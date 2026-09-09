@@ -772,6 +772,34 @@ FM.Cooldown  = 6          -- seconds before the same prompt is worth trying agai
 FM.RarePri   = true
 FM.rareSet   = {}
 FM.RareCount = 0
+
+-- ---- rift ----
+-- The rift wants three specific pets. WHICH three cannot be read from the game: the
+-- Input1/2/3 labels in the trade-in UI are TextLabels and text returns nil here, the
+-- pet ImageLabel's asset id is unreadable, require() on the data modules fails, and
+-- the decompiler reports invalid bytecode on RiftTradeIn. So the list is configured,
+-- not detected - and since the requirements rotate (that UI has a RotateTimer), expect
+-- to change these when they do.
+--
+-- What IS readable is your backpack: pets sit there as Tools with real names, which is
+-- how progress is tracked. Matching is loose - lowercase, and a contains test - because
+-- names carry suffixes like "Prehistoric Bat [X1]" and spellings vary.
+-- `egg` is the template name in ReplicatedStorage.Assets.Models.Eggs, which is how the
+-- farm picks out the right egg in the world rather than taking any egg in the area.
+-- Note the Cosmic Gecko pet comes from an egg called "Galaxy Gecko".
+FM.RiftTargets = {
+    { name = "Cosmic Gecko", area = "Cosmic",      egg = "Galaxy Gecko",
+      alts = { "cosmic gecko" } },
+    { name = "Whale Shark",  area = "Abyss Ocean", egg = "Whale Shark",
+      alts = { "whale shark" } },
+    { name = "Centapede",    area = "Cosmic",      egg = "Centapede",
+      alts = { "centapede", "centipede" } },
+}
+FM.eggName   = {}         -- [slot key] = identified egg template name
+FM.EggIdent  = 0          -- how many slots we could identify last sweep
+FM.Rift      = false      -- auto rift farm on/off
+FM.RiftHave  = {}         -- [name] = true when it is in your backpack
+FM.RiftState = "off"
 FM.AutoBoss  = true
 -- NOT carried across reloads. It used to be `FM.Areas or {}`, which kept old
 -- selections alive while the rebuilt UI drew every toggle unchecked - so Forest stayed
@@ -1112,6 +1140,162 @@ local function looksRare(t)
     return (_G.FARM.rareSet or {})[key] == true
 end
 
+-- ---- egg identification ----
+-- Every egg type has a template model in ReplicatedStorage.Assets.Models.Eggs, named
+-- after its pet - 115 of them. World eggs are clones of those, so an egg can be
+-- identified by shape.
+--
+-- The fingerprint is the set of child part VOLUMES expressed as ratios of the largest
+-- part, which makes it scale-invariant. That matters: raw volumes match the templates
+-- almost perfectly (98 of 115 unique) but almost nothing in the world, because world
+-- eggs are scaled - the same trap that made item naming impossible in the AR2 script.
+-- With ratios, Whale Shark and Galaxy Gecko resolve uniquely, and Centapede narrows to
+-- three of which only it appears in Cosmic.
+local EGG_FP = nil
+-- Ratio vector, largest part first. Sorted by size rather than compared exactly,
+-- because the same egg reads a different number of parts at different slots - some
+-- children's Size comes back unreadable - so an exact fingerprint match is far too
+-- brittle. Comparison is scored with a tolerance instead.
+-- The shape of the three biggest parts, as aspect ratios (X/Y and Z/Y). Scale-invariant
+-- per part, and far more discriminating than relative volumes: volume ratios could not
+-- separate Galaxy Gecko from Camel, while aspect ratios put a clear margin between them.
+local function eggFingerprint(m)
+    local parts = {}
+    local okc, kids = pcall(function() return m:GetChildren() end)
+    if not okc or not kids then return nil end
+    for _, c in ipairs(kids) do
+        local okn, n = pcall(function() return c.Name end)
+        local okcl, cl = pcall(function() return c.ClassName end)
+        if okn and okcl and n ~= "Hitbox" and cl ~= "ProximityPrompt" then
+            local oks, s = pcall(function() return c.Size end)
+            if oks and s and s.Y > 0 then
+                parts[#parts + 1] = { v = s.X * s.Y * s.Z, ax = s.X / s.Y, az = s.Z / s.Y }
+            end
+        end
+    end
+    if #parts < 2 then return nil end
+    table.sort(parts, function(a, b) return a.v > b.v end)
+    local out = {}
+    for i = 1, math.min(3, #parts) do
+        out[#out + 1] = parts[i].ax
+        out[#out + 1] = parts[i].az
+    end
+    return out
+end
+
+local function eggScore(a, b)
+    local n = math.min(#a, #b)
+    if n < 4 then return 9 end
+    local sum = 0
+    for i = 1, n do sum = sum + math.abs(a[i] - b[i]) end
+    return sum / n
+end
+
+local function buildEggFingerprints()
+    if EGG_FP then return EGG_FP end
+    EGG_FP = {}
+    local RS = game:GetService("ReplicatedStorage")
+    local ok, folder = pcall(function()
+        return RS.Assets and RS.Assets.Models and RS.Assets.Models:FindFirstChild("Eggs")
+    end)
+    if not ok or not folder then return EGG_FP end
+    local okc, kids = pcall(function() return folder:GetChildren() end)
+    if not okc or not kids then return EGG_FP end
+    for _, m in ipairs(kids) do
+        local r = eggFingerprint(m)
+        if r then EGG_FP[#EGG_FP + 1] = { name = tostring(m.Name), r = r } end
+    end
+    return EGG_FP
+end
+
+-- Best-scoring template, but only when the answer is CLEAR: a low error and a decent
+-- margin over the runner-up. Anything else returns nil - "unknown" is a useful answer
+-- and a wrong name is not.
+--
+-- The previous version resolved ambiguity by preferring whichever candidate happened to
+-- be one of the rift targets for that area. That is confirmation bias in code: a Frog
+-- egg sitting in Cosmic was reported as a Centapede purely because Centapede was what
+-- we wanted, and it produced a confident "4 Centapede eggs on the map" that was not
+-- real. Nothing here is allowed to know what we are hoping for.
+-- Deliberately loose enough to be useful and strict enough to stay honest. About two
+-- thirds of the map's eggs get a confident name; the rest return nil.
+--
+-- Being wrong here is cheap by design: the rift farm only ever runs in the areas its
+-- pets come from, and it takes every egg there eventually, so identification changes
+-- the ORDER it visits them and nothing else. That is the only reason a partial, fuzzy
+-- matcher is acceptable at all.
+local EGG_MAXERR, EGG_MARGIN = 0.02, 0.005
+local function eggNameFor(model, area)
+    local list = buildEggFingerprints()
+    local r = eggFingerprint(model)
+    if not r or #list == 0 then return nil end
+    -- everything that fits, not just the winner: whole families score identically
+    local fits = {}
+    local best
+    for _, t in ipairs(list) do
+        local s = eggScore(r, t.r)
+        if s <= EGG_MAXERR then fits[#fits + 1] = { name = t.name, s = s } end
+        if not best or s < best then best = s end
+    end
+    if #fits == 0 then return nil end
+    table.sort(fits, function(a, b) return a.s < b.s end)
+    -- a clear winner
+    if #fits == 1 or (fits[2].s - fits[1].s) >= EGG_MARGIN then return fits[1].name end
+
+    -- Otherwise the shape is shared by a whole family and only location separates them.
+    -- Centapede, Dream Axolotl, Frog and Lava frog all score 0.0000 against each other -
+    -- they are built from similarly proportioned parts - and the same family turns up in
+    -- Lake, Volcano and Cosmic. Which one it is depends on where it is.
+    --
+    -- This is NOT the biased tie-break that was removed. That one preferred whichever
+    -- candidate we happened to want, and invented four Centapede eggs. This asks a
+    -- different question: which of these can spawn HERE. It is an inference rather than
+    -- a fact, but a corroborated one - it names exactly three Centapede eggs in Cosmic,
+    -- which is what was actually on screen.
+    if area then
+        for _, t in ipairs(_G.FARM.RiftTargets or {}) do
+            if t.area == area then
+                for _, c in ipairs(fits) do
+                    if c.name == t.egg then return c.name end
+                end
+            end
+        end
+    end
+    return nil    -- ambiguous and nothing local to break the tie
+end
+
+-- Which rift pets are in the backpack right now. Loose match on lowercase contains, so
+-- "Whale Shark [X2]" still counts as a Whale Shark.
+local function riftProgress()
+    local lp = localPlayer()
+    local okb, bp = pcall(function() return lp and lp:FindFirstChild("Backpack") end)
+    local held, names = {}, {}
+    if okb and bp then
+        local okc, kids = pcall(function() return bp:GetChildren() end)
+        if okc and kids then
+            for _, d in ipairs(kids) do
+                local okn, nm = pcall(function() return d.Name end)
+                if okn and nm then names[#names + 1] = string.lower(tostring(nm)) end
+            end
+        end
+    end
+    local have, total = 0, 0
+    for _, want in ipairs(_G.FARM.RiftTargets or {}) do
+        total = total + 1
+        local got = false
+        for _, alt in ipairs(want.alts or { string.lower(want.name) }) do
+            for _, nm in ipairs(names) do
+                if string.find(nm, alt, 1, true) then got = true break end
+            end
+            if got then break end
+        end
+        held[want.name] = got
+        if got then have = have + 1 end
+    end
+    return have, total, held
+end
+_G.SEHUB_RIFT = riftProgress
+
 local function pressE(dur)
     if not keypress then return end
     pcall(function()
@@ -1155,6 +1339,75 @@ farmSec:Slider("Escape Delay", 0.15, 0.05, 0, 3, " s", function(v) FM.WakeDelay 
 farmSec:Slider("Run Speed", 220, 10, 40, 320, " studs/s", function(v) FM.Speed = v end,
     "320 is the measured ceiling. Speed itself was never punished - only air time.")
 FM.ui = farmSec:Label("off")
+
+local riftSec = farm:Section("Auto Rift-Farm", "Full")
+riftSec:Label("Hunts the exact eggs that drop the three rift pets, not")
+riftSec:Label("just any egg in their areas. Egg types are identified by")
+riftSec:Label("shape, matched against the 115 templates the game keeps in")
+riftSec:Label("ReplicatedStorage - so a Whale Shark egg is picked out from")
+riftSec:Label("its neighbours. Stops when all three pets are yours.")
+riftSec:Label("WHICH pets the rift wants cannot be read (that UI is text,")
+riftSec:Label("and text is unreadable here), so tell me when they rotate.")
+riftSec:Toggle("Auto Rift-Farm", false, function(v)
+    FM.Rift = v
+    if v then
+        -- Remember what to put back. Turning this on changes the area filter and may
+        -- start the farm; without recording that, switching it off left the farm
+        -- running on two areas and looked like it could not be disabled at all.
+        FM.riftPrevAreas = FM.Areas
+        FM.riftPrevAll   = FM.AllAreas
+        FM.riftStartedFarm = false
+
+        local areas, list = {}, {}
+        for _, t in ipairs(FM.RiftTargets or {}) do
+            if not areas[t.area] then areas[t.area] = true; list[#list + 1] = t.area end
+        end
+        FM.Areas = areas
+        FM.AllAreas = false
+        -- Start the farm too. Setting the filter and the target list without turning
+        -- the farm on just looks broken - nothing moves and nothing says why.
+        if not FM.On then
+            FM.On = true
+            FM.riftStartedFarm = true
+            if not ST.On then
+                ST.On, ST.offsetsOk = true, true
+                patchPrompts()
+            end
+        end
+        FM.RiftState = "farming " .. table.concat(list, " + ")
+        notify("Rift Farm", "Farming " .. table.concat(list, " + "), 3)
+    else
+        -- put everything back the way it was
+        local weStarted = FM.riftStartedFarm
+        FM.Areas    = FM.riftPrevAreas or {}
+        FM.AllAreas = (FM.riftPrevAll ~= false)
+        if weStarted then
+            FM.On = false
+            FM.State = "off"
+        end
+        FM.riftStartedFarm = false
+        FM.eggName, FM.EggIdent = {}, 0     -- stop the egg sweep from lingering
+        FM.RiftState = "off"
+        notify("Rift Farm", weStarted and "Stopped the farm" or "Off - areas restored", 2)
+    end
+end, "Restricts farming to the areas those pets drop in and starts the farm. Turning it off puts your area selection back and stops the farm if it was started by this toggle.")
+riftSec:Button("Check Rift Progress", function()
+    local have, total, held = _G.SEHUB_RIFT()
+    print(string.format("---- rift pets: %d of %d ----", have, total))
+    for _, t in ipairs(FM.RiftTargets or {}) do
+        print(string.format("   [%s] %-14s from %-12s egg: %s",
+            held[t.name] and "x" or " ", t.name, t.area, tostring(t.egg)))
+    end
+    print(string.format("   egg types identified on the map: %d", FM.EggIdent or 0))
+    local seen = {}
+    for _, nm in pairs(FM.eggName or {}) do seen[nm] = (seen[nm] or 0) + 1 end
+    for _, t in ipairs(FM.RiftTargets or {}) do
+        print(string.format("   %-14s eggs currently spawned: %d",
+            tostring(t.egg), seen[t.egg] or 0))
+    end
+    if have < total then print("   still farming") else print("   ALL THREE - rift is ready") end
+end, "Lists the three pets, which you already hold, and how many of their eggs are on the map right now.")
+FM.riftUi = riftSec:Label("off")
 
 local areaSec = farm:Section("Areas", "Full")
 areaSec:Label("Eleven areas of five eggs, in the map's own order.")
@@ -1391,6 +1644,63 @@ SESPAWN("night watch", function()
                 end
                 FM.rareSet, FM.RareCount = rare, rareN
 
+                -- Identify egg types, once a second, only while the rift farm needs it.
+                -- Skipped otherwise: it reads every child's Size across 55 slots, which
+                -- is fine at 1Hz but has no business running when nothing uses it.
+                if FM.Rift then
+                    local names, ident = {}, 0
+                    for _, m in ipairs(kids) do
+                        local hb = m:FindFirstChild("Hitbox")
+                        local okp, p = pcall(function() return hb and hb.Position end)
+                        if okp and p then
+                            local nm = eggNameFor(m, areaOf(p))
+                            if nm then
+                                names[string.format("%d_%d_%d", p.X, p.Y, p.Z)] = nm
+                                ident = ident + 1
+                            end
+                        end
+                    end
+                    FM.eggName, FM.EggIdent = names, ident
+                end
+
+                -- rift progress, checked here too rather than in another loop
+                if FM.Rift then
+                    local have, total, held = riftProgress()
+                    FM.RiftHave = held
+                    if have >= total then
+                        FM.RiftState = string.format("ALL %d PETS - rift ready", total)
+                        if FM.On then
+                            FM.On = false
+                            FM.riftStartedFarm = false   -- it is already stopped
+                            notify("Rift Farm", "All three pets collected - farm stopped", 5)
+                            print("[Steal An Egg] rift pets complete:")
+                            for _, t in ipairs(FM.RiftTargets or {}) do
+                                print("   " .. t.name .. " (" .. t.area .. ")")
+                            end
+                        end
+                    else
+                        -- Say what is actually on the map, not just what is missing from
+                        -- the backpack. These eggs rotate: a target can be at zero for a
+                        -- while, and without this the farm looks stuck when it is really
+                        -- just waiting for the right egg to spawn.
+                        local spawned = {}
+                        for _, nm in pairs(FM.eggName or {}) do
+                            spawned[nm] = (spawned[nm] or 0) + 1
+                        end
+                        local missing, onMap = {}, 0
+                        for _, t in ipairs(FM.RiftTargets or {}) do
+                            if not held[t.name] then
+                                local c = spawned[t.egg] or 0
+                                onMap = onMap + c
+                                missing[#missing + 1] = string.format("%s(%d)", t.name, c)
+                            end
+                        end
+                        FM.RiftState = string.format("%d/%d - need %s%s",
+                            have, total, table.concat(missing, ", "),
+                            (onMap == 0) and " - none spawned, waiting" or "")
+                    end
+                end
+
                 local n = #kids
                 if FM.slotCount and (n - FM.slotCount) >= 10 then
                     FM.visited = {}
@@ -1532,6 +1842,20 @@ local function farmStep()
                             local d = (t.pos - me).Magnitude
                             local score = d
                             if FM.RarePri and looksRare(t) then score = d - 10000 end
+                            -- Rift farming goes for the exact eggs that drop the pets
+                            -- still missing, identified by shape. Beats even a rare,
+                            -- because a rare you do not need is a detour.
+                            if FM.Rift then
+                                local en = FM.eggName[key]
+                                if en then
+                                    for _, want in ipairs(FM.RiftTargets or {}) do
+                                        if want.egg == en and not (FM.RiftHave or {})[want.name] then
+                                            score = d - 50000
+                                            break
+                                        end
+                                    end
+                                end
+                            end
                             if not bestScore or score < bestScore then
                                 best, bestScore = t, score
                                 best.key = key
@@ -1718,6 +2042,7 @@ SESPAWN("ui refresh", function()
         pcall(function()
             if ST.ui then ST.ui:SetText(tostring(ST.State)) end
             if FM.ui then FM.ui:SetText(tostring(FM.State)) end
+            if FM.riftUi then FM.riftUi:SetText(tostring(FM.RiftState)) end
             if MV.ui then MV.ui:SetText(tostring(MV.State)) end
             if AB.ui then AB.ui:SetText(tostring(AB.State)) end
             if diagLbl then
