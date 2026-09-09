@@ -443,30 +443,97 @@ ST.Hold       = 0.0        -- HoldDuration to force
 ST.Dist       = 15.0       -- MaxActivationDistance to force; 15 is the measured ceiling
 ST.OFF_HOLD   = 0x120
 ST.OFF_DIST   = 0x128
+-- Candidate offset for RequiresLineOfSight, and it IS a candidate rather than a fact.
+--
+-- The layout around it is confirmed: +0x120 reads as HoldDuration, +0x124 holds 101 which
+-- is KeyCode.E, and +0x128 is MaxActivationDistance - three anchors in a row. After those
+-- sit three bytes that are 01 on every real prompt, which is what Enabled,
+-- RequiresLineOfSight and ClickablePrompt all default to, and +0x135 is the one that reads
+-- 00 on some non-egg prompts, so it is the one that varies per prompt.
+--
+-- Which of the three it actually is cannot be settled by reading, because all three are
+-- true everywhere it matters. Trying to settle it by dumping every prompt in the workspace
+-- failed for a different reason worth remembering: ClassName lies in this executor, and
+-- that scan reported 97 egg-slot prompts where there are 8.
+--
+-- So this is behind its own toggle, defaults off, saves the original byte, and restores it.
+-- If prompts stop appearing entirely when you switch it on, the byte was Enabled, not line
+-- of sight - turn it off and say so, and the next candidate is +0x134.
+ST.OFF_LOS    = 0x135
+ST.NoLOS      = false
 ST.orig       = ST.orig or {}   -- [address] = { hold = n, dist = n }
+ST.origLOS    = ST.origLOS or {} -- [address] = original line-of-sight byte
 ST.offsetsOk  = true
 ST.patched    = 0
 ST.State      = "off"
 
-local function promptList()
-    -- Root-level SmartPromptPart only, which is where the steal prompts live (30 of
-    -- them). A full descendant walk finds 175 prompts, most of them machines and
-    -- shops, and costs far more per sweep for no benefit.
+-- Egg prompts live in TWO places, and for a long time this only knew about one.
+--
+--   55 sit under root-level SmartPromptPart, which is what this used to scan
+--    8 sit under the egg slot model itself, at AreaEggSlotsClient.<guid>.Hitbox / .Part
+--
+-- The eight were never patched - they read back the untouched hold=-0.5 range=0 while
+-- every other prompt on the map read 0 / 5. Walk up to one of those eggs and the instant
+-- tap does nothing, so the grab falls through to holding E for its real duration: the
+-- couple of seconds of standing in the egg before it finally lifts.
+--
+-- Still not a full descendant walk of workspace - that finds 175 prompts, mostly machines
+-- and shops, and costs far more per sweep. Two known locations, both cheap.
+--
+-- `pos` is optional; with it, only prompts within `radius` are returned, each carrying the
+-- distance from its OWNER part so callers can pick the nearest without measuring twice.
+local function promptsNear(pos, radius)
     local out = {}
+    local r = radius or math.huge
     local okc, kids = pcall(function() return workspace:GetChildren() end)
-    if not okc or not kids then return out end
-    for _, c in ipairs(kids) do
-        local okn, nm = pcall(function() return c.Name end)
-        if okn and nm == "SmartPromptPart" then
-            local okg, sub = pcall(function() return c:GetChildren() end)
-            if okg and sub then
-                for _, p in ipairs(sub) do
-                    local okcl, cl = pcall(function() return p.ClassName end)
-                    if okcl and cl == "ProximityPrompt" then out[#out + 1] = p end
+    if okc and kids then
+        for _, c in ipairs(kids) do
+            local okn, nm = pcall(function() return c.Name end)
+            if okn and nm == "SmartPromptPart" then
+                local okp, p = pcall(function() return c.Position end)
+                local d = (okp and p and pos) and (p - pos).Magnitude or 0
+                if not pos or (okp and p and d <= r) then
+                    local okg, sub = pcall(function() return c:GetChildren() end)
+                    if okg and sub then
+                        for _, pr in ipairs(sub) do
+                            local okcl, cl = pcall(function() return pr.ClassName end)
+                            if okcl and cl == "ProximityPrompt" then
+                                out[#out + 1] = { p = pr, d = d }
+                            end
+                        end
+                    end
                 end
             end
         end
     end
+    local folder = workspace:FindFirstChild("AreaEggSlotsClient")
+    if folder then
+        local oks, slots = pcall(function() return folder:GetChildren() end)
+        if oks and slots then
+            for _, m in ipairs(slots) do
+                local hb = m:FindFirstChild("Hitbox")
+                local okp, p = pcall(function() return hb and hb.Position end)
+                local d = (okp and p and pos) and (p - pos).Magnitude or 0
+                if not pos or (okp and p and d <= r) then
+                    local okd, desc = pcall(function() return m:GetDescendants() end)
+                    if okd and desc then
+                        for _, pr in ipairs(desc) do
+                            local okcl, cl = pcall(function() return pr.ClassName end)
+                            if okcl and cl == "ProximityPrompt" then
+                                out[#out + 1] = { p = pr, d = d }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return out
+end
+
+local function promptList()
+    local out = {}
+    for _, e in ipairs(promptsNear(nil, nil)) do out[#out + 1] = e.p end
     return out
 end
 
@@ -502,6 +569,13 @@ local function patchPrompts()
                 memory_write("float", a + ST.OFF_HOLD, ST.Hold)
                 memory_write("float", a + ST.OFF_DIST, ST.Dist)
             end)
+            if ST.NoLOS then
+                if ST.origLOS[a] == nil then
+                    local okl, l = pcall(function() return memory_read("byte", a + ST.OFF_LOS) end)
+                    if okl and type(l) == "number" then ST.origLOS[a] = l end
+                end
+                pcall(function() memory_write("byte", a + ST.OFF_LOS, 0) end)
+            end
             -- verify: if the struct moved, this is where we find out
             local okv, h2 = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
             local okv2, d2 = pcall(function() return memory_read("float", a + ST.OFF_DIST) end)
@@ -533,41 +607,31 @@ local function patchNear(pos, radius)
     if not memory_write or not pos then return 0 end
     if not ST.On or not ST.offsetsOk then return 0 end
     local n = 0
-    local okc, kids = pcall(function() return workspace:GetChildren() end)
-    if not okc or not kids then return 0 end
-    for _, c in ipairs(kids) do
-        local okn, nm = pcall(function() return c.Name end)
-        if okn and nm == "SmartPromptPart" then
-            local okp, p = pcall(function() return c.Position end)
-            if okp and p and (p - pos).Magnitude <= (radius or 30) then
-                local okg, sub = pcall(function() return c:GetChildren() end)
-                if okg and sub then
-                    for _, pr in ipairs(sub) do
-                        local okcl, cl = pcall(function() return pr.ClassName end)
-                        if okcl and cl == "ProximityPrompt" then
-                            local a = addrOf(pr)   -- nil once the prompt is gone
-                            if a then
-                                if not ST.orig[a] then
-                                    local okh, h = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
-                                    local okd, dd = pcall(function() return memory_read("float", a + ST.OFF_DIST) end)
-                                    if okh and okd then ST.orig[a] = { hold = h, dist = dd } end
-                                end
-                                -- Write only. A "read first, write if different" version
-                                -- of this looked tidier and put roughly 144 memory_read
-                                -- calls per second onto prompt addresses that are freed
-                                -- constantly as eggs are taken - and the executor began
-                                -- crashing within a second of load. Reads happen at grab
-                                -- time only, against one prompt, checked for a parent.
-                                pcall(function()
-                                    memory_write("float", a + ST.OFF_HOLD, ST.Hold)
-                                    memory_write("float", a + ST.OFF_DIST, ST.Dist)
-                                end)
-                                n = n + 1
-                            end
-                        end
-                    end
-                end
+    for _, e in ipairs(promptsNear(pos, radius or 30)) do
+        local a = addrOf(e.p)   -- nil once the prompt is gone
+        if a then
+            if not ST.orig[a] then
+                local okh, h = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
+                local okd, dd = pcall(function() return memory_read("float", a + ST.OFF_DIST) end)
+                if okh and okd then ST.orig[a] = { hold = h, dist = dd } end
             end
+            -- Write only. A "read first, write if different" version of this looked tidier
+            -- and put roughly 144 memory_read calls per second onto prompt addresses that
+            -- are freed constantly as eggs are taken - and the executor began crashing
+            -- within a second of load. Reads happen at grab time only, against one prompt,
+            -- checked for a parent.
+            pcall(function()
+                memory_write("float", a + ST.OFF_HOLD, ST.Hold)
+                memory_write("float", a + ST.OFF_DIST, ST.Dist)
+            end)
+            if ST.NoLOS then
+                if ST.origLOS[a] == nil then
+                    local okl, l = pcall(function() return memory_read("byte", a + ST.OFF_LOS) end)
+                    if okl and type(l) == "number" then ST.origLOS[a] = l end
+                end
+                pcall(function() memory_write("byte", a + ST.OFF_LOS, 0) end)
+            end
+            n = n + 1
         end
     end
     return n
@@ -586,28 +650,8 @@ _G.SEHUB_PATCHNEAR = patchNear
 local function holdTimeNear(pos, radius)
     if not memory_read or not pos then return nil end
     local bestD, bestPrompt
-    local okc, kids = pcall(function() return workspace:GetChildren() end)
-    if not okc or not kids then return nil end
-    for _, c in ipairs(kids) do
-        local okn, nm = pcall(function() return c.Name end)
-        if okn and nm == "SmartPromptPart" then
-            local okp, p = pcall(function() return c.Position end)
-            if okp and p then
-                local d = (p - pos).Magnitude
-                if d <= (radius or 20) and (not bestD or d < bestD) then
-                    local okg, sub = pcall(function() return c:GetChildren() end)
-                    if okg and sub then
-                        for _, pr in ipairs(sub) do
-                            local okcl, cl = pcall(function() return pr.ClassName end)
-                            if okcl and cl == "ProximityPrompt" then
-                                bestD, bestPrompt = d, pr
-                                break
-                            end
-                        end
-                    end
-                end
-            end
-        end
+    for _, e in ipairs(promptsNear(pos, radius or 20)) do
+        if not bestD or e.d < bestD then bestD, bestPrompt = e.d, e.p end
     end
     if not bestPrompt then return nil end
     local okpar, par = pcall(function() return bestPrompt.Parent end)
@@ -632,6 +676,9 @@ local function restorePrompts()
                 memory_write("float", a + ST.OFF_DIST, o.dist)
             end)
             n = n + 1
+        end
+        if a and ST.origLOS[a] ~= nil then
+            pcall(function() memory_write("byte", a + ST.OFF_LOS, ST.origLOS[a]) end)
         end
     end
     ST.State = string.format("restored %d prompts to original values", n)
@@ -663,8 +710,30 @@ end, "On by default because the farm depends on it. Applies continuously - promp
 -- the feature the whole farm is built on, and a slider that silently does is a trap
 -- whether it got there by a stray click or a restored value. ST.Hold stays 0; the Instant
 -- Steal toggle above is the honest on/off.
-stealSec:Slider("Prompt Range", 15, 1, 10, 15, " studs", function(v) ST.Dist = v end,
-    "How far away the prompt can be triggered from. Capped at 15 because that is the measured ceiling - the reference script asks for 25 and the extra 10 does nothing, so the server is clearly validating this one. The floor is 10: below that you have to be almost on top of the egg, which is how a working patch still ends up missing.")
+-- 5, not 15, and this is a correction rather than a preference. Egg slots sit 6.7 studs
+-- apart at the closest, so a 15 stud activation range makes four neighbouring eggs eligible
+-- at once and leaves which one you get down to Roblox's tie-breaking. At 5 the maths is
+-- decided instead of hoped for: standing 1.5 studs from the target puts its prompt about
+-- 2.5 away (the prompt sits ~1 stud off its egg) and every neighbour at 5.2 or more, so
+-- exactly one prompt is in range.
+--
+-- Bigger was assumed better because 15 was the measured ceiling - true, and irrelevant.
+-- Reach is worth nothing if it cannot tell two eggs apart.
+stealSec:Slider("Prompt Range", 5, 1, 4, 15, " studs", function(v) ST.Dist = v end,
+    "How far away the prompt can be triggered from. 5 keeps exactly one egg in range at a time - eggs are only 6.7 studs apart, so anything much larger makes the neighbours eligible too and you take the wrong one. 15 is the server-validated ceiling if you want reach instead of precision.")
+stealSec:Toggle("Ignore Line of Sight", false, function(v)
+    ST.NoLOS = v
+    if v then
+        ST.offsetsOk = true
+        patchPrompts()
+        notify("Instant Steal", "Line-of-sight byte cleared - test a grab", 5)
+    else
+        restorePrompts()
+        ST.origLOS = {}
+        patchPrompts()
+        notify("Instant Steal", "Line-of-sight restored", 3)
+    end
+end, "EXPERIMENTAL. Roblox only shows a prompt when the camera can see it, which is why pointing the camera down and zooming in makes grabs work smoothly. This clears the byte that looks like RequiresLineOfSight so the camera stops mattering. If prompts stop working entirely when you enable this, that byte was Enabled instead - switch it off and tell me, the next candidate is one byte earlier.")
 stealSec:Button("Restore Originals", function()
     local n = restorePrompts()
     notify("Instant Steal", "Restored " .. tostring(n or 0) .. " prompts", 2)
@@ -676,12 +745,24 @@ ST.ui = stealSec:Label("off")
 -- Hold Time ended up at 1.00s and Prompt Range at 5 with nothing on screen admitting it.
 -- Re-assert the settings the farm cannot work without, AFTER the UI has had its say, and
 -- say so out loud rather than correcting it silently.
-if ST.Hold ~= 0 or (ST.Dist or 0) < 10 then
-    warn(string.format("[Steal An Egg] menu returned hold=%.2f range=%.0f - forcing 0 / 15",
-        ST.Hold or -1, ST.Dist or -1))
+-- The menu does not merely fire its callbacks at build time - it REMEMBERS. Slider values
+-- are persisted by label and replayed on load, so whatever a slider was last set to beats
+-- whatever this file declares as its default, silently and forever. That is the single
+-- mechanism behind every "the setting came back" problem in this script: Hold Time at 1.00s
+-- killing instant steal, Escape Delay returning as 0.15, and Prompt Range loading as 15
+-- after the default here was changed to 5.
+--
+-- So the two values that decide whether a grab works at all are pinned to a known-good
+-- state on every load, loudly. The sliders still work normally once you are in-game; this
+-- only controls where each session STARTS.
+local STboot = { Hold = 0, Dist = 5 }
+for k, want in pairs(STboot) do
+    if ST[k] ~= want then
+        warn(string.format("[Steal An Egg] menu returned ST.%s=%s - starting at %s",
+            k, tostring(ST[k]), tostring(want)))
+        ST[k] = want
+    end
 end
-ST.Hold = 0
-ST.Dist = math.max(tonumber(ST.Dist) or 15, 10)
 
 
 SESPAWN("prompt patch", function()
@@ -907,10 +988,22 @@ local FM = _G.FARM
 FM.On        = false
 FM.Speed     = 220        -- ground speed; 320 is the measured ceiling, this leaves room
 FM.Stick     = 18         -- downward bias, studs/s, to guarantee floor contact
-FM.Reach     = 5          -- start pressing at this range (fixed, no slider)
+-- Close enough to be standing INSIDE the egg, and that is not a preference - it is what
+-- makes the game hand you the right prompt.
+--
+-- Measured: egg slots sit 6.7 studs apart at the closest, median 7.2, and the prompt sits
+-- on the egg (0.97 studs off it, median). Roblox activates the CLOSEST eligible prompt, so
+-- at the old 5 stud reach a neighbour could be 6.7 - 5 = 1.7 studs away - nearer than the
+-- egg being aimed at - and you would take the wrong one. That is the whole bug.
+--
+--   stand 5.0 away -> nearest neighbour >= 1.7   (loses, frequently)
+--   stand 1.5 away -> nearest neighbour >= 5.2   (wins by 3.5 studs)
+FM.Reach     = 1.5        -- start pressing at this range (fixed, no slider)
 FM.GrabHold  = 1.3        -- fallback hold when the instant patch did not take
 FM.Fallbacks = 0
-FM.Brake     = 60         -- start slowing this far out, so arrival is a stop not a skid
+-- 30, not 60. Braking from 60 studs out spent half the approach crawling; the taper is
+-- proportional, so a shorter brake keeps full speed for longer and still arrives stopped.
+FM.Brake     = 30         -- start slowing this far out, so arrival is a stop not a skid
 FM.AfterSteal = 0.4       -- settle time after a grab before the run home begins
 -- Rally point: where to go first after dying. Respawning puts you at your base, and
 -- setting off for an egg from there drags you through whatever geometry is in the way,
@@ -1643,18 +1736,21 @@ local RIFT_GUI = { "RiftTradeIn", "RiftTradeInMain", "SacrificeInputs" }
 -- The last two are here for completeness; both templates are empty, so they can never be
 -- matched in the world - see the EMPTY note below.
 local RIFT_EGG_ALIAS = {
-    ["cosmic gecko"] = "Galaxy Gecko",
-    ["lava gecko"]   = "Ash Gecko",
-    ["king mammoth"] = "Colossal Mammoth",
-    ["beluga whale"] = "Belula Beluga",
-    ["phoenix"]      = "Ascended Vermilion Phoenix",
+    ["cosmic gecko"]        = "Galaxy Gecko",
+    ["lava gecko"]          = "Ash Gecko",
+    ["cosmic gorilla"]      = "Cyclops Gorilla",
+    ["cosmic skeleton"]     = "Alien Skeleton Boss",
+    ["cosmic skeleton boss"] = "Alien Skeleton Boss",
+    ["king mammoth"]        = "Colossal Mammoth",
+    ["beluga whale"]        = "Belula Beluga",
+    ["phoenix"]             = "Ascended Vermilion Phoenix",
 }
 
 -- Case matters more than you would think: the rift panel writes "Lava frog" with a
 -- lowercase f, matching the template exactly, but the same pet is "Lava Frog" everywhere
 -- a human writes it. An exact-only lookup would silently fail on one of those, so the
 -- resolver falls back to a case-insensitive scan before giving up.
-local function resolveEggTemplate(name)
+local function resolveEggTemplate(name, area)
     if not name then return nil end
     local alias = RIFT_EGG_ALIAS[string.lower(name)]
     if alias then name = alias end
@@ -1670,6 +1766,36 @@ local function resolveEggTemplate(name)
         local want = string.lower(name)
         for _, t in ipairs(kids) do
             if string.lower(tostring(t.Name)) == want then return tostring(t.Name) end
+        end
+    end
+
+    -- Last resort: match on the ANIMAL. The renames all keep the creature and swap the
+    -- adjective - Cosmic Gorilla is filed as Cyclops Gorilla, Lava Gecko as Ash Gecko,
+    -- King Mammoth as Colossal Mammoth - so the final word is the part that survives.
+    -- Constrained to the eggs that area can actually spawn, which is what keeps it from
+    -- matching Cosmic Gorilla to some unrelated gorilla halfway across the map.
+    --
+    -- This exists because the alias table silently failed exactly once and cost a farming
+    -- session: "Cosmic Gorilla" resolved to a template that does not exist, so a rift egg
+    -- standing 1.1 studs away and correctly identified as Cyclops Gorilla was never
+    -- matched against it. A hand-maintained lookup will keep going stale; this catches the
+    -- next one without needing anyone to notice.
+    local allow = area and AREA_EGGS[area]
+    if allow then
+        local lastWord = string.match(string.lower(name), "(%a+)%s*$")
+        if lastWord then
+            local hit
+            for _, cand in ipairs(allow) do
+                if string.match(string.lower(cand), "(%a+)%s*$") == lastWord then
+                    if hit then hit = nil break end     -- ambiguous, say nothing
+                    hit = cand
+                end
+            end
+            if hit then
+                warn(string.format("[Steal An Egg] '%s' has no template; matched to '%s' by animal in %s",
+                    name, hit, tostring(area)))
+                return hit
+            end
         end
     end
     return name    -- no template; the farm falls back to taking any egg in the area
@@ -1722,7 +1848,7 @@ local function readRiftUI()
                 local amt  = riftLabel(inp, "Empty", "Amount")
                 local have, need
                 if amt then have, need = amt:match("^%s*(%d+)%s*/%s*(%d+)") end
-                local tmpl = resolveEggTemplate(nm)
+                local tmpl = resolveEggTemplate(nm, area)
                 local tier = riftLabel(inp, "Empty", "Rarity")
                 -- Free rarity data, straight off the panel. "Rarity" is the template's own
                 -- placeholder text before it is filled in, so it is rejected by rank lookup.
@@ -2009,6 +2135,9 @@ farmSec:Label("If you're still getting caught from lack of speed, enable")
 farmSec:Label("Auto Anti-Boss.")
 farmSec:Label("If you're not using Auto Anti-Boss and you're farming too")
 farmSec:Label("quickly, Boss Reset Wait waits for the boss to sleep again.")
+farmSec:Label("Point your camera DOWN and zoom in - the game only shows a")
+farmSec:Label("prompt the camera can see, so grabs are smoother that way.")
+farmSec:Label("(Steal tab > Ignore Line of Sight tries to remove this.)")
 farmSec:Toggle("Auto Farm", false, function(v)
     FM.On = v
     if v then
@@ -2625,7 +2754,15 @@ local function farmStep()
                         if allowed then anyAllowed = anyAllowed + 1 end
 
                         if allowed and cool then
-                            local d = (t.pos - me).Magnitude
+                            -- HORIZONTAL distance. The character only ever moves in X and
+                            -- Z, so the Y gap is a constant it can never close - and eggs
+                            -- sit about 2.06 studs below the HumanoidRootPart. Measured in
+                            -- 3D, standing dead on top of an egg still reads 2.06 studs
+                            -- away, which is more than the 1.5 arrival threshold: it could
+                            -- never arrive, so it hovered on the spot forever. Worse, while
+                            -- hovering, the tiny drift in position kept flipping which egg
+                            -- scored nearest - that is the switching between eggs.
+                            local d = (Vector3.new(t.pos.X, me.Y, t.pos.Z) - me).Magnitude
                             local en = FM.eggName[key]
                             -- Priority is a LADDER, and distance only ever breaks ties
                             -- within a rung. 20000 per rank is wider than the map is long
@@ -2710,7 +2847,10 @@ local function farmStep()
                         FM.State = "nothing to farm (all on cooldown or no area on)"
                         task.wait(0.5)
                     else
-                        local d = (best.pos - me).Magnitude
+                        -- Horizontal, for the same reason as the scoring above: the Y gap
+                        -- to an egg is roughly 2 studs and the character cannot close it,
+                        -- so a 3D test against a 1.5 stud reach never passes.
+                        local d = (Vector3.new(best.pos.X, me.Y, best.pos.Z) - me).Magnitude
                         if d > FM.Reach then
                             -- Run there, glued to the floor, but SLOW DOWN on approach.
                             -- Driving at full speed until the moment you are in range
@@ -2722,10 +2862,14 @@ local function farmStep()
                             local m = flat.Magnitude
                             if m > 0.01 then
                                 local sp = FM.Speed
-                                local brakeAt = FM.Brake or 60
+                                local brakeAt = FM.Brake or 30
                                 if d < brakeAt then
                                     sp = FM.Speed * (d / brakeAt)
-                                    if sp < 25 then sp = 25 end   -- still enough to close
+                                    -- 14, not 25. The last stretch is now a 1.5 stud
+                                    -- approach rather than a 5 stud one, and 25 studs/s
+                                    -- covers 0.75 studs per tick - half the target - so it
+                                    -- overshot and had to creep back.
+                                    if sp < 14 then sp = 14 end   -- still enough to close
                                 end
                                 local v = (flat / m) * sp
                                 pcall(function()
@@ -2736,16 +2880,16 @@ local function farmStep()
                             FM.State = string.format("running to %s, %.0f studs%s", best.area, d,
                                 (d < (FM.Brake or 60)) and " (braking)" or "")
                         else
-                            -- Full stop FIRST. A press while still sliding is a press
-                            -- from wherever the slide takes you, which is how eggs were
-                            -- being missed at point blank range.
-                            for _ = 1, 3 do
-                                pcall(function()
-                                    root.AssemblyLinearVelocity =
-                                        Vector3.new(0, -(FM.Stick or 18), 0)
-                                end)
-                                task.wait(0.03)
-                            end
+                            -- Full stop FIRST. A press while still sliding is a press from
+                            -- wherever the slide takes you. ONE frame, not three: three was
+                            -- 0.09s of standing on the spot you are about to rob, and the
+                            -- approach now brakes to 14 studs/s so there is barely any slide
+                            -- left to kill.
+                            pcall(function()
+                                root.AssemblyLinearVelocity =
+                                    Vector3.new(0, -(FM.Stick or 18), 0)
+                            end)
+                            task.wait(0.03)
                             -- INSTANT PICK UP, the one piece kept from the reference
                             -- script. Patch this prompt, then READ THE HOLD TIME BACK:
                             -- a patched prompt takes an instant tap, an unpatched one
@@ -2774,17 +2918,17 @@ local function farmStep()
                             -- and ran all the way home empty. That is the bug that made
                             -- instant steal look like it broke on its own.
                             if ST.On and hd ~= nil and hd >= 0 and hd < 0.05 then
-                                -- press a few times: one press can land in the same frame
-                                -- the prompt is still registering you as in range
-                                for _ = 1, 3 do
-                                    pcall(function()
-                                        root.AssemblyLinearVelocity =
-                                            Vector3.new(0, -(FM.Stick or 18), 0)
-                                    end)
-                                    pressE(0.05)
-                                    if slotGone(slot) then break end
-                                    task.wait(0.04)
-                                end
+                                -- ONE press, then leave. This was three presses spaced
+                                -- 0.04s apart - 0.27s of standing still - because a single
+                                -- press could land in the frame before the prompt had
+                                -- registered you as in range. Two things killed that
+                                -- reason: the approach now stops 1.5 studs away instead of
+                                -- 5, so you are unambiguously inside the prompt when the
+                                -- key goes down, and a missed grab is no longer silent -
+                                -- the pending check turns you round within 0.8s. Paying
+                                -- 0.27s on EVERY egg to insure against a rare miss is the
+                                -- wrong trade when the miss now costs 0.8s and self-heals.
+                                pressE(0.04)
                             else
                                 -- Three cases, and the middle one is the one that was
                                 -- getting this wrong:
