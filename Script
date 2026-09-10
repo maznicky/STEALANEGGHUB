@@ -1470,21 +1470,155 @@ local RARITY_RANK = {
 --
 -- "King Mammoth Egg" is the display name for the template called Colossal Mammoth, the same
 -- display/internal split as Cosmic Gecko -> Galaxy Gecko and Lava Gecko -> Ash Gecko.
+-- The tier of each of the eight index slots, per area. This is the authoritative source and
+-- it needs NO name mapping at all: the farm identifies an egg by template, the index gives
+-- that template's slot, and this gives the slot's tier.
+--
+-- Supplied by you in full, and it cross-checks against the index cleanly. Where your
+-- ordering differed from the index's - Bear/Fox in Forest, Toucan/Chimpanzee in Jungle,
+-- Tralaledon/T-Rex in Prehistoric, Koi/Snowy Owl in Cherry Blossom, Spideron/Crustacia in
+-- Titan Temple - both members of each pair share a tier, so slot -> tier is unambiguous
+-- everywhere. That is what makes this usable rather than merely close.
+--
+-- Keyed by AREA, holding TIERS. The two namespaces meet here and nowhere else, which is
+-- why every entry is spelled out rather than computed: "Cosmic" appears as an area key AND
+-- as a tier value in this very table, and they mean different things.
+local AREA_TIER = {
+    ["Forest"]         = { "Common", "Common", "Uncommon", "Rare", "Rare", "Epic", "Epic", "Legendary" },
+    ["Lake"]           = { "Common", "Common", "Uncommon", "Rare", "Epic", "Epic", "Legendary", "Cosmic" },
+    ["Desert"]         = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Mythic", "Cosmic" },
+    ["Jungle"]         = { "Rare", "Rare", "Epic", "Legendary", "Legendary", "Mythic", "Mythic", "Secret" },
+    ["Snow"]           = { "Rare", "Epic", "Legendary", "Mythic", "Mythic", "Cosmic", "Secret", "Eternal" },
+    ["Volcano"]        = { "Rare", "Epic", "Legendary", "Legendary", "Mythic", "Secret", "Eternal", "Eternal" },
+    ["Abyss Ocean"]    = { "Rare", "Epic", "Legendary", "Mythic", "Cosmic", "Cosmic", "Secret", "Eternal" },
+    ["Prehistoric"]    = { "Rare", "Legendary", "Mythic", "Cosmic", "Cosmic", "Secret", "Secret", "Eternal" },
+    ["Cosmic"]         = { "Epic", "Legendary", "Mythic", "Cosmic", "Secret", "Secret", "Eternal", "Divine" },
+    ["Cherry Blossom"] = { "Epic", "Legendary", "Mythic", "Cosmic", "Cosmic", "Secret", "Eternal", "Divine" },
+    ["Titan Temple"]   = { "Legendary", "Legendary", "Mythic", "Cosmic", "Cosmic", "Secret", "Eternal", "Divine" },
+}
+
+-- Template name -> tier, for the cases where no index harvest is needed. Every entry here
+-- is either an exact name match between your list and the template folder, or an alias
+-- corroborated by the shape matcher actually finding that template in that area. Nothing
+-- is here on resemblance alone - the pets whose display names have no confirmed template
+-- (Bird, Leviathan, Royal Sphinx, King Snake, Lava Dragon, Cosmic Dragon, Mutant Shark,
+-- Nightflame, and Titan Temple's Rhinotaur and Gorilla King) are deliberately absent, and
+-- are covered by AREA_TIER above once the index has been read.
 local EGG_RARITY = {
-    -- Snow, complete
+    -- Forest
+    ["Chicken"] = "Common", ["Dog"] = "Common", ["Burrowing Owl"] = "Rare",
+    ["Raccoon"] = "Rare", ["Bear"] = "Epic", ["Mire Fox"] = "Epic",
+    ["Brr Brr Patapim"] = "Legendary",
+    -- Lake
+    ["Frog"] = "Common", ["Duckling"] = "Common", ["Catfish"] = "Uncommon",
+    ["Turtle"] = "Rare", ["Trulimero Trulicina"] = "Epic", ["Swan"] = "Epic",
+    ["Dream Axolotl"] = "Legendary",
+    -- Desert
+    ["Jerboa"] = "Common", ["FennecFox"] = "Uncommon", ["Camel"] = "Rare",
+    ["Tob Tobi Tob Tob"] = "Epic", ["Rattlesnake"] = "Legendary",
+    ["Sand Spider"] = "Mythic", ["DeathstalkerScorpion"] = "Mythic",
+    -- Jungle
+    ["Chimpanzee"] = "Rare", ["Toucan"] = "Rare", ["Crocodile"] = "Epic",
+    ["Gorilla"] = "Legendary", ["Orangutini Ananassini"] = "Legendary",
+    ["Spider"] = "Mythic", ["Tiger"] = "Mythic",
+    -- Snow
     ["Penguin"] = "Rare", ["Walrus"] = "Epic", ["Polar Bear"] = "Legendary",
     ["Sabertooth Tiger"] = "Mythic", ["Mammoth"] = "Mythic",
-    ["Colossal Mammoth"] = "Cosmic", ["Yeti"] = "Secret",
-    -- observed on the rift panel
-    ["Galaxy Gecko"] = "Legendary", ["Whale Shark"] = "Cosmic", ["Centapede"] = "Epic",
-    ["Ash Gecko"] = "Rare", ["Lava frog"] = "Epic", ["Orca"] = "Mythic",
-    ["Swordfish"] = "Epic",
+    ["Colossal Mammoth"] = "Cosmic", ["Yeti"] = "Secret", ["Ice Dragon"] = "Eternal",
+    -- Volcano
+    ["Ash Gecko"] = "Rare", ["Lava frog"] = "Epic", ["Flaming Bull"] = "Legendary",
+    ["Lava Iguana"] = "Legendary", ["Chillin Chilli"] = "Mythic", ["Cerberus"] = "Secret",
+    ["Ascended Vermilion Phoenix"] = "Eternal",
+    -- Abyss Ocean
+    ["Parrotfish"] = "Rare", ["Swordfish"] = "Epic", ["Shark"] = "Legendary",
+    ["Orca"] = "Mythic", ["Whale Shark"] = "Cosmic", ["Belula Beluga"] = "Cosmic",
+    ["Kraken"] = "Secret", ["El Maja"] = "Eternal",
+    -- Prehistoric
+    ["Dodo"] = "Rare", ["Pterodactyl"] = "Legendary", ["Ankylosaurus"] = "Mythic",
+    ["Triceratops"] = "Cosmic", ["Bronto"] = "Cosmic", ["TyrannosaurusRex"] = "Secret",
+    ["Tralaledon"] = "Secret", ["Mosasaurus"] = "Eternal",
+    -- Cosmic
+    ["Centapede"] = "Epic", ["Galaxy Gecko"] = "Legendary", ["Cyclops Gorilla"] = "Mythic",
+    ["La Vacca Saturno Saturnita"] = "Cosmic", ["Alien Skeleton Boss"] = "Secret",
+    ["Eternal Lunar Dragon"] = "Eternal", ["Unicorn"] = "Divine",
+    -- Cherry Blossom, every one an exact name match
+    ["Crane"] = "Epic", ["Salamander"] = "Legendary", ["Red Panda"] = "Mythic",
+    ["Snowy Owl"] = "Cosmic", ["Koi"] = "Cosmic", ["Stag"] = "Secret",
+    ["Oni Tiger"] = "Eternal", ["Kitsune"] = "Divine",
+    -- Titan Temple, only the four the matcher has actually seen there
+    ["Kaiju Spider"] = "Legendary", ["Crab"] = "Legendary",
+    ["Blade Head"] = "Mythic", ["Mantis"] = "Cosmic",
 }
 
 -- Rank of an identified egg, 0 when we have never been told its tier.
-local function rarityRank(eggName)
+-- [area][template] = 1..8, the pet's slot in that area's Pet Index. Filled in by
+-- harvestPetIndex() further down, which reads PlayerGui.Index.
+--
+-- Survives reloads via _G and restarts via a file, because the source is only readable in
+-- a narrow window: the index builds its per-area frames when you OPEN it and tears them
+-- down again afterwards, so a harvest run at the wrong moment sees three empty children
+-- and nothing else. Persisting turns "open the Pet Index every session" into "open the Pet
+-- Index once, ever".
+--
+-- AREAS AND TIERS ARE DIFFERENT NAMESPACES and must never be mixed: "Cosmic" is both an
+-- area on the map and a rarity tier, so this table is keyed by area on the outside and
+-- holds slot NUMBERS, never tier names. RARITY_RANK above is keyed by tier and never sees
+-- an area string.
+local INDEX_FILE = "sehub_petindex.lua"
+_G.SEHUB_INDEXSLOT = _G.SEHUB_INDEXSLOT or {}
+local INDEX_SLOT = _G.SEHUB_INDEXSLOT
+
+-- Load the cached index off disk when memory has nothing. Written as Lua source rather
+-- than JSON because loadstring is already here and a JSON parser is not.
+if not next(INDEX_SLOT) and readfile then
+    local ok, src = pcall(readfile, INDEX_FILE)
+    if ok and type(src) == "string" and #src > 0 then
+        local okc, chunk = pcall(loadstring, src)
+        if okc and chunk then
+            local okr, tbl = pcall(chunk)
+            if okr and type(tbl) == "table" then
+                for area, slots in pairs(tbl) do
+                    if type(slots) == "table" then INDEX_SLOT[area] = slots end
+                end
+            end
+        end
+    end
+end
+
+local function saveIndexSlots()
+    if not writefile then return end
+    local parts = { "return {" }
+    for area, slots in pairs(INDEX_SLOT) do
+        parts[#parts + 1] = string.format("[%q]={", area)
+        for tmpl, slot in pairs(slots) do
+            parts[#parts + 1] = string.format("[%q]=%d,", tmpl, slot)
+        end
+        parts[#parts + 1] = "},"
+    end
+    parts[#parts + 1] = "}"
+    pcall(writefile, INDEX_FILE, table.concat(parts))
+end
+
+-- Rank of an identified egg. Two sources, and BOTH are now exact - there is no estimating
+-- left in here. An earlier version guessed a rank from the slot number plus an offset,
+-- which was wrong in a way that mattered: each area starts at a different rung, so Snow's
+-- slot 1 is Rare while Cosmic's slot 1 is Epic, and a single offset could not express that.
+--
+--   1. EGG_RARITY, keyed by template. Works with no index harvest at all.
+--   2. The pet's slot in that area's index, read through AREA_TIER. Covers the pets whose
+--      display name has no confirmed template, which is exactly where (1) has holes.
+--
+-- Returns 0 for genuinely unknown, and 0 means "sort by distance" rather than "sort last",
+-- which is the honest behaviour when we do not know.
+local function rarityRank(eggName, area)
     if not eggName then return 0 end
     local tier = EGG_RARITY[eggName]
+    if not tier then
+        local byArea = area and INDEX_SLOT[area]
+        local slot = byArea and byArea[eggName]
+        local tiers = area and AREA_TIER[area]
+        if slot and tiers then tier = tiers[slot] end
+    end
     if not tier then return 0 end
     return RARITY_RANK[string.lower(tier)] or 0
 end
@@ -1769,37 +1903,117 @@ local function resolveEggTemplate(name, area)
         end
     end
 
-    -- Last resort: match on the ANIMAL. The renames all keep the creature and swap the
-    -- adjective - Cosmic Gorilla is filed as Cyclops Gorilla, Lava Gecko as Ash Gecko,
-    -- King Mammoth as Colossal Mammoth - so the final word is the part that survives.
-    -- Constrained to the eggs that area can actually spawn, which is what keeps it from
-    -- matching Cosmic Gorilla to some unrelated gorilla halfway across the map.
+    -- There WAS a fuzzy fallback here that matched on the animal - the last word - on the
+    -- reasoning that every rename keeps the creature and swaps the adjective (Cosmic
+    -- Gorilla -> Cyclops Gorilla, King Mammoth -> Colossal Mammoth). It is gone, because
+    -- the first thing it did in the wild was map "Cosmic Dragon" to "Eternal Lunar Dragon"
+    -- - two different pets that both happen to end in Dragon, both in Cosmic.
     --
-    -- This exists because the alias table silently failed exactly once and cost a farming
-    -- session: "Cosmic Gorilla" resolved to a template that does not exist, so a rift egg
-    -- standing 1.1 studs away and correctly identified as Cyclops Gorilla was never
-    -- matched against it. A hand-maintained lookup will keep going stale; this catches the
-    -- next one without needing anyone to notice.
-    local allow = area and AREA_EGGS[area]
-    if allow then
-        local lastWord = string.match(string.lower(name), "(%a+)%s*$")
-        if lastWord then
-            local hit
-            for _, cand in ipairs(allow) do
-                if string.match(string.lower(cand), "(%a+)%s*$") == lastWord then
-                    if hit then hit = nil break end     -- ambiguous, say nothing
-                    hit = cand
+    -- A wrong mapping is strictly worse than no mapping. No mapping means the farm takes
+    -- any egg in the area; a wrong one sends it at the wrong egg while reporting success.
+    -- Unmapped names are recorded so they can be turned into real aliases, which is a
+    -- thing to fix rather than a thing to guess.
+    local FMx = _G.FARM
+    FMx.EggUnmapped = FMx.EggUnmapped or {}
+    FMx.EggUnmapped[tostring(name) .. (area and (" [" .. area .. "]") or "")] = true
+    return name    -- no template; the farm falls back to taking any egg in the area
+end
+
+-- ---- the Pet Index ----
+-- PlayerGui.Index is the in-game collection screen, and it is the best data source in this
+-- game: one frame per area, eight entries per area named IndexEntry1..8, each carrying the
+-- pet's display name - and the entries are ordered by RARITY.
+--
+-- It answers two separate problems that were both being solved by hand:
+--
+--   1. Rare Priority had nothing to work with. Only 14 of 115 egg types had a known
+--      rarity, so almost every egg scored 0, tied, and quietly fell back to distance.
+--      That is why the toggle appeared to do nothing.
+--   2. AREA_EGGS and the alias table were transcriptions - from you, or from the wiki -
+--      and went stale silently. "Cosmic Gorilla" cost a farming session precisely because
+--      a hand-maintained mapping had a hole in it.
+--
+-- Verified against the Snow list you supplied: slots 1-7 read Penguin, Walrus, Polar Bear,
+-- Sabertooth Tiger, Mammoth, King Mammoth, Yeti, which is exactly Rare through Secret.
+--
+-- Reads fine with the index CLOSED. Locked pets read "???" and are skipped rather than
+-- guessed at.
+local function harvestPetIndex()
+    local lp = localPlayer()
+    local pg = lp and lp:FindFirstChild("PlayerGui")
+    local idx = pg and pg:FindFirstChild("Index")
+    local node = idx
+    for _, step in ipairs({ "Frame", "List", "ScrollingFrame" }) do
+        if not node then return 0 end
+        local ok, nxt = pcall(function() return node:FindFirstChild(step) end)
+        if not ok or not nxt then return 0 end
+        node = nxt
+    end
+    local learned = 0
+    for _, b in ipairs(AREA_BOUNDS) do
+        local area = b.name
+        local f = node:FindFirstChild(area)
+        local pets = f and f:FindFirstChild("Pets")
+        if pets then
+            local slots, order = {}, {}
+            for i = 1, 8 do
+                local e = pets:FindFirstChild("IndexEntry" .. i)
+                local lbl = e and e:FindFirstChild("TextLabel")
+                local ok, t = pcall(function() return lbl and lbl.Text end)
+                if ok and type(t) == "string" and #t > 0 and t ~= "???" then
+                    -- Display name -> template. Goes through the same resolver the rift
+                    -- panel uses, so "Cosmic Gorilla" lands on Cyclops Gorilla here too.
+                    -- Only kept if a template of that name actually EXISTS: a name that
+                    -- resolves to nothing can never match a world egg, and storing it
+                    -- would put a phantom into the area list that the matcher then has to
+                    -- rule out. Unmapped names are recorded by the resolver instead.
+                    local tmpl = resolveEggTemplate(t, area)
+                    local RS = game:GetService("ReplicatedStorage")
+                    local okf, folder = pcall(function()
+                        return RS and RS.Assets and RS.Assets.Models
+                               and RS.Assets.Models:FindFirstChild("Eggs")
+                    end)
+                    local real = okf and folder and tmpl and folder:FindFirstChild(tmpl)
+                    if real then
+                        slots[tmpl] = i
+                        order[#order + 1] = tmpl
+                        learned = learned + 1
+                    end
                 end
             end
-            if hit then
-                warn(string.format("[Steal An Egg] '%s' has no template; matched to '%s' by animal in %s",
-                    name, hit, tostring(area)))
-                return hit
+            if next(slots) then
+                INDEX_SLOT[area] = slots
+                -- Replace the transcribed list with the game's own. Keyed by AREA; the
+                -- values are template names, never tiers.
+                AREA_EGGS[area] = order
             end
         end
     end
-    return name    -- no template; the farm falls back to taking any egg in the area
+    if learned > 0 then saveIndexSlots() end
+    _G.FARM.IndexPets = learned
+    return learned
 end
+_G.SEHUB_INDEX = harvestPetIndex
+
+-- Rebuild the area lists from whatever the cache holds, so a restart is as good as a fresh
+-- harvest without needing the index open.
+local function areaEggsFromIndex()
+    local n = 0
+    for area, slots in pairs(INDEX_SLOT) do
+        local order = {}
+        for tmpl, slot in pairs(slots) do order[#order + 1] = { t = tmpl, s = slot } end
+        if #order > 0 then
+            table.sort(order, function(a, b) return a.s < b.s end)
+            local list = {}
+            for _, e in ipairs(order) do list[#list + 1] = e.t end
+            AREA_EGGS[area] = list
+            n = n + #list
+        end
+    end
+    return n
+end
+_G.SEHUB_AREAEGGS = areaEggsFromIndex
+areaEggsFromIndex()
 
 local function riftLabel(parent, ...)
     local node = parent
@@ -2498,6 +2712,14 @@ SESPAWN("night watch", function()
                 -- is fine at 1Hz but has no business running when nothing uses it.
                 if FM.Rift or FM.RarePri then sweepEggNames() end
 
+                -- Re-read the Pet Index every 30s. Cheap, and entries change under you:
+                -- a locked pet reads "???" until you hatch one, at which point its name
+                -- and its rarity slot become available.
+                if (tick() - (FM.indexAt or 0)) > 30 then
+                    FM.indexAt = tick()
+                    pcall(harvestPetIndex)
+                end
+
                 -- rift progress, checked here too rather than in another loop
                 if FM.Rift then
                     local have, total, held = riftProgress()
@@ -2790,7 +3012,7 @@ local function farmStep()
                             -- idea and made "which of these is ordering my eggs" a question
                             -- you had to think about.
                             if FM.RarePri then
-                                local rank = rarityRank(en)
+                                local rank = rarityRank(en, t.area)
                                 if rank > 0 then
                                     pri = pri + rank * 20000
                                 elseif looksRare(t) then
@@ -3071,10 +3293,20 @@ diagSec:Button("Check Rift Progress", function()
         table.sort(odd)
         print("   not on the area's known egg list: " .. table.concat(odd, ", "))
     end
+    -- Display names with no matching template. Each one is an alias waiting to be added;
+    -- until then the farm treats that egg as unidentified rather than guessing at it.
+    local un = {}
+    for k in pairs(FM.EggUnmapped or {}) do un[#un + 1] = k end
+    if #un > 0 then
+        table.sort(un)
+        print("   no template for: " .. table.concat(un, ", "))
+    end
     if have < total then print("   still farming") else print("   ALL THREE - rift is ready") end
 end, "Lists the three pets, which you already hold, and how many of their eggs are on the map right now.")
 
 diagSec:Button("Show Egg Rarities", function()
+    local n = _G.SEHUB_INDEX()
+    print(string.format("---- Pet Index: %d pets read across the areas ----", n))
     local tbl, rank = _G.SEHUB_RARITY()
     local rows = {}
     for name, tier in pairs(tbl) do
@@ -3084,7 +3316,7 @@ diagSec:Button("Show Egg Rarities", function()
         if a.r ~= b.r then return a.r > b.r end
         return a.n < b.n
     end)
-    print(string.format("---- known egg rarities: %d (%d learned from the rift panel) ----",
+    print(string.format("---- exact tiers known: %d (%d learned from the rift panel) ----",
         #rows, FM.RarityLearned or 0))
     for _, r in ipairs(rows) do
         print(string.format("   %-2d %-10s %s", r.r, r.t, r.n))
