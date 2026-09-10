@@ -558,6 +558,13 @@ ST.OFF_LOS    = 0x135
 ST.NoLOS      = false
 ST.orig       = ST.orig or {}   -- [address] = { hold = n, dist = n }
 ST.origLOS    = ST.origLOS or {} -- [address] = original line-of-sight byte
+-- [address] = when we last wrote it. The sweep repeats every 0.75s because prompts are
+-- constantly recreated, but an address that was patched a moment ago and still answers is
+-- the same object with the same values - rewriting it is six memory operations for nothing.
+-- Measured at 65ms average per sweep before this, which is a hitch you can feel.
+ST.doneAt     = ST.doneAt or {}
+ST.REPATCH    = 3.0             -- seconds before an address is worth writing again
+ST.sweepN     = 0
 ST.offsetsOk  = true
 ST.patched    = 0
 ST.State      = "off"
@@ -661,9 +668,23 @@ local function patchPrompts()
     end
     if not ST.offsetsOk then return end
     local n = 0
+    ST.sweepN = (ST.sweepN or 0) + 1
+    -- Verify on the first few sweeps and occasionally after. Its job is to catch the
+    -- ProximityPrompt struct being reshuffled by a Roblox update, which is a permanent,
+    -- once-ever event - not something worth two memory reads per prompt per 0.75s forever.
+    local verify = (ST.sweepN <= 3) or (ST.sweepN % 20 == 0)
+    local now = tick()
     for _, p in ipairs(promptList()) do
         local a = addrOf(p)
+        -- Already written recently, and still answering, so it is the same object holding
+        -- the same values. Skipping it is the difference between six memory operations and
+        -- none, across every prompt in range, every 0.75 seconds.
+        if a and (now - (ST.doneAt[a] or 0)) < ST.REPATCH then
+            n = n + 1
+            a = nil
+        end
         if a then
+            ST.doneAt[a] = now
             -- record the originals ONCE per address, before touching anything
             if not ST.orig[a] then
                 local okh, h = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
@@ -681,9 +702,11 @@ local function patchPrompts()
                 end
                 pcall(function() memory_write("byte", a + ST.OFF_LOS, 0) end)
             end
-            -- verify: if the struct moved, this is where we find out
-            local okv, h2 = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
-            local okv2, d2 = pcall(function() return memory_read("float", a + ST.OFF_DIST) end)
+            local okv, h2, okv2, d2 = false, nil, false, nil
+            if verify then
+                okv, h2 = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
+                okv2, d2 = pcall(function() return memory_read("float", a + ST.OFF_DIST) end)
+            end
             if okv and okv2 and h2 and d2 then
                 if math.abs(h2 - ST.Hold) > 0.01 or math.abs(d2 - ST.Dist) > 0.01 then
                     ST.offsetsOk = false
@@ -697,6 +720,13 @@ local function patchPrompts()
                 end
             end
             n = n + 1
+        end
+    end
+    -- Prune the seen-recently table. Prompts are recreated constantly with fresh addresses,
+    -- so without this it grows for the life of the session.
+    if ST.sweepN % 20 == 0 then
+        for addr, at in pairs(ST.doneAt) do
+            if (now - at) > 30 then ST.doneAt[addr] = nil end
         end
     end
     ST.patched = n
@@ -804,9 +834,11 @@ stealSec:Toggle("Instant Steal", true, function(v)
     ST.On = v
     if v then
         ST.offsetsOk = true
+        ST.doneAt = {}        -- force a real write on the sweep after re-enabling
         patchPrompts()
     else
         restorePrompts()
+        ST.doneAt = {}
     end
 end, "On by default because the farm depends on it. Applies continuously - prompts are recreated as you move around, so the sweep repeats every couple of seconds.")
 -- No Hold Time slider any more. It existed so instant steal could be softened if instant
@@ -3604,21 +3636,39 @@ diagSec:Button("Panic", function()
     notify("Steal An Egg", "Everything off, prompts restored", 3)
 end, "Turns every feature off and puts the prompt memory back.")
 
+-- Writes a label ONLY when its text actually changed.
+--
+-- This loop was pushing six SetText calls every 0.25s - twenty-four writes a second into
+-- the menu, forever, almost all of them setting a label to the string it already held. That
+-- is worth removing on its own, but the reason it is worth removing NOW is that the menu is
+-- built out of Drawing objects (no Instance.new in this executor), and a library that
+-- rebuilds its elements while you scroll leaves our cached label handles pointing at freed
+-- drawings. Writing to one is a native crash, which pcall cannot catch - which is what
+-- "scrolled down and it crashed" looks like.
+--
+-- Idle, this now writes nothing at all, so there is almost no window left to hit.
+local lastLabel = {}
+local function setLabel(key, obj, text)
+    if not obj then return end
+    if lastLabel[key] == text then return end
+    lastLabel[key] = text
+    pcall(function() obj:SetText(text) end)
+end
+
 SESPAWN("ui refresh", function()
     while _G.SEHUB_GEN == GEN do
-        pcall(function()
-            if ST.ui then ST.ui:SetText(tostring(ST.State)) end
-            if FM.ui then FM.ui:SetText(tostring(FM.State)) end
-            if FM.riftUi then FM.riftUi:SetText(tostring(FM.RiftState)) end
-            if MV.ui then MV.ui:SetText(tostring(MV.State)) end
-            if AB.ui then AB.ui:SetText(tostring(AB.State)) end
-            if diagLbl then
-                diagLbl:SetText(string.format("health %.2f | prompts %d | eggs %d | escapes %d",
-                    _G.SEHUB_HEALTH or -1, ST.patched or 0, FM.Taken or 0,
-                    (_G.SEHUB_WATCH or {}).chaseEscapes or 0))
-            end
-        end)
-        task.wait(0.25)
+        local __t0 = tick()
+        setLabel("steal", ST.ui, tostring(ST.State))
+        setLabel("farm", FM.ui, tostring(FM.State))
+        setLabel("rift", FM.riftUi, tostring(FM.RiftState))
+        setLabel("move", MV.ui, tostring(MV.State))
+        setLabel("boss", AB.ui, tostring(AB.State))
+        -- health is rounded to one decimal so it stops churning the string every tick
+        setLabel("diag", diagLbl, string.format("health %.1f | prompts %d | eggs %d | escapes %d",
+            _G.SEHUB_HEALTH or -1, ST.patched or 0, FM.Taken or 0,
+            (_G.SEHUB_WATCH or {}).chaseEscapes or 0))
+        PROFTICK("ui refresh", __t0)
+        task.wait(0.3)
     end
 end)
 
