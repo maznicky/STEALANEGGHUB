@@ -2573,6 +2573,10 @@ local function refreshRiftTargets()
         "RiftTradeIn", "RiftTradeInMain", "CurrentEggInfoHolder", "RotateTimer")
     if not live then return false end
     _G.FARM.RiftTargets = live
+    -- When the panel was last actually READ. Everything downstream needs this, because the
+    -- targets are kept when a read fails and there is otherwise no way to tell a current
+    -- list from one left over from before the executor lost its DataModel bindings.
+    _G.FARM.RiftReadAt = tick()
     return true
 end
 
@@ -3255,6 +3259,27 @@ SESPAWN("night watch", function()
                 if FM.Rift then
                     local have, total, held = riftProgress()
                     FM.RiftHave = held
+                    -- Say so, loudly, when the panel has gone unreadable. Silently farming
+                    -- a stale target list is how you end up hunting Centapede, Orca and
+                    -- Cosmic Gorilla while the rift is asking for something else entirely.
+                    local age = tick() - (FM.RiftReadAt or 0)
+                    if age > 30 then
+                        FM.RiftState = string.format("PANEL UNREADABLE for %.0fs - targets stale, priority off", age)
+                        if not FM.riftStaleWarned then
+                            FM.riftStaleWarned = true
+                            notify("Rift Farm", "Rift panel unreadable - targets may be stale, priority off", 6)
+                            warn("[Steal An Egg] rift panel unreadable: PlayerGui is out of reach, " ..
+                                 "which happens when the executor loses its DataModel bindings. " ..
+                                 "Rejoin or re-inject to restore it.")
+                        end
+                    else
+                        FM.riftStaleWarned = false
+                    end
+                    -- Everything below reports on the target list, so it is skipped while
+                    -- that list is stale - otherwise the status line would cheerfully print
+                    -- progress against pets the rift may no longer be asking for, which is
+                    -- the exact thing that made this hard to notice.
+                    if age <= 30 then
                     -- Only a COMPLETE read may stop the farm. A partial one satisfies
                     -- "have >= total" as soon as the two pets it could see are done, which
                     -- would park you at the safe zone with a third still outstanding.
@@ -3296,6 +3321,7 @@ SESPAWN("night watch", function()
                             have, total, table.concat(missing, ", "),
                             (onMap == 0) and " - none spawned, waiting" or "")
                     end
+                    end   -- age <= 30
                 end
 
                 local n = #kids
@@ -3710,7 +3736,14 @@ local function farmStep()
                             -- the rarity rung then decides the order among the wanted ones.
                             local pri = 0
                             local wanted = false
-                            if FM.Rift and FM.RiftPrio then
+                            -- STALE TARGETS ARE NOT TARGETS. If the rift panel has not been
+                            -- readable for a while - which happens when this executor loses
+                            -- its DataModel bindings and PlayerGui becomes unreachable - the
+                            -- list still in memory is whatever the rift wanted before that.
+                            -- Chasing it sends the farm after three pets the rift may no
+                            -- longer want, which is worse than not prioritising at all.
+                            local riftFresh = (tick() - (FM.RiftReadAt or 0)) < 30
+                            if FM.Rift and FM.RiftPrio and riftFresh then
                                 for _, want in ipairs(FM.RiftTargets or {}) do
                                     if not (FM.RiftHave or {})[want.name] then
                                         -- Normal case: we know which egg drops this pet.
