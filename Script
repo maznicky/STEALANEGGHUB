@@ -306,6 +306,35 @@ local function myRoot()
     end)
     return okr and r or nil
 end
+-- The egg you are carrying, as an actual object rather than an inference.
+--
+-- This file spent a long time asserting the opposite - "an egg is NOT a Tool in the
+-- character, false through 541 ragdolls" - and built grab timing, delivery timeouts and
+-- slot-vanished checks around that. It is wrong. A held egg is a Tool parented to the
+-- character, with a readable name: "Riftbeasts Egg", "Volcano Egg". The original test was
+-- run once, mid-run, and the conclusion outlived whatever made it fail.
+--
+-- Filtered on the name containing "egg" so that equipping a pet - and every pet you own is
+-- also a Tool - is not mistaken for carrying one.
+local function heldEggTool()
+    local lp = localPlayer()
+    local okc, ch = pcall(function() return lp and lp.Character end)
+    if not okc or not ch then return nil end
+    local okk, kids = pcall(function() return ch:GetChildren() end)
+    if not okk or not kids then return nil end
+    for _, c in ipairs(kids) do
+        local okcl, cl = pcall(function() return c.ClassName end)
+        if okcl and cl == "Tool" then
+            local okn, n = pcall(function() return c.Name end)
+            if okn and type(n) == "string" and string.find(string.lower(n), "egg", 1, true) then
+                return c, n
+            end
+        end
+    end
+    return nil
+end
+_G.SEHUB_HELDEGG = heldEggTool
+
 -- ---------------- notifications ----------------
 -- Drawn ourselves, bottom-right, rather than handed to Lib.Notify - the library puts its
 -- toasts where it likes, and the ask was for them to sit where the game's own "eggs have
@@ -1074,8 +1103,10 @@ bossSec:Button("Set Safe Zone", function()
 end, "Saves where you are standing right now.")
 bossSec:Button("Escape Now", function() gotoZone() end,
     "Same as pressing the key below.")
-bossSec:Slider("Repeats", 5, 1, 1, 15, "", function(v) AB.Count = v end,
-    "The write is repeated a few times a few milliseconds apart, so one rejected write does not lose the escape.")
+-- The teleport-repeat slider lives in the Auto Farm section now, next to Anti-Boss Delay,
+-- because that is where the anti-boss is actually tuned. One control, not two: a second
+-- slider writing the same value is how Hold Time ended up at 1.00s with nothing on screen
+-- admitting it.
 AB.ui = bossSec:Label("no safe zone set")
 AB.keyUi = bossSec:Keybind("Escape Key", "f", function(k) AB.Key = k end,
     "Fires on press, not hold.")
@@ -1165,14 +1196,33 @@ FM.Home      = nil        -- resolved from AB.Zone at use time; see homePos()
 -- Fallback Hold; when the boss detection was rebuilt on movement these two came with it
 -- and put the clutter straight back. They are tuning constants, not settings.
 FM.BossRange   = 140      -- how close a waking guard has to be to count as yours
-FM.FlingLift   = 45       -- upward studs/s that means something threw you
+-- 75, not 45. A jump leaves the ground at roughly 50, so 45 caught every one of them.
+FM.FlingLift   = 75       -- upward studs/s that means something threw you
 FM.needRally = false
 FM.slotCount = nil        -- last seen egg-slot count, for spotting the night reload
 FM.Reloads   = 0
 FM.Cooldown  = 6          -- seconds before the same prompt is worth trying again
 FM.RarePri   = false
+-- How many studs of travel one tier of rarity is worth.
+--
+-- This was 20000, which is wider than the map (about 4600 studs corner to corner), so
+-- rarity was absolute: a single Secret anywhere outranked every other egg in the world, the
+-- farm crossed the map for it, took the 6 second cooldown, and crossed back. With Prehistoric
+-- running Rare through Eternal while Forest runs Common through Legendary, that meant the
+-- farm effectively lived in one area - which is exactly what you saw.
+--
+-- At 400 a tier is worth 400 studs of walking, so rarity still decides between eggs in the
+-- same area and distance still decides whether a distant one is worth the trip. Push the
+-- slider to the top for the old absolute behaviour.
+FM.RareWeight = 400
 FM.rareSet   = {}
 FM.RareCount = 0
+FM.fails     = {}         -- [slot key] = consecutive failed grabs
+FM.banned    = {}         -- [slot key] = time until which the slot is ignored
+-- Cleared on every load. It is a per-session cache of "we already looked at this slot",
+-- and carrying it across a reload means carrying the previous build's mistakes with it -
+-- including, once, a different value type entirely.
+FM.eggTried  = {}
 
 -- ---- rift ----
 -- Startup values only. These are overwritten by readRiftUI() with what the trade-in
@@ -1438,13 +1488,30 @@ end
 -- Instead: being flung is motion nobody asked for. The script only ever writes downward
 -- stick or horizontal run velocity, never upward, so a sharp upward throw is something
 -- the game did to you.
+-- A JUMP IS NOT A FLING, and this could not tell them apart. The whole test was
+-- "upward velocity over 45", and a normal Roblox jump leaves the ground at about 50 - so
+-- every time you pressed space the anti-boss teleported you to the safe zone.
+--
+-- That also explains the intermittency you noticed. Every escape stamps AB.lastEscape, and
+-- the chase watch refuses to fire within 2 seconds of one. So a jump would burn the escape
+-- AND suppress the real rescue for the next two seconds, which is exactly "sometimes works,
+-- sometimes doesn't" - it depended on whether you had jumped recently.
+--
+-- Two guards. The threshold is raised well clear of a jump, and a jump is recognised
+-- directly: if space has been down in the last second, upward motion is yours.
+local lastJumpAt = 0
 local function isRagdolled()
     local root = myRoot()
     if not root then return false end
     local ok, v = pcall(function() return root.AssemblyLinearVelocity end)
     if not ok or not v then return false end
     if _G.MOVE and _G.MOVE.Fly then return false end   -- flying is upward on purpose
-    return v.Y > (_G.FARM.FlingLift or 45)
+    if iskeypressed then
+        local okk, down = pcall(function() return iskeypressed(0x20) end)   -- space
+        if okk and down then lastJumpAt = tick() end
+    end
+    if (tick() - lastJumpAt) < 1.0 then return false end
+    return v.Y > (_G.FARM.FlingLift or 75)
 end
 
 -- (An AreaId attribute exists on the player and would name your current area, but every
@@ -2048,6 +2115,16 @@ local RIFT_EGG_ALIAS = {
     ["king mammoth"]        = "Colossal Mammoth",
     ["beluga whale"]        = "Belula Beluga",
     ["phoenix"]             = "Ascended Vermilion Phoenix",
+    -- Titan Temple. Every display name there is invented, so all four of these are renames.
+    -- The evidence is that the shape matcher finds exactly these four templates in Titan
+    -- Temple, sweep after sweep, and they are four of the eight names the Pet Index lists
+    -- for it - with the creature surviving each rename the way it does everywhere else.
+    -- I had already worked this out for the rarity table and then failed to write it here,
+    -- which is the same oversight that made Cosmic Gorilla undetectable.
+    ["spideron"]            = "Kaiju Spider",
+    ["crustacia"]           = "Crab",
+    ["bladehide"]           = "Blade Head",
+    ["mantaris"]            = "Mantis",
 }
 
 -- Case matters more than you would think: the rift panel writes "Lava frog" with a
@@ -2233,6 +2310,22 @@ local function readRiftUI()
                 local have, need
                 if amt then have, need = amt:match("^%s*(%d+)%s*/%s*(%d+)") end
                 local tmpl = resolveEggTemplate(nm, area)
+                -- Does that template actually exist? Four Titan Temple pets and a handful
+                -- elsewhere have display names with no model behind them, and a target
+                -- pointing at a template that does not exist can never match a world egg -
+                -- so the farm silently ignored it. Recorded here so the scoring can fall
+                -- back to "anything in that area" rather than nothing.
+                local known = false
+                do
+                    local RS = game:GetService("ReplicatedStorage")
+                    local okf, folder = pcall(function()
+                        return RS and RS.Assets and RS.Assets.Models
+                               and RS.Assets.Models:FindFirstChild("Eggs")
+                    end)
+                    if okf and folder and tmpl then
+                        known = folder:FindFirstChild(tmpl) ~= nil
+                    end
+                end
                 local tier = riftLabel(inp, "Empty", "Rarity")
                 -- Free rarity data, straight off the panel. "Rarity" is the template's own
                 -- placeholder text before it is filled in, so it is rejected by rank lookup.
@@ -2241,6 +2334,7 @@ local function readRiftUI()
                     name  = nm,
                     area  = area,
                     egg   = tmpl,
+                    known = known,
                     rarity = tier,
                     have  = tonumber(have) or 0,
                     need  = tonumber(need) or 1,
@@ -2400,6 +2494,37 @@ _G.SEHUB_RIFTREFRESH = refreshRiftTargets
 -- Progress. Prefers the rift panel's own "0/1" counters, which are authoritative;
 -- falls back to a loose backpack name match when the GUI cannot be read, so
 -- "Whale Shark [X2]" still counts as a Whale Shark.
+-- Do you already own one of this pet? Your backpack is 149 Tools with readable names, and
+-- pets keep their display name there - the same name the rift panel asks for - so this is a
+-- direct lookup rather than an inference.
+--
+-- Matched on "contains", because mutations prefix the name: a Golden Centapede, a Rainbow
+-- Cosmic Gorilla and a Silver Bladehide are all still that pet as far as the rift cares.
+local function ownsPet(name)
+    if not name then return false end
+    local want = string.lower(name)
+    local lp = localPlayer()
+    for _, where in ipairs({ lp and lp:FindFirstChild("Backpack"), lp and lp.Character }) do
+        if where then
+            local okk, kids = pcall(function() return where:GetChildren() end)
+            if okk and kids then
+                for _, c in ipairs(kids) do
+                    local okcl, cl = pcall(function() return c.ClassName end)
+                    if okcl and cl == "Tool" then
+                        local okn, n = pcall(function() return c.Name end)
+                        if okn and type(n) == "string"
+                           and string.find(string.lower(n), want, 1, true) then
+                            return true
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+_G.SEHUB_OWNS = ownsPet
+
 local function riftProgress()
     local live = readRiftUIStable()
     if live then
@@ -2414,7 +2539,11 @@ local function riftProgress()
         local have, total, held = 0, 0, {}
         for _, want in ipairs(live) do
             total = total + 1
-            local got = want.have >= want.need
+            -- OWNING one counts, not just having inserted it. The panel's 0/1 only moves
+            -- when a pet is put into the rift, so a backpack full of Centapedes still read
+            -- as "need Centapede" and the farm kept prioritising an egg you already had
+            -- several of. Owning one is the thing that makes hunting it pointless.
+            local got = (want.have >= want.need) or ownsPet(want.name)
             held[want.name] = got
             if got then have = have + 1 end
         end
@@ -2465,26 +2594,39 @@ _G.SEHUB_RIFT = riftProgress
 -- once and pays the full 49ms exactly once.
 local function sweepEggNames()
     local prev = _G.FARM.eggName or {}
-    -- Slots already fingerprinted, INCLUDING the ones that came back unidentifiable.
-    -- Without this second table an egg the matcher cannot name is re-fingerprinted on
-    -- every sweep forever, which is the expensive half of the job done repeatedly for a
-    -- guaranteed nil - and about a third of the map is unidentifiable.
+    -- Slots already fingerprinted, as an ATTEMPT COUNT rather than a flag.
+    --
+    -- This existed to stop unidentifiable eggs being re-fingerprinted every second forever,
+    -- which is real - but as a boolean it cached the first answer permanently, and the first
+    -- answer is often wrong. Models stream in progressively, so a slot fingerprinted a
+    -- moment too early has the wrong part count and matches nothing, and that nil then stuck
+    -- for the rest of the cycle. Measured: 0 of 46 slots named, then 46 of 46 the instant
+    -- this table was cleared. Rift eggs standing next to you read as undetected because of it.
+    --
+    -- Four attempts at 1Hz gives streaming several seconds to finish while still bounding
+    -- the cost for eggs that genuinely cannot be matched.
     local tried = _G.FARM.eggTried or {}
+    local TRY_LIMIT = 4
     local names, seen, ident, fresh = {}, {}, 0, 0
     for _, e in ipairs(eggSlots()) do
         local p = e.pos
         local key = string.format("%d_%d_%d", p.X, p.Y, p.Z)
         seen[key] = true
+        -- Coerced, because this table survives a reload and older builds stored `true`
+        -- here rather than a count. Comparing that to a number is an error that kills the
+        -- sweep outright, and the sweep is what feeds every priority decision.
+        local attempts = tried[key]
+        if type(attempts) ~= "number" then attempts = attempts and TRY_LIMIT or 0 end
         local nm = prev[key]
-        if nm == nil and not tried[key] then
-            -- Only mark it tried if the model was actually ALIVE to be looked at. A dead
+        if nm == nil and attempts < TRY_LIMIT then
+            -- Only count an attempt if the model was actually ALIVE to be looked at. A dead
             -- model returns nil for reasons that have nothing to do with the egg, and slots
-            -- reuse their exact positions - so marking a dead one tried would blacklist
-            -- that position and the egg that respawns there would never be identified.
+            -- reuse their exact positions - so spending attempts on a dead one would use up
+            -- the budget before the egg that respawns there is ever looked at.
             local okp, par = pcall(function() return e.model.Parent end)
             if okp and par ~= nil then
                 fresh = fresh + 1
-                tried[key] = true
+                tried[key] = attempts + 1
                 nm = eggNameFor(e.model, areaOf(p))
             end
         end
@@ -2571,10 +2713,16 @@ farmSec:Toggle("Auto Farm", false, function(v)
 end, "Runs continuously until you turn it off. Needs at least one area ticked below, and does NOT switch Instant Steal on for you.")
 farmSec:Toggle("Rare Priority", false, function(v) FM.RarePri = v end,
     "Rarest first: Divine before Eternal before Secret, all the way down to Common, with distance only breaking ties inside a tier. Rarity comes from the egg TYPE, identified by shape - the label above the egg is unreadable, but it does not need to be read. Eggs of unknown type fall back to the rare glow on their slot.")
+farmSec:Slider("Rarity Weight", 400, 50, 0, 3000, " studs", function(v) FM.RareWeight = v end,
+    "How far the farm will walk for one extra tier of rarity. This was effectively infinite, which is why Rare Priority sent you to one area and kept you there - Prehistoric runs Rare to Eternal while Forest runs Common to Legendary, so a single Secret outranked the whole map. At 400 rarity decides between nearby eggs and distance decides whether a far one is worth the trip. Max is the old behaviour: rarest first, wherever it is.")
 farmSec:Toggle("Auto Anti-Boss", false, function(v) FM.AutoBoss = v end,
     "Escapes to the safe zone when a guard starts closing on you WHILE you are carrying an egg. Not on the grab itself - that spends the escape before the boss has moved - and never empty-handed, since walking past a stationary guard closes distance fast and reads as a chase.")
 farmSec:Slider("Anti-Boss Delay", 0.15, 0.05, 0, 2, " s", function(v) FM.WakeDelay = v end,
     "How long after picking up an egg before Auto Anti-Boss fires. 0 leaves the instant the egg is in your hands. Titan Temple's guard wakes faster than the rest, so it uses a shorter delay than this if you set a longer one - it will never make your setting slower.")
+farmSec:Slider("Anti-Boss Teleports", 5, 1, 1, 15, "", function(v) AB.Count = v end,
+    "How many times the escape writes your position to the safe zone, a few milliseconds apart. One rejected write then does not lose the escape. Raise it if the anti-boss sometimes fails to move you; lower it if the teleport feels heavy-handed.")
+farmSec:Slider("Fling Threshold", 75, 5, 50, 150, " studs/s", function(v) FM.FlingLift = v end,
+    "Upward speed that counts as being thrown rather than jumping. A normal jump leaves the ground at about 50, which is why 45 used to fire the anti-boss every time you pressed space. Lower it if real flings are being missed; raise it if jumping still triggers an escape.")
 farmSec:Slider("Boss Reset Wait", 0, 0.5, 0, 10, " s", function(v) FM.PostDeliver = v end,
     "Pause at the safe zone after handing an egg over, before running out for the next one. Without it you can arrive at the next egg while the guard that chased you is still out of position, and it throws you as soon as you pick up. Mainly for farming without Auto Anti-Boss.")
 farmSec:Slider("Run Speed", 220, 10, 40, 320, " studs/s", function(v) FM.Speed = v end,
@@ -2664,7 +2812,7 @@ end
 
 riftSec:Toggle("Prioritize Current Eggs", true, function(v)
     FM.RiftPrio = v
-end, "Go for the three pets being asked for right now before anything else in those areas. Off means nearest-first, which banks eggs faster but ignores what the rift currently wants.")
+end, "Go for the three pets being asked for right now before anything else in those areas. A pet you already OWN stops being prioritised - one copy is all the rift needs, so a backpack full of Centapedes means Centapede eggs are treated as done. Once you own one of each the section reads COMPLETE and priority switches off, though it keeps farming those areas. Off means nearest-first from the start.")
 
 FM.riftUi = riftSec:Label("off")
 
@@ -2929,18 +3077,24 @@ SESPAWN("night watch", function()
                     -- Only a COMPLETE read may stop the farm. A partial one satisfies
                     -- "have >= total" as soon as the two pets it could see are done, which
                     -- would park you at the safe zone with a third still outstanding.
+                    -- COMPLETE means stop PRIORITISING, not stop farming. Owning one of each
+                    -- pet makes hunting those specific eggs pointless, but the banner's
+                    -- areas are still worth farming for everything else in them - and the
+                    -- requirements reroll, at which point priority comes back on its own.
+                    -- The farm used to switch itself off here, which threw away the run.
                     if have >= total and total >= 3 and FM.RiftComplete then
-                        FM.RiftState = string.format("ALL %d PETS - rift ready", total)
-                        if FM.On then
-                            FM.On = false
-                            FM.riftStartedFarm = false   -- it is already stopped
-                            notify("Rift Farm", "All three pets collected - farm stopped", 5)
-                            print("[Steal An Egg] rift pets complete:")
+                        FM.RiftState = string.format("COMPLETE - one of each owned, priority off (%d/%d)",
+                            have, total)
+                        if not FM.riftDoneNotified then
+                            FM.riftDoneNotified = true
+                            notify("Rift Farm", "One of each pet owned - priority off, still farming", 5)
+                            print("[Steal An Egg] rift pets complete - all owned:")
                             for _, t in ipairs(FM.RiftTargets or {}) do
-                                print("   " .. t.name .. " (" .. t.area .. ")")
+                                print("   " .. t.name .. " (" .. tostring(t.area) .. ")")
                             end
                         end
                     else
+                        FM.riftDoneNotified = false
                         -- Say what is actually on the map, not just what is missing from
                         -- the backpack. These eggs rotate: a target can be at zero for a
                         -- while, and without this the farm looks stuck when it is really
@@ -3055,11 +3209,36 @@ local function farmStep()
                     -- Did that grab actually land? Answered while running, not while
                     -- standing still. The slot model is destroyed server-side within a
                     -- round trip, so anything still there after 0.8s was never taken.
-                    if FM.pendingSlot ~= nil then
+                    -- CARRYING SOMETHING BEATS EVERY OTHER SIGNAL. Big eggs overlap the one
+                    -- being aimed at, so the press often takes the NEIGHBOUR - which leaves
+                    -- the target's slot sitting there, reads as a failed grab, and sends the
+                    -- farm back for it while an egg is already in your hands. That is the
+                    -- back-and-forth: it returns, gets chased, the anti-boss teleports, and
+                    -- it repeats until something kills you.
+                    --
+                    -- The slot check answers "did THAT egg go", which is the wrong question.
+                    -- This answers "am I holding an egg", which is the one that decides
+                    -- whether to deliver or turn round.
+                    if FM.pendingSlot ~= nil and not FM.pendingHadEgg and heldEggTool() then
+                        FM.eggIsTool = true    -- this kind of egg DOES show as a Tool
+                        FM.Confirmed = (FM.Confirmed or 0) + 1
+                        if FM.grabRetry and FM.pendingKey then
+                            FM.grabRetry[FM.pendingKey] = nil
+                            FM.fails[FM.pendingKey] = nil
+                        end
+                        -- The target is still there, so we took a neighbour. Leave it for
+                        -- later rather than immediately trying again and repeating the mix-up.
+                        if FM.pendingKey and not slotGone(FM.pendingSlot) then
+                            FM.visited[FM.pendingKey] = tick()
+                            FM.WrongEgg = (FM.WrongEgg or 0) + 1
+                        end
+                        FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
+                    elseif FM.pendingSlot ~= nil then
                         if slotGone(FM.pendingSlot) then
                             FM.Confirmed = (FM.Confirmed or 0) + 1
                             if FM.grabRetry and FM.pendingKey then
                                 FM.grabRetry[FM.pendingKey] = nil
+                                FM.fails[FM.pendingKey] = nil   -- it worked; forget the misses
                             end
                             FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
                         elseif (tick() - (FM.pendingAt or 0)) > 0.8 then
@@ -3082,7 +3261,55 @@ local function farmStep()
                             -- bouncing forever: a wasted trip home is a bad outcome, a farm
                             -- that never delivers is a broken one.
                             FM.Misses = (FM.Misses or 0) + 1
+                            -- And stop coming back to it. Two full attempts, each with its
+                            -- own retry from a different side, is enough to call an egg
+                            -- unreachable - almost always a bigger egg sitting over it.
+                            -- Banned for two minutes, by which point the map has usually
+                            -- reshuffled it anyway.
+                            if key then
+                                FM.fails[key] = (FM.fails[key] or 0) + 1
+                                if FM.fails[key] >= 2 then
+                                    FM.banned[key] = tick() + 120
+                                    FM.Banned = (FM.Banned or 0) + 1
+                                    FM.State = "egg unreachable (blocked) - skipping it"
+                                end
+                            end
                         end
+                    end
+
+                    -- THE TOOL IN YOUR HAND IS THE TRUTH, and it outranks the flag. If an
+                    -- egg is held, the farm is carrying one - whether it took it, you took
+                    -- it by hand, or the flag was cleared by a misread a moment earlier.
+                    -- Without this the farm would walk off to grab a second egg while one
+                    -- was already in your hands.
+                    if heldEggTool() and not FM.hasEgg then
+                        FM.hasEgg = true
+                        FM.eggIsTool = true
+                        FM.grabbedAt = FM.grabbedAt or tick()
+                        FM.depositAt = nil
+                    end
+
+                    -- ABSENCE OF A TOOL PROVES NOTHING unless this egg was one.
+                    --
+                    -- The Tool was verified on a Riftbeasts Egg from the rift machine and I
+                    -- assumed every egg behaved the same. Stolen area eggs appear not to -
+                    -- which matches this file's original finding of no Tool across 541
+                    -- ragdolls, a note I had just finished calling wrong. So for a stolen
+                    -- egg heldEggTool() returns nil the whole way home, this check fired
+                    -- 1.5s after every grab, cleared the flag, and sent the farm off to the
+                    -- next area still carrying the egg. That is the "grabs one then goes
+                    -- somewhere else" bug.
+                    --
+                    -- FM.eggIsTool records whether a Tool actually appeared for THIS egg.
+                    -- Only then does its disappearance mean anything.
+                    if FM.hasEgg and FM.eggIsTool and FM.pendingSlot == nil and FM.grabbedAt
+                       and (tick() - FM.grabbedAt) > 1.5 and not heldEggTool() then
+                        FM.hasEgg = false
+                        FM.depositAt = nil
+                        FM.Dropped = (FM.Dropped or 0) + 1
+                        FM.State = "no egg in hand - back to farming"
+                        task.wait(0.05)
+                        return
                     end
 
                     if FM.hasEgg and homeP then
@@ -3116,9 +3343,32 @@ local function farmStep()
                             -- that never actually landed would otherwise end the run.
                             FM.depositAt = FM.depositAt or tick()
                             local held = tick() - FM.depositAt
-                            -- Standing on the delivery point for a couple of seconds is
-                            -- taken as delivered. There is no readable signal for the
-                            -- egg leaving your hands, so this is a timer, not a fact.
+                            -- Delivery is a fact ONLY for eggs that were a Tool to begin
+                            -- with. For those, the Tool leaving the character is the
+                            -- hand-over. For the rest - stolen area eggs, which never show
+                            -- one - this test would be true the instant you arrived and
+                            -- would declare delivery before it happened, so they fall
+                            -- through to the timer below.
+                            if FM.eggIsTool and not heldEggTool() then
+                                FM.hasEgg = false
+                                FM.depositAt = nil
+                                FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
+                                local pause = FM.PostDeliver or 0
+                                if pause > 0 then
+                                    FM.State = string.format("delivered - letting the boss reset (%.1fs)", pause)
+                                    local t0d = tick()
+                                    while (tick() - t0d) < pause and FM.On do
+                                        pcall(function()
+                                            root.AssemblyLinearVelocity =
+                                                Vector3.new(0, -(FM.Stick or 18), 0)
+                                        end)
+                                        task.wait(0.05)
+                                    end
+                                end
+                                FM.State = "delivered - back to farming"
+                                task.wait(0.05)
+                                return
+                            end
                             if held > (FM.DeliverSettle or 2.5) then
                                 FM.hasEgg = false
                                 FM.depositAt = nil
@@ -3184,6 +3434,13 @@ local function farmStep()
                         local allowed = (FM.Areas[t.area] == true)
                         local key = string.format("%d_%d_%d", t.pos.X, t.pos.Y, t.pos.Z)
                         local cool = (now - (FM.visited[key] or 0)) > FM.Cooldown
+                        -- An egg that cannot be taken must stop being chosen. A big
+                        -- neighbour overlapping it does not go away, so without this the
+                        -- highest-scoring ungrabbable egg becomes a permanent magnet: run
+                        -- out, fail, 6 second cooldown, run out again - forever, and every
+                        -- one of those trips is time spent standing in a guard's area
+                        -- getting caught for nothing.
+                        if (FM.banned[key] or 0) > now then allowed = false end
                         if allowed then anyAllowed = anyAllowed + 1 end
 
                         if allowed and cool then
@@ -3209,12 +3466,25 @@ local function farmStep()
                             -- the rarity rung then decides the order among the wanted ones.
                             local pri = 0
                             local wanted = false
-                            if FM.Rift and FM.RiftPrio and en then
+                            if FM.Rift and FM.RiftPrio then
                                 for _, want in ipairs(FM.RiftTargets or {}) do
-                                    if want.egg == en and not (FM.RiftHave or {})[want.name] then
-                                        wanted = true
-                                        pri = pri + 10000000    -- above every rarity
-                                        break
+                                    if not (FM.RiftHave or {})[want.name] then
+                                        -- Normal case: we know which egg drops this pet.
+                                        if en and want.egg == en then
+                                            wanted = true
+                                        -- Fallback: the pet's egg has no template we can
+                                        -- recognise, so the most we honestly know is the
+                                        -- AREA it comes from. Prioritising everything there
+                                        -- is worse than picking the right egg and far better
+                                        -- than the old behaviour, which was to ignore the
+                                        -- target completely and farm as if it did not exist.
+                                        elseif want.known == false and want.area == t.area then
+                                            wanted = true
+                                        end
+                                        if wanted then
+                                            pri = pri + 10000000    -- above every rarity
+                                            break
+                                        end
                                     end
                                 end
                             end
@@ -3223,15 +3493,16 @@ local function farmStep()
                             -- idea and made "which of these is ordering my eggs" a question
                             -- you had to think about.
                             if FM.RarePri then
+                                local W = FM.RareWeight or 400
                                 local rank = rarityRank(en, t.area)
                                 if rank > 0 then
-                                    pri = pri + rank * 20000
+                                    pri = pri + rank * W
                                 elseif looksRare(t) then
                                     -- Unidentified, but wearing the rare glow. Worth more
                                     -- than a known common and less than a known Legendary,
                                     -- so it slots in at the middle rung rather than
                                     -- pretending to a precision we do not have.
-                                    pri = pri + 5 * 20000
+                                    pri = pri + 5 * W
                                 end
                             end
                             local score = d - pri
@@ -3280,10 +3551,26 @@ local function farmStep()
                         FM.State = "nothing to farm (all on cooldown or no area on)"
                         task.wait(0.5)
                     else
+                        -- APPROACH FROM A DIFFERENT SIDE ON A RETRY. Eggs vary enormously
+                        -- in size - hitboxes run from 0.6 to 13.6 studs across - so a big
+                        -- neighbour can sit on top of the one being aimed at, blocking the
+                        -- line of sight the game needs to show its prompt. Standing in the
+                        -- same spot and pressing again just fails again.
+                        --
+                        -- Each retry rotates the standing position 137 degrees around the
+                        -- egg, which walks around it without ever repeating a side. The aim
+                        -- point stays 1.2 studs out, so you are still inside the egg and
+                        -- still unambiguously nearest to it.
+                        local aim = best.pos
+                        local tries = (FM.grabRetry or {})[best.key or ""] or 0
+                        if tries > 0 then
+                            local ang = tries * 2.39   -- radians; 137 degrees, the awkward angle
+                            aim = best.pos + Vector3.new(math.cos(ang) * 1.2, 0, math.sin(ang) * 1.2)
+                        end
                         -- Horizontal, for the same reason as the scoring above: the Y gap
                         -- to an egg is roughly 2 studs and the character cannot close it,
                         -- so a 3D test against a 1.5 stud reach never passes.
-                        local d = (Vector3.new(best.pos.X, me.Y, best.pos.Z) - me).Magnitude
+                        local d = (Vector3.new(aim.X, me.Y, aim.Z) - me).Magnitude
                         if d > FM.Reach then
                             -- Run there, glued to the floor, but SLOW DOWN on approach.
                             -- Driving at full speed until the moment you are in range
@@ -3291,7 +3578,7 @@ local function farmStep()
                             -- sail straight past and end up out of reach with the
                             -- prompt behind you. Speed is tapered from BRAKE_DIST so
                             -- the last stretch is walked, not sprinted.
-                            local flat = Vector3.new(best.pos.X - me.X, 0, best.pos.Z - me.Z)
+                            local flat = Vector3.new(aim.X - me.X, 0, aim.Z - me.Z)
                             local m = flat.Magnitude
                             if m > 0.01 then
                                 local sp = FM.Speed
@@ -3442,6 +3729,14 @@ local function farmStep()
                             FM.pendingSlot = slot
                             FM.pendingKey  = best.key
                             FM.pendingAt   = tick()
+                            -- Whether anything was in hand BEFORE the press, so a Tool
+                            -- appearing afterwards is proof this grab landed - even if it
+                            -- landed on the wrong egg.
+                            FM.pendingHadEgg = (heldEggTool() ~= nil)
+                            -- Set true only if a Tool actually turns up for this egg, which
+                            -- the pending window below watches for. Until then, assume not:
+                            -- assuming it does is what sent the farm off mid-carry.
+                            FM.eggIsTool = false
                             FM.hasEgg = true
                             FM.grabbedAt = tick()
                             FM.grabEscaped = false    -- arm the post-grab escape
@@ -3496,9 +3791,10 @@ diagSec:Button("Check Rift Progress", function()
     print("   banner: " .. tostring(FM.RiftBanner or FM.RiftBannerGuess or "unreadable"))
     print("   areas:  " .. tostring(FM.RiftAreaNote or "not set"))
     for _, t in ipairs(FM.RiftTargets or {}) do
-        print(string.format("   [%s] %-14s %-10s from %-12s egg: %s",
+        print(string.format("   [%s] %-14s %-10s from %-12s egg: %-22s %s",
             held[t.name] and "x" or " ", t.name, tostring(t.rarity or "?"),
-            tostring(t.area), tostring(t.egg)))
+            tostring(t.area), tostring(t.egg),
+            _G.SEHUB_OWNS(t.name) and "OWNED - not prioritised" or "still wanted"))
     end
     print(string.format("   egg types identified on the map: %d", FM.EggIdent or 0))
     local seen = {}
@@ -3609,6 +3905,14 @@ diagSec:Button("Log Capability Report", function()
         FM.Confirmed or 0))
     print(string.format("   grabs unconfirmed     %d  (retried, egg still there, carried on anyway)",
         FM.Misses or 0))
+    print(string.format("   eggs skipped as blocked %d  (banned 2 min after two failed attempts)",
+        FM.Banned or 0))
+    print(string.format("   wrong egg taken       %d  (a big neighbour, target left for later)",
+        FM.WrongEgg or 0))
+    print(string.format("   eggs lost in transit  %d  (thrown or killed on the way home)",
+        FM.Dropped or 0))
+    local t, nm = _G.SEHUB_HELDEGG()
+    print(string.format("   holding right now     %s", t and tostring(nm) or "nothing"))
     print(string.format("   fallback holds used   %d  (instant patch failed on these)",
         FM.Fallbacks or 0))
     print(string.format("   anti-boss ticks       %d", W.ticks or 0))
