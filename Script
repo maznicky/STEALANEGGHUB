@@ -342,6 +342,12 @@ _G.SEHUB_HELDEGG = heldEggTool
 local function stowHeldEgg()
     local tool = heldEggTool()
     if not tool then return true end          -- nothing to put away
+    -- LIVENESS FIRST. Delivering consumes the egg, so the server destroys this Tool at the
+    -- same moment we would be re-parenting it, and writing Parent on a freed instance is a
+    -- native crash that pcall cannot catch - the same failure mode as the double-freed
+    -- drawings. Reading Parent is safe; writing to a dead one is not.
+    local okp, par = pcall(function() return tool.Parent end)
+    if not okp or par == nil then return true end
     local lp = localPlayer()
     local bp = lp and lp:FindFirstChild("Backpack")
     if not bp then return false end
@@ -501,20 +507,63 @@ end
 -- Matcha delivers KeyCode as a raw number about as often as an Enum, and never
 -- delivers gameProcessed, so every key test has to accept both forms. The letter is
 -- converted to its virtual-key code because that is what iskeypressed wants.
+-- The KeyCode a name maps to, asked of the engine rather than guessed from its letter.
+-- string.byte was the old approach and it is wrong: Enum.KeyCode.F.Value is 102, the byte
+-- of LOWERCASE f, while the code compared against byte("F") = 70. It also cannot express
+-- F1 at all, which is 282.
+local function keyCodeValue(name)
+    if not name then return nil end
+    local ok, v = pcall(function() return Enum.KeyCode[name].Value end)
+    if ok and type(v) == "number" then return v end
+    return nil
+end
+
+-- Matcha delivers KeyCode as a raw number about as often as an Enum, and its Enum names
+-- come back as "KeyCode.F1" rather than "F1", so every comparison here has to accept all
+-- three shapes. Both of the old branches were broken - the numeric one by the byte
+-- mismatch above, the name one by the "KeyCode." prefix - which meant a keybind of F1
+-- would simply never have fired.
 local function keyMatches(input, letter)
-    if not input then return false end
-    local want = string.byte(string.upper(letter))
+    if not input or not letter then return false end
     local ok, kc = pcall(function() return input.KeyCode end)
     if not ok or kc == nil then return false end
-    if type(kc) == "number" then return kc == want end
+    local want = keyCodeValue(letter)
+
+    if type(kc) == "number" then
+        if want and kc == want then return true end
+        if #letter == 1 then
+            return kc == string.byte(string.lower(letter))
+                or kc == string.byte(string.upper(letter))
+        end
+        return false
+    end
+
     local okv, v = pcall(function() return kc.Value end)
-    if okv and v == want then return true end
+    if okv and want and v == want then return true end
     local okn, n = pcall(function() return kc.Name end)
-    return okn and type(n) == "string" and string.upper(n) == string.upper(letter)
+    if okn and type(n) == "string" then
+        local N, L = string.upper(n), string.upper(letter)
+        if N == L then return true end
+        if string.match(N, "%.([%w_]+)$") == L then return true end   -- "KEYCODE.F1"
+    end
+    return false
 end
+-- iskeypressed wants a WINDOWS virtual-key code, which is not the same thing as a byte.
+-- For A-Z and 0-9 the uppercase byte happens to equal the VK code, which is why the old
+-- one-liner worked - but only for those. F1 is VK 0x70, nowhere near byte("F") = 70
+-- decimal, so a function-key bind polled the letter F instead.
+local VK = {
+    F1 = 0x70, F2 = 0x71, F3 = 0x72, F4 = 0x73, F5 = 0x74, F6 = 0x75,
+    F7 = 0x76, F8 = 0x77, F9 = 0x78, F10 = 0x79, F11 = 0x7A, F12 = 0x7B,
+    SPACE = 0x20, LSHIFT = 0xA0, RSHIFT = 0xA1, LCONTROL = 0xA2, RCONTROL = 0xA3,
+    TAB = 0x09, LALT = 0xA4, RALT = 0xA5, BACKSPACE = 0x08, ENTER = 0x0D,
+}
 local function keyDown(letter)
-    if not iskeypressed then return false end
-    local ok, d = pcall(function() return iskeypressed(string.byte(string.upper(letter))) end)
+    if not iskeypressed or not letter then return false end
+    local up = string.upper(tostring(letter))
+    local code = VK[up] or (#up == 1 and string.byte(up) or nil)
+    if not code then return false end
+    local ok, d = pcall(function() return iskeypressed(code) end)
     return (ok and d) and true or false
 end
 
@@ -866,15 +915,12 @@ end
 -- exposed so the re-run guard of the NEXT load can undo this one's writes
 _G.SEHUB_RESTORE = restorePrompts
 
-local steal = win:Tab("Steal", "egg")
-local stealSec = steal:Section("Instant Steal", "Full")
-stealSec:Label("Zeroes the prompt hold time and widens its reach by")
-stealSec:Label("writing the ProximityPrompt struct directly. The property")
-stealSec:Label("route errors under Matcha and fireproximityprompt does")
-stealSec:Label("not exist, so this is the only way that works.")
-stealSec:Label("Values are read back after every write - if an update")
-stealSec:Label("moves the offsets it stops instead of writing blind.")
-stealSec:Toggle("Instant Steal", true, function(v)
+local main = win:Tab("Main", "egg")
+local stealSec = main:Section("Instant Steal", "Full")
+stealSec:Label("Removes the prompt hold time, letting you pick eggs up")
+stealSec:Label("instantly. I wouldn't rely on this too much for auto-")
+stealSec:Label("farming - it tends to stop working after a while.")
+stealSec:Toggle("Instant Steal", false, function(v)
     ST.On = v
     if v then
         ST.offsetsOk = true
@@ -884,7 +930,7 @@ stealSec:Toggle("Instant Steal", true, function(v)
         restorePrompts()
         ST.doneAt = {}
     end
-end, "On by default because the farm depends on it. Applies continuously - prompts are recreated as you move around, so the sweep repeats every couple of seconds.")
+end, "Off by default now: it stops working after a while, and the farm no longer depends on it - with this off the grab just holds E for the prompt's real time. Applies continuously while on, since prompts are recreated as you move around.")
 -- No Hold Time slider any more. It existed so instant steal could be softened if instant
 -- turned out to be what got flagged, and it read 1.00s here - which is not a softer
 -- instant steal, it is no instant steal at all. Nothing else in the menu can switch off
@@ -900,9 +946,10 @@ end, "On by default because the farm depends on it. Applies continuously - promp
 --
 -- Bigger was assumed better because 15 was the measured ceiling - true, and irrelevant.
 -- Reach is worth nothing if it cannot tell two eggs apart.
-stealSec:Slider("Prompt Range", 5, 1, 4, 15, " studs", function(v) ST.Dist = v end,
-    "How far away the prompt can be triggered from. 5 keeps exactly one egg in range at a time - eggs are only 6.7 studs apart, so anything much larger makes the neighbours eligible too and you take the wrong one. 15 is the server-validated ceiling if you want reach instead of precision.")
-stealSec:Toggle("Ignore Line of Sight", false, function(v)
+-- No Prompt Range slider either. It has exactly one correct value here: 5 keeps precisely
+-- one egg in range at a time, because slots sit 6.7 studs apart and anything larger makes
+-- the neighbours eligible and you take the wrong egg. It is pinned below.
+stealSec:Toggle("Ignore Line of Sight", true, function(v)
     ST.NoLOS = v
     if v then
         ST.offsetsOk = true
@@ -915,10 +962,6 @@ stealSec:Toggle("Ignore Line of Sight", false, function(v)
         notify("Instant Steal", "Line-of-sight restored", 3)
     end
 end, "EXPERIMENTAL. Roblox only shows a prompt when the camera can see it, which is why pointing the camera down and zooming in makes grabs work smoothly. This clears the byte that looks like RequiresLineOfSight so the camera stops mattering. If prompts stop working entirely when you enable this, that byte was Enabled instead - switch it off and tell me, the next candidate is one byte earlier.")
-stealSec:Button("Restore Originals", function()
-    local n = restorePrompts()
-    notify("Instant Steal", "Restored " .. tostring(n or 0) .. " prompts", 2)
-end, "Puts every prompt back to the values recorded before the first write.")
 ST.ui = stealSec:Label("off")
 
 -- Building the menu fires every widget's callback, so the values the sliders hand back
@@ -936,7 +979,11 @@ ST.ui = stealSec:Label("off")
 -- So the two values that decide whether a grab works at all are pinned to a known-good
 -- state on every load, loudly. The sliders still work normally once you are in-game; this
 -- only controls where each session STARTS.
-local STboot = { Hold = 0, Dist = 5 }
+-- Dist has no slider any more, so this is the only thing setting it. On and NoLOS are
+-- pinned for the same reason everything else here is: the menu remembers what a toggle was
+-- last set to and replays it over the declared default, so without this Instant Steal came
+-- back ON and Ignore Line of Sight came back OFF - both the opposite of what was asked for.
+local STboot = { Hold = 0, Dist = 5, On = false, NoLOS = true }
 for k, want in pairs(STboot) do
     if ST[k] ~= want then
         warn(string.format("[Steal An Egg] menu returned ST.%s=%s - starting at %s",
@@ -958,70 +1005,18 @@ SESPAWN("prompt patch", function()
 end)
 
 -- ==================== movement ====================
--- Velocity, not CFrame. Both work here, but velocity is smooth, has no observed
--- ceiling, and never triggered the pull-back that a 350 stud teleport did.
+-- The Movement tab and its fly loop are gone. Flight was never usable here for the reason
+-- discovered early on: in the egg areas, more than about a second off the ground gets you
+-- snapped down and then killed, so a flight feature in a game about running between eggs on
+-- the floor was a tab nobody could safely open.
+--
+-- The table stays because isRagdolled() checks _G.MOVE.Fly to avoid mistaking deliberate
+-- upward motion for a fling. With nothing able to set it, that check is now always false -
+-- harmless, and cheaper than hunting every reference.
 _G.MOVE = _G.MOVE or {}
 local MV = _G.MOVE
 MV.Fly      = false
-MV.Speed    = 120
-MV.Key      = "g"
-MV.Hover    = 12       -- upward studs/s needed to hold altitude; measured ~12
 MV.State    = "off"
-
-local move = win:Tab("Movement", "wind")
-local flySec = move:Section("Flight", "Full")
-flySec:Label("Writes AssemblyLinearVelocity along the camera's facing.")
-flySec:Label("Speed is nearly free - 205 studs/s sustained, 411 studs in")
-flySec:Label("two seconds, nothing pulled back, and no fall damage. What")
-flySec:Label("is NOT free is air time: more than about a second off the")
-flySec:Label("ground causes trouble, so keep it low and brief. Nothing")
-flySec:Label("here is subtle - other players see you moving impossibly.")
-flySec:Toggle("Fly", false, function(v)
-    MV.Fly = v
-    if not v then MV.State = "off" end
-end, "Hold the fly key to move along the camera's facing.")
-flySec:Slider("Speed", 200, 10, 20, 320, " studs/s", function(v) MV.Speed = v end,
-    "Capped at 320: past that it starts misbehaving. Speed itself is not what gets caught - TIME OFF THE GROUND is. Stay under about a second airborne.")
-flySec:Slider("Hover Lift", 12, 1, 0, 40, " studs/s", function(v) MV.Hover = v end,
-    "Zero vertical velocity still sinks about 12 studs/s, so holding an altitude needs a small upward push. This is that push.")
-MV.ui = flySec:Label("off")
-MV.keyUi = flySec:Keybind("Fly Key", "g", function(k) MV.Key = k end,
-    "Held, not toggled. Mouse 4 and 5 are not offered - Matcha reads them as never pressed.")
-
-SESPAWN("fly", function()
-    while _G.SEHUB_GEN == GEN do
-        if MV.Fly then
-            local held = keyDown(tostring(MV.Key or "g"))
-            if not held and MV.keyUi then
-                local ok, v = pcall(function() return MV.keyUi:IsActivated() end)
-                if ok and v then held = true end
-            end
-            if held then
-                local root = myRoot()
-                local cam = getCamera()
-                if root and cam then
-                    local okc, cf = pcall(function() return cam.CFrame end)
-                    if okc and cf then
-                        local look = cf.LookVector
-                        local vel = look * MV.Speed
-                        -- Near-level flight sinks without help, so add the hover push
-                        -- only when the camera is not deliberately pointed up or down.
-                        if math.abs(look.Y) < 0.25 then
-                            vel = Vector3.new(vel.X, MV.Hover, vel.Z)
-                        end
-                        pcall(function() root.AssemblyLinearVelocity = vel end)
-                        MV.State = string.format("flying at %d studs/s", MV.Speed)
-                    end
-                else
-                    MV.State = "no character"
-                end
-            else
-                MV.State = "ready - hold " .. tostring(MV.Key)
-            end
-        end
-        task.wait(0.03)
-    end
-end)
 
 -- ==================== anti-boss ====================
 -- Save a spot, return to it instantly. Ported from the reference script, which is
@@ -1035,7 +1030,7 @@ AB.Zone   = CFrame.new(537.9755, 70.5763, -371.0225)
 AB.Count  = 5          -- repeats, to beat a single rejected write
 AB.HoldFor = 6         -- seconds to keep re-planting you while a ragdoll is active
 AB.Delay  = 0.005
-AB.Key    = "f"
+AB.Key    = "F1"
 AB.State  = "no safe zone set"
 
 -- One teleport, done the way that actually sticks: an immediate write, then repeats a
@@ -1093,13 +1088,10 @@ local function gotoZone(quiet)
     if not quiet then notify("Anti-Boss", "Teleported to safe zone", 2) end
 end
 
-local boss = win:Tab("Anti-Boss", "shield")
-local bossSec = boss:Section("Safe Zone", "Full")
-bossSec:Label("The safe zone is set in the script already - it is the spot")
-bossSec:Label("the farm uses for escapes and deliveries. The button below")
-bossSec:Label("only overrides it if you want to escape somewhere else.")
-bossSec:Label("Keep it reasonably close: short hops have always held,")
-bossSec:Label("while one 350 stud jump was dragged back after a second.")
+-- Shares the Main tab with Instant Steal now, rather than owning a tab for two controls.
+local bossSec = main:Section("Anti-Boss", "Full")
+bossSec:Label("Quickly teleports you to the safe zone and back so the")
+bossSec:Label("boss stops chasing you.")
 bossSec:Button("Set Safe Zone", function()
     local root = myRoot()
     if not root then
@@ -1115,15 +1107,13 @@ bossSec:Button("Set Safe Zone", function()
     else
         notify("Anti-Boss", "Could not read your position", 2)
     end
-end, "Saves where you are standing right now.")
-bossSec:Button("Escape Now", function() gotoZone() end,
-    "Same as pressing the key below.")
--- The teleport-repeat slider lives in the Auto Farm section now, next to Anti-Boss Delay,
+end, "Saves where you are standing right now. A safe zone is already set in the script - the spot the farm uses for escapes and deliveries - so this only overrides it. Keep it close: short hops have always held, while one 350 stud jump was dragged back after a second.")
+-- The teleport-repeat slider lives in the Auto Farm section, next to Anti-Boss Delay,
 -- because that is where the anti-boss is actually tuned. One control, not two: a second
 -- slider writing the same value is how Hold Time ended up at 1.00s with nothing on screen
 -- admitting it.
 AB.ui = bossSec:Label("no safe zone set")
-AB.keyUi = bossSec:Keybind("Escape Key", "f", function(k) AB.Key = k end,
+AB.keyUi = bossSec:Keybind("Escape Key", "F1", function(k) AB.Key = k end,
     "Fires on press, not hold.")
 
 -- InputBegan is the ONLY event that connects under Matcha - :Connect on Instances
@@ -1136,7 +1126,7 @@ do
             local conn = UIS.InputBegan:Connect(function(input)
                 if _G.SEHUB_GEN ~= GEN then return end
                 pcall(function()
-                    if keyMatches(input, tostring(AB.Key or "f")) then gotoZone() end
+                    if keyMatches(input, tostring(AB.Key or "F1")) then gotoZone() end
                 end)
             end)
             _G.SEHUB_CONN = conn
@@ -1146,7 +1136,7 @@ end
 SESPAWN("escape key", function()
     local wasDown = false
     while _G.SEHUB_GEN == GEN do
-        local down = keyDown(tostring(AB.Key or "f"))
+        local down = keyDown(tostring(AB.Key or "F1"))
         if down and not wasDown and AB.Zone then gotoZone() end
         wasDown = down
         task.wait(0.05)
@@ -2515,9 +2505,14 @@ _G.SEHUB_RIFTREFRESH = refreshRiftTargets
 --
 -- Matched on "contains", because mutations prefix the name: a Golden Centapede, a Rainbow
 -- Cosmic Gorilla and a Silver Bladehide are all still that pet as far as the rift cares.
-local function ownsPet(name)
-    if not name then return false end
-    local want = string.lower(name)
+-- Built ONCE and cached for a second, rather than walked per pet. The backpack is 150
+-- Tools and this is asked three times a second - once per rift target - so the naive
+-- version was 450 name reads a second, about 80ms of every second spent re-reading a list
+-- that changes when you hatch something. The inventory does not change fast enough to care.
+local OWNED_CACHE, OWNED_AT = nil, 0
+local function ownedNames()
+    if OWNED_CACHE and (tick() - OWNED_AT) < 1.0 then return OWNED_CACHE end
+    local out = {}
     local lp = localPlayer()
     for _, where in ipairs({ lp and lp:FindFirstChild("Backpack"), lp and lp.Character }) do
         if where then
@@ -2527,14 +2522,23 @@ local function ownsPet(name)
                     local okcl, cl = pcall(function() return c.ClassName end)
                     if okcl and cl == "Tool" then
                         local okn, n = pcall(function() return c.Name end)
-                        if okn and type(n) == "string"
-                           and string.find(string.lower(n), want, 1, true) then
-                            return true
+                        if okn and type(n) == "string" then
+                            out[#out + 1] = string.lower(n)
                         end
                     end
                 end
             end
         end
+    end
+    OWNED_CACHE, OWNED_AT = out, tick()
+    return out
+end
+
+local function ownsPet(name)
+    if not name then return false end
+    local want = string.lower(name)
+    for _, n in ipairs(ownedNames()) do
+        if string.find(n, want, 1, true) then return true end
     end
     return false
 end
@@ -2728,16 +2732,12 @@ farmSec:Toggle("Auto Farm", false, function(v)
 end, "Runs continuously until you turn it off. Needs at least one area ticked below, and does NOT switch Instant Steal on for you.")
 farmSec:Toggle("Rare Priority", false, function(v) FM.RarePri = v end,
     "Rarest first: Divine before Eternal before Secret, all the way down to Common, with distance only breaking ties inside a tier. Rarity comes from the egg TYPE, identified by shape - the label above the egg is unreadable, but it does not need to be read. Eggs of unknown type fall back to the rare glow on their slot.")
-farmSec:Slider("Rarity Weight", 400, 50, 0, 3000, " studs", function(v) FM.RareWeight = v end,
-    "How far the farm will walk for one extra tier of rarity. This was effectively infinite, which is why Rare Priority sent you to one area and kept you there - Prehistoric runs Rare to Eternal while Forest runs Common to Legendary, so a single Secret outranked the whole map. At 400 rarity decides between nearby eggs and distance decides whether a far one is worth the trip. Max is the old behaviour: rarest first, wherever it is.")
 farmSec:Toggle("Auto Anti-Boss", false, function(v) FM.AutoBoss = v end,
     "Escapes to the safe zone when a guard starts closing on you WHILE you are carrying an egg. Not on the grab itself - that spends the escape before the boss has moved - and never empty-handed, since walking past a stationary guard closes distance fast and reads as a chase.")
 farmSec:Slider("Anti-Boss Delay", 0.15, 0.05, 0, 2, " s", function(v) FM.WakeDelay = v end,
     "How long after picking up an egg before Auto Anti-Boss fires. 0 leaves the instant the egg is in your hands. Titan Temple's guard wakes faster than the rest, so it uses a shorter delay than this if you set a longer one - it will never make your setting slower.")
 farmSec:Slider("Anti-Boss Teleports", 5, 1, 1, 15, "", function(v) AB.Count = v end,
     "How many times the escape writes your position to the safe zone, a few milliseconds apart. One rejected write then does not lose the escape. Raise it if the anti-boss sometimes fails to move you; lower it if the teleport feels heavy-handed.")
-farmSec:Slider("Fling Threshold", 75, 5, 50, 150, " studs/s", function(v) FM.FlingLift = v end,
-    "Upward speed that counts as being thrown rather than jumping. A normal jump leaves the ground at about 50, which is why 45 used to fire the anti-boss every time you pressed space. Lower it if real flings are being missed; raise it if jumping still triggers an escape.")
 farmSec:Slider("Boss Reset Wait", 0, 0.5, 0, 10, " s", function(v) FM.PostDeliver = v end,
     "Pause at the safe zone after handing an egg over, before running out for the next one. Without it you can arrive at the next egg while the guard that chased you is still out of position, and it throws you as soon as you pick up. Mainly for farming without Auto Anti-Boss.")
 farmSec:Slider("Run Speed", 220, 10, 40, 320, " studs/s", function(v) FM.Speed = v end,
@@ -3402,15 +3402,14 @@ local function farmStep()
                             if held > (FM.DeliverSettle or 2.5) then
                                 FM.hasEgg = false
                                 FM.depositAt = nil
-                                -- Put away whatever the hand-over left in your hands, so
-                                -- the next run does not start holding the last egg.
-                                if heldEggTool() then
-                                    if stowHeldEgg() then
-                                        FM.Stowed = (FM.Stowed or 0) + 1
-                                    else
-                                        FM.StowFail = (FM.StowFail or 0) + 1
-                                    end
-                                end
+                                -- NOT stowed here. Delivering is the moment the server
+                                -- destroys the egg Tool, so re-parenting it right now is a
+                                -- race against a free - and losing that race takes the whole
+                                -- executor down rather than raising an error. The stow is
+                                -- deferred to the start of the next run instead, by which
+                                -- point a Tool that still exists is one the game has decided
+                                -- to leave you, and is safe to move.
+                                FM.stowPending = true
                                 -- Never carry a slot reference past the run it belongs to.
                                 FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
                                 -- Wait before setting off again. Sprinting straight back
@@ -3453,6 +3452,23 @@ local function farmStep()
 
                     -- nothing in hand: the delivery clock resets for next time
                     FM.depositAt = nil
+
+                    -- Deferred stow. We are past the delivery, the egg Tool has either been
+                    -- consumed (nothing to do) or survived it (safe to move), so putting it
+                    -- away here cannot collide with the server destroying it.
+                    -- Kill switch. Run  _G.FARM.NoStow = true  to disable the auto-unequip
+                    -- without reloading, so if crashes continue this can be ruled in or out
+                    -- in one line rather than by another round of guessing.
+                    if FM.stowPending then
+                        FM.stowPending = nil
+                        if heldEggTool() and not FM.NoStow then
+                            if stowHeldEgg() then
+                                FM.Stowed = (FM.Stowed or 0) + 1
+                            else
+                                FM.StowFail = (FM.StowFail or 0) + 1
+                            end
+                        end
+                    end
 
                     -- PHASE 3: nothing in hand, so go take one.
                     --
@@ -4006,7 +4022,6 @@ SESPAWN("ui refresh", function()
         setLabel("steal", ST.ui, tostring(ST.State))
         setLabel("farm", FM.ui, tostring(FM.State))
         setLabel("rift", FM.riftUi, tostring(FM.RiftState))
-        setLabel("move", MV.ui, tostring(MV.State))
         setLabel("boss", AB.ui, tostring(AB.State))
         -- health is rounded to one decimal so it stops churning the string every tick
         setLabel("diag", diagLbl, string.format("health %.1f | prompts %d | eggs %d | escapes %d",
