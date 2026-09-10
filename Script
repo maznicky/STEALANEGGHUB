@@ -67,6 +67,54 @@ end
 -- about which one is at fault is slower than switching them off one at a time.
 _G.SEHUB_SKIP = _G.SEHUB_SKIP or {}
 _G.SEHUB_LOOPS = {}
+-- ---------------- tick profiler ----------------
+-- Added because the freezes have now survived two rounds of fixing the thing I ASSUMED was
+-- slow. Both times the number that convinced me came from a probe I wrote to imitate the
+-- real function, not the function itself, and both times the imitation was wrong - once by
+-- doing a descendant walk the real code never does.
+--
+-- This times the real loops in place, while you play, and keeps the worst tick plus what
+-- the farm was doing at that moment. Cost is two tick() calls per iteration.
+_G.SEHUB_SLOW = _G.SEHUB_SLOW or {}
+
+-- Waiting is not working, and conflating the two is how the first reading lied. farmStep
+-- sleeps inside itself - 0.2s when the farm is off, 0.03s between phases - so timing the
+-- call end to end reported a 0.2 second nap as a 200ms stall. PWAIT accumulates time spent
+-- asleep so PROFTICK can subtract it and report CPU only.
+local PWAIT_ACC = 0
+local function PWAIT(t)
+    local a = tick()
+    local r = task.wait(t)
+    PWAIT_ACC = PWAIT_ACC + (tick() - a)
+    return r
+end
+local function PROFRESET() PWAIT_ACC = 0 end
+-- Shadowing `task` with this inside farmStep routes its dozen-odd task.wait calls through
+-- PWAIT with a single line, instead of rewriting every call site and getting one wrong.
+local PROF_TASK = { wait = PWAIT, spawn = task.spawn, delay = task.delay, defer = task.defer }
+
+-- `sub` only for the loop that actually routes its waits through PWAIT. The accumulator is
+-- shared, and subtracting it from a loop that never touched it charged the farm's sleep
+-- against whoever measured next - which is why every loop suddenly showed a second-long
+-- maximum at the same time.
+local function PROFTICK(name, t0, sub)
+    local ms = (tick() - t0) * 1000
+    if sub then ms = ms - PWAIT_ACC * 1000 end
+    if ms < 0 then ms = 0 end
+    local e = _G.SEHUB_SLOW[name]
+    if not e then
+        e = { n = 0, total = 0, max = 0, over50 = 0, over150 = 0, maxState = "?" }
+        _G.SEHUB_SLOW[name] = e
+    end
+    e.n, e.total = e.n + 1, e.total + ms
+    if ms > e.max then
+        e.max = ms
+        e.maxState = tostring((_G.FARM or {}).State)
+    end
+    if ms > 50 then e.over50 = e.over50 + 1 end
+    if ms > 150 then e.over150 = e.over150 + 1 end
+end
+
 local function SESPAWN(name, fn)
     if _G.SEHUB_SKIP[name] then
         print("[Steal An Egg] skipping loop: " .. name)
@@ -109,29 +157,56 @@ local function SESPAWN(name, fn)
 end
 
 -- ---------------- Drawing registry ----------------
--- Nothing draws yet, but ESP is coming and the leak it prevents is invisible until
--- it is severe: a loop killed mid-sweep never removes its own Drawings, and twenty
--- reloads of that is enough to destabilise the client. Wrapping Drawing.new once,
--- globally, costs nothing now and cannot be retrofitted after the fact.
+-- ONLY OUR OWN DRAWINGS. This used to wrap Drawing.new globally and free everything it had
+-- ever seen on reload, which was catastrophic for a reason that took three crashes to spot:
+-- Instance.new does not exist in this executor, so the UI LIBRARY draws its entire menu out
+-- of Drawing objects too. They all landed in this registry.
+--
+-- The reload sequence then freed them twice. Destroying the window (above) frees the
+-- library's drawings through its own path, which never touches our dead-flag, and then this
+-- block removed the same 238 objects a second time. Double-freeing a native object is not
+-- catchable by pcall - it takes the executor out, which is exactly the "crashed when the
+-- new script loaded" symptom.
+--
+-- Fixing the flag was not enough because a wrapper installed by an EARLIER generation
+-- survives in the environment and keeps registering the library's drawings no matter what
+-- this load does. So ownership is tracked explicitly instead: newDrawing() marks what is
+-- ours, and cleanup will not touch anything else, whatever ends up in the list.
 _G.SEHUB_DRAWINGS = _G.SEHUB_DRAWINGS or {}
+_G.SEHUB_DRAWOURS = _G.SEHUB_DRAWOURS or {}
+_G.SEHUB_DRAWDEAD = _G.SEHUB_DRAWDEAD or {}
+local function dropDrawing(d)
+    if not d or _G.SEHUB_DRAWDEAD[d] then return end
+    if not _G.SEHUB_DRAWOURS[d] then return end   -- not ours, not our business
+    _G.SEHUB_DRAWDEAD[d] = true
+    pcall(function() d.Visible = false end)
+    pcall(function() d:Remove() end)
+end
+_G.SEHUB_DROPDRAW = dropDrawing
+
+-- Create and claim. Everything this script draws goes through here.
+local function newDrawing(kind)
+    if not Drawing then return nil end
+    local ok, obj = pcall(function() return Drawing.new(kind) end)
+    if not ok or not obj then return nil end
+    _G.SEHUB_DRAWOURS[obj] = true
+    table.insert(_G.SEHUB_DRAWINGS, obj)
+    return obj
+end
+
 if GEN > 1 then
     local n = 0
     for _, d in ipairs(_G.SEHUB_DRAWINGS) do
-        if pcall(function() d.Visible = false end) then n = n + 1 end
-        pcall(function() d:Remove() end)
+        if _G.SEHUB_DRAWOURS[d] and not _G.SEHUB_DRAWDEAD[d] then
+            dropDrawing(d)
+            n = n + 1
+        end
     end
-    if n > 0 then print(string.format("[Steal An Egg] cleared %d drawings from the previous load", n)) end
+    print(string.format("[Steal An Egg] cleared %d of our own drawings (the menu's are its own)", n))
 end
 _G.SEHUB_DRAWINGS = {}
-if Drawing and not _G.SEHUB_DRAWWRAP then
-    _G.SEHUB_DRAWWRAP = true
-    local realNew = Drawing.new
-    Drawing.new = function(...)
-        local obj = realNew(...)
-        if obj then table.insert(_G.SEHUB_DRAWINGS, obj) end
-        return obj
-    end
-end
+_G.SEHUB_DRAWOURS = {}
+_G.SEHUB_DRAWDEAD = {}
 
 -- INS-ui captures game:GetService("Players") ONCE, at library load, and reads the
 -- mouse only through LocalPlayer:GetMouse(). If the handle is nil at that instant the
@@ -295,33 +370,35 @@ local function toastPush(title, msg, dur)
 
     -- The two text lines are the toast. Everything else is decoration, created separately
     -- so that an executor without Drawing "Square" still shows you the message.
-    local okt, h1 = pcall(function() return Drawing.new("Text") end)
-    if not okt or not h1 then return false end
-    local ok2, h2 = pcall(function() return Drawing.new("Text") end)
-    if not ok2 or not h2 then pcall(function() h1:Remove() end) return false end
+    local h1 = newDrawing("Text")
+    if not h1 then return false end
+    local h2 = newDrawing("Text")
+    if not h2 then dropDrawing(h1) return false end
     setp(h1, "Text", tostring(title)); setp(h1, "Size", 15)
     setp(h1, "Color", rgb(255, 255, 255)); setp(h1, "Outline", true); setp(h1, "Visible", true)
     setp(h2, "Text", tostring(msg));   setp(h2, "Size", 13)
     setp(h2, "Color", rgb(200, 205, 215)); setp(h2, "Outline", true); setp(h2, "Visible", true)
     t.parts.h1, t.parts.h2 = h1, h2
 
-    pcall(function()
-        local bg = Drawing.new("Square")
+    local bg = newDrawing("Square")
+    if bg then
         setp(bg, "Filled", true); setp(bg, "Color", rgb(18, 18, 22))
         setp(bg, "Transparency", 0.82); setp(bg, "Size", Vector2.new(TOAST.w, TOAST.h))
         setp(bg, "Visible", true)
         t.parts.bg = bg
-        local bar = Drawing.new("Square")
+    end
+    local bar = newDrawing("Square")
+    if bar then
         setp(bar, "Filled", true); setp(bar, "Color", rgb(120, 200, 255))
         setp(bar, "Transparency", 1); setp(bar, "Size", Vector2.new(3, TOAST.h))
         setp(bar, "Visible", true)
         t.parts.bar = bar
-    end)
+    end
     table.insert(TOAST.list, 1, t)      -- newest nearest the bottom
     -- Cap the stack. Without this a night respawn plus a rift report can fill the screen.
     while #TOAST.list > 5 do
         local old = table.remove(TOAST.list)
-        for _, p in pairs(old.parts) do pcall(function() p:Remove() end) end
+        for _, p in pairs(old.parts) do dropDrawing(p) end
     end
     return true
 end
@@ -333,7 +410,7 @@ local function toastLayout()
     for i = #TOAST.list, 1, -1 do
         local t = TOAST.list[i]
         if now > t.until_ then
-            for _, p in pairs(t.parts) do pcall(function() p:Remove() end) end
+            for _, p in pairs(t.parts) do dropDrawing(p) end
             table.remove(TOAST.list, i)
         end
     end
@@ -366,7 +443,7 @@ SESPAWN("toasts", function()
     end
     -- generation retired: take our pixels with us
     for _, t in ipairs(TOAST.list) do
-        for _, p in pairs(t.parts) do pcall(function() p:Remove() end) end
+        for _, p in pairs(t.parts) do dropDrawing(p) end
     end
     TOAST.list = {}
 end)
@@ -409,6 +486,24 @@ SESPAWN("health", function()
         local now = tick()
         local dt = now - last
         last = now
+        -- The freeze detector. This loop asks for 0.05s and does no work, so however late
+        -- it comes back is how long the CLIENT was stalled - by anything, us or not. If the
+        -- farm's worst tick and this both spike together the stall is global and not ours;
+        -- if the farm spikes alone, it is.
+        local lateMs = (dt - 0.05) * 1000
+        local L = _G.SEHUB_SLOW["scheduler stall"]
+        if not L then
+            L = { n = 0, total = 0, max = 0, over50 = 0, over150 = 0, maxState = "-" }
+            _G.SEHUB_SLOW["scheduler stall"] = L
+        end
+        L.n, L.total = L.n + 1, L.total + lateMs
+        if lateMs > L.max then
+            L.max = lateMs
+            L.maxState = tostring((_G.FARM or {}).State)
+        end
+        if lateMs > 50 then L.over50 = L.over50 + 1 end
+        if lateMs > 150 then L.over150 = L.over150 + 1 end
+
         local score = 0.05 / math.max(dt, 0.0001)
         if score > 1 then score = 1 end
         local blend = (score < _G.SEHUB_HEALTH) and 0.6 or 0.1
@@ -531,9 +626,19 @@ local function promptsNear(pos, radius)
     return out
 end
 
+-- The background sweep only needs prompts you could plausibly reach before the next sweep.
+-- Unbounded, it walked all 53 egg slots' descendants every 0.75s - measured at 41ms to find
+-- zero prompts most of the time, since only a handful of slots own one. 400 studs is nearly
+-- two seconds of running at full speed, so nothing can be reached before the next pass.
 local function promptList()
     local out = {}
-    for _, e in ipairs(promptsNear(nil, nil)) do out[#out + 1] = e.p end
+    local root = myRoot()
+    local pos
+    if root then
+        local okp, p = pcall(function() return root.Position end)
+        if okp then pos = p end
+    end
+    for _, e in ipairs(promptsNear(pos, pos and 400 or nil)) do out[#out + 1] = e.p end
     return out
 end
 
@@ -767,7 +872,9 @@ end
 
 SESPAWN("prompt patch", function()
     while _G.SEHUB_GEN == GEN do
+        local t0 = tick()
         if ST.On and ST.offsetsOk then patchPrompts() end
+        PROFTICK("prompt patch", t0)
         -- 0.75s rather than 2s: eggs respawn constantly, and a prompt that appears just
         -- after a sweep was staying unpatched long enough to be reached and failed on.
         task.wait(0.75)
@@ -1178,7 +1285,21 @@ end
 -- of it (four lookups per slot, plus caching to afford them) went in alongside the
 -- reference-script work and the executor started crashing. Reverted wholesale rather
 -- than picked at - it was stable in exactly this form.
-local function eggSlots()
+-- CACHED, because this was the single most expensive thing in the script. It walks every
+-- slot and reads a position off each, which measures 5.4ms - and the farm loop called it
+-- 33 times a second, so it was burning 179ms of every second rebuilding a list of things
+-- that do not move. Eggs only appear and disappear; their positions are fixed.
+--
+-- A quarter second of staleness costs nothing (a slot that vanished is caught by the grab
+-- verification anyway) and gives back roughly a sixth of the frame budget, which is the
+-- likeliest source of the sub-second freezes.
+--
+-- The model is carried alongside the position now, so the grab can verify against the exact
+-- slot it aimed at rather than re-finding one by position afterwards.
+local EGG_CACHE, EGG_CACHE_AT = nil, 0
+local function eggSlots(maxAge)
+    local age = maxAge or 0.25
+    if EGG_CACHE and (tick() - EGG_CACHE_AT) < age then return EGG_CACHE end
     local out = {}
     local folder = workspace:FindFirstChild("AreaEggSlotsClient")
     if not folder then return out end
@@ -1187,10 +1308,17 @@ local function eggSlots()
     for _, m in ipairs(kids) do
         local hb = m:FindFirstChild("Hitbox")
         local okp, p = pcall(function() return hb and hb.Position end)
-        if okp and p then out[#out + 1] = p end
+        if okp and p then out[#out + 1] = { pos = p, model = m } end
     end
+    EGG_CACHE, EGG_CACHE_AT = out, tick()
     return out
 end
+-- Called when the world changes under us - a night reload swaps every slot at once.
+local function eggSlotsInvalidate() EGG_CACHE, EGG_CACHE_AT = nil, 0 end
+-- Exposed for timing. Both of these are hot paths that have surprised us once already, so
+-- they need to be measurable from outside without editing the file.
+_G.SEHUB_SLOTS = eggSlots
+_G.SEHUB_SLOTSINV = eggSlotsInvalidate
 
 -- The slot model sitting at a position, so a grab can be confirmed the moment it lands.
 -- Taking an egg destroys its model, so `Parent == nil` is a real success signal - the one
@@ -1222,7 +1350,8 @@ local function slotGone(m)
 end
 
 local function buildAreas()
-    local pts = eggSlots()
+    local pts = {}
+    for _, e in ipairs(eggSlots()) do pts[#pts + 1] = e.pos end
     if #pts == 0 then return {} end
     table.sort(pts, function(a, b) return a.X < b.X end)
     local groups, cur = {}, { pts[1] }
@@ -1432,8 +1561,8 @@ local function carryingEgg() return false end
 -- standing on the slot puts you on its prompt.
 local function farmTargets()
     local out = {}
-    for _, p in ipairs(eggSlots()) do
-        out[#out + 1] = { pos = p, area = areaOf(p) }
+    for _, e in ipairs(eggSlots()) do
+        out[#out + 1] = { pos = e.pos, area = areaOf(e.pos), model = e.model }
     end
     return out
 end
@@ -1692,6 +1821,15 @@ local EGG_FP = nil
 -- GetDescendants, not GetChildren: the decorations are often nested a level down, and
 -- reading only the top level is what made these models look like they had 2-5 parts.
 local function eggFingerprint(m)
+    if not m then return nil end
+    -- PARENT CHECK FIRST, and it is not paranoia. This is handed models from the eggSlots
+    -- cache, which can be up to a quarter second old, and eggs are destroyed constantly as
+    -- other players take them. A destroyed instance answers some calls and crashes the
+    -- executor on others - GetDescendants being one of the others - and a native crash is
+    -- not something pcall can catch. Before the cache existed every model here came
+    -- straight out of a fresh GetChildren and was live by construction.
+    local okp, par = pcall(function() return m.Parent end)
+    if not okp or par == nil then return nil end
     local parts = {}
     local okd, kids = pcall(function() return m:GetDescendants() end)
     if not okd or not kids then return nil end
@@ -2284,26 +2422,55 @@ _G.SEHUB_RIFT = riftProgress
 -- switching the rift farm on can ask the question immediately instead of waiting up to a
 -- second for the next sweep - the difference between a notification that tells you what is
 -- out there and one that says "nothing" because it looked too early.
+-- INCREMENTAL. Fingerprinting a slot means walking its descendants and reading a Size off
+-- each, then scoring that against 88 templates. Doing it for every slot once a second
+-- measured 49ms - a visible hitch, every second, forever - and almost all of it was
+-- recomputing answers that had not changed. An egg's identity never changes while it sits
+-- there; only the set of slots changes.
+--
+-- So a slot whose position key is already known keeps its previous answer, and only new
+-- keys are fingerprinted. Steady state costs nothing; a night reload swaps every key at
+-- once and pays the full 49ms exactly once.
 local function sweepEggNames()
-    local folder = workspace:FindFirstChild("AreaEggSlotsClient")
-    if not folder then return 0 end
-    local okc, kids = pcall(function() return folder:GetChildren() end)
-    if not okc or not kids then return 0 end
-    local names, ident = {}, 0
-    for _, m in ipairs(kids) do
-        local hb = m:FindFirstChild("Hitbox")
-        local okp, p = pcall(function() return hb and hb.Position end)
-        if okp and p then
-            local nm = eggNameFor(m, areaOf(p))
-            if nm then
-                names[string.format("%d_%d_%d", p.X, p.Y, p.Z)] = nm
-                ident = ident + 1
+    local prev = _G.FARM.eggName or {}
+    -- Slots already fingerprinted, INCLUDING the ones that came back unidentifiable.
+    -- Without this second table an egg the matcher cannot name is re-fingerprinted on
+    -- every sweep forever, which is the expensive half of the job done repeatedly for a
+    -- guaranteed nil - and about a third of the map is unidentifiable.
+    local tried = _G.FARM.eggTried or {}
+    local names, seen, ident, fresh = {}, {}, 0, 0
+    for _, e in ipairs(eggSlots()) do
+        local p = e.pos
+        local key = string.format("%d_%d_%d", p.X, p.Y, p.Z)
+        seen[key] = true
+        local nm = prev[key]
+        if nm == nil and not tried[key] then
+            -- Only mark it tried if the model was actually ALIVE to be looked at. A dead
+            -- model returns nil for reasons that have nothing to do with the egg, and slots
+            -- reuse their exact positions - so marking a dead one tried would blacklist
+            -- that position and the egg that respawns there would never be identified.
+            local okp, par = pcall(function() return e.model.Parent end)
+            if okp and par ~= nil then
+                fresh = fresh + 1
+                tried[key] = true
+                nm = eggNameFor(e.model, areaOf(p))
             end
         end
+        if nm then
+            names[key] = nm
+            ident = ident + 1
+        end
     end
-    _G.FARM.eggName, _G.FARM.EggIdent = names, ident
+    -- Drop keys for slots that are gone, so the tables cannot grow without bound across a
+    -- session's worth of night reloads.
+    for key in pairs(tried) do
+        if not seen[key] then tried[key] = nil end
+    end
+    _G.FARM.eggName, _G.FARM.eggTried = names, tried
+    _G.FARM.EggIdent, _G.FARM.EggFresh = ident, fresh
     return ident
 end
+_G.SEHUB_SWEEP = sweepEggNames
 
 -- "Are any of the three actually out there right now" - as a toast, because that is the
 -- one thing worth knowing the moment you switch the farm on or the eggs respawn.
@@ -2502,6 +2669,7 @@ _G.SEHUB_WATCH = { ticks = 0, ragSeen = 0, escapes = 0, blocked = 0, lastRag = "
 SESPAWN("boss chase watch", function()
     local hist = {}
     while _G.SEHUB_GEN == GEN do
+        local __t0 = tick()
         -- Refreshed often, because a stale guard handle is what crashed this loop.
         if (tick() - (GU.at or 0)) > 1.0 then GU.at = tick(); refreshGuards() end
         -- NOT `local ok, p = root and pcall(...)`. An `and` expression truncates a
@@ -2582,6 +2750,7 @@ SESPAWN("boss chase watch", function()
                 end
             end
         end
+        PROFTICK("boss chase watch", __t0)
         -- 10Hz. The wake highlight was observed appearing and disappearing inside half a
         -- second, so a slower poll would miss it outright. These are FindFirstChild
         -- calls, which are safe at this rate - unlike the attribute reads they replaced.
@@ -2673,6 +2842,7 @@ end)
 -- sitting out the cooldown on slots that are no longer the same eggs.
 SESPAWN("night watch", function()
     while _G.SEHUB_GEN == GEN do
+        local __t0 = tick()
         local folder = workspace:FindFirstChild("AreaEggSlotsClient")
         if folder then
             local okc, kids = pcall(function() return folder:GetChildren() end)
@@ -2764,6 +2934,11 @@ SESPAWN("night watch", function()
                 local n = #kids
                 if FM.slotCount and (n - FM.slotCount) >= 10 then
                     FM.visited = {}
+                    -- Every slot is a different egg now, so the cached positions and the
+                    -- cached identities are both worthless. Say so explicitly rather than
+                    -- waiting for the 0.25s TTL to notice.
+                    eggSlotsInvalidate()
+                    FM.eggName, FM.eggTried = {}, {}
                     FM.Reloads = (FM.Reloads or 0) + 1
                     FM.State = "eggs reloaded (night) - sweeping again"
                     notify("Auto Farm", "Night reload - fresh eggs", 3)
@@ -2782,6 +2957,7 @@ SESPAWN("night watch", function()
                 FM.slotCount = n
             end
         end
+        PROFTICK("night watch", __t0)
         task.wait(1.0)
     end
 end)
@@ -2790,6 +2966,9 @@ end)
 -- Luau has no goto, and nesting the phases as if/else instead produced a pyramid deep
 -- enough that the grab logic sat sixteen levels in.
 local function farmStep()
+    -- Every task.wait below this line is PWAIT, so the profiler measures work rather than
+    -- sleep. See PROF_TASK at the top of the file.
+    local task = PROF_TASK
     if not FM.On then task.wait(0.2) return end
     local root = myRoot()
     if not root then
@@ -3130,7 +3309,15 @@ local function farmStep()
                             -- completion whether or not the egg had already been taken -
                             -- three presses at 0.11s each, or a flat 1.3s hold - which is
                             -- the standing-around you were seeing after the pickup.
-                            local slot = slotAt(best.pos)
+                            -- The model we AIMED at, carried through from target selection,
+                            -- not re-found by position afterwards. slotAt() had to match a
+                            -- hitbox within a stud of where the egg was when it was chosen,
+                            -- and it returned nil whenever that egg had since been taken -
+                            -- by another player, or by a grab that had already worked. nil
+                            -- meant "unknown", which the verification treats as success, so
+                            -- those runs walked home empty and were counted as taken. Three
+                            -- of your last twenty-one went that way.
+                            local slot = best.model or slotAt(best.pos)
                             -- hd >= 0, not just hd < 0.05. A NEGATIVE hold time is not a
                             -- fast prompt, it is a nonsense reading - unpatched egg prompts
                             -- read back -0.5 - and `-0.5 < 0.05` is true, so the old test
@@ -3252,7 +3439,10 @@ end
 
 SESPAWN("auto farm", function()
     while _G.SEHUB_GEN == GEN do
+        PROFRESET()
+        local t0 = tick()
         farmStep()
+        PROFTICK("auto farm", t0, true)
         task.wait(0.03)
     end
 end)
@@ -3335,6 +3525,28 @@ diagSec:Button("Show Egg Rarities", function()
     end
 end, "Every egg type whose rarity is known, rarest first, plus what is currently spawned. The table fills itself in as the rift panel names new pets.")
 
+diagSec:Button("Show Slow Ticks", function()
+    print("---- loop timings, measured in place while you play ----")
+    print("   CPU only - time each loop spends asleep is subtracted, which the first")
+    print("   version of this did not do and so reported a 0.2s nap as a 200ms stall.")
+    print("   a freeze you can feel is one tick over ~100ms; the max column is the one to read")
+    local rows = {}
+    for name, e in pairs(_G.SEHUB_SLOW or {}) do rows[#rows + 1] = { n = name, e = e } end
+    table.sort(rows, function(a, b) return a.e.max > b.e.max end)
+    for _, r in ipairs(rows) do
+        local e = r.e
+        print(string.format("   %-18s ticks %-7d avg %6.2f ms  max %7.1f ms  >50ms %-5d >150ms %d",
+            r.n, e.n, e.n > 0 and (e.total / e.n) or 0, e.max, e.over50, e.over150))
+        if e.max > 50 then
+            print(string.format("        worst tick happened during: %s", tostring(e.maxState)))
+        end
+    end
+    if #rows == 0 then print("   (nothing recorded yet - the loops have to run first)") end
+end, "Times the real loops rather than a probe imitating them. Run the farm for a minute, freeze a few times, then read this: whichever loop shows a max in the hundreds of milliseconds is the one stalling you.")
+diagSec:Button("Reset Slow Ticks", function()
+    _G.SEHUB_SLOW = {}
+    notify("Diagnostics", "Tick timings cleared", 2)
+end, "Clears the timings so you can measure one stretch of play cleanly.")
 diagSec:Button("Test Notification", function()
     notify("Steal An Egg", "Bottom-right toast, 4 seconds", 4)
 end, "Fires a toast so you can check it lands where you expect.")
