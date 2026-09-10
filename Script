@@ -335,6 +335,21 @@ local function heldEggTool()
 end
 _G.SEHUB_HELDEGG = heldEggTool
 
+-- Put the held egg away. Humanoid:UnequipTools() is not bound in this executor, so the
+-- only route left is re-parenting the Tool into the Backpack, which is what unequipping
+-- does anyway. Wrapped because a Parent write is not guaranteed to be permitted here, and
+-- the caller must work whether or not it lands.
+local function stowHeldEgg()
+    local tool = heldEggTool()
+    if not tool then return true end          -- nothing to put away
+    local lp = localPlayer()
+    local bp = lp and lp:FindFirstChild("Backpack")
+    if not bp then return false end
+    pcall(function() tool.Parent = bp end)
+    return heldEggTool() == nil
+end
+_G.SEHUB_STOW = stowHeldEgg
+
 -- ---------------- notifications ----------------
 -- Drawn ourselves, bottom-right, rather than handed to Lib.Notify - the library puts its
 -- toasts where it likes, and the ask was for them to sit where the game's own "eggs have
@@ -3282,7 +3297,22 @@ local function farmStep()
                     -- it by hand, or the flag was cleared by a misread a moment earlier.
                     -- Without this the farm would walk off to grab a second egg while one
                     -- was already in your hands.
-                    if heldEggTool() and not FM.hasEgg then
+                    -- ONLY OUT IN THE FIELD. At the safe zone a held egg is the one the game
+                    -- just handed you for delivering - you said it puts it in your hands
+                    -- there - so treating that as "carrying, go deliver" left the farm
+                    -- standing on the delivery point waiting to deliver an egg it had
+                    -- already delivered. That is why you had to unequip it by hand before
+                    -- anything would move.
+                    --
+                    -- Out in an area, a held egg still means exactly what it did: you are
+                    -- carrying one, whoever picked it up.
+                    local homeNow = homePos()
+                    local farFromHome = true
+                    if homeNow then
+                        farFromHome = (Vector3.new(homeNow.X, me.Y, homeNow.Z) - me).Magnitude
+                                      > ((FM.ZoneReach or 12) + 8)
+                    end
+                    if heldEggTool() and not FM.hasEgg and farFromHome then
                         FM.hasEgg = true
                         FM.eggIsTool = true
                         FM.grabbedAt = FM.grabbedAt or tick()
@@ -3372,6 +3402,15 @@ local function farmStep()
                             if held > (FM.DeliverSettle or 2.5) then
                                 FM.hasEgg = false
                                 FM.depositAt = nil
+                                -- Put away whatever the hand-over left in your hands, so
+                                -- the next run does not start holding the last egg.
+                                if heldEggTool() then
+                                    if stowHeldEgg() then
+                                        FM.Stowed = (FM.Stowed or 0) + 1
+                                    else
+                                        FM.StowFail = (FM.StowFail or 0) + 1
+                                    end
+                                end
                                 -- Never carry a slot reference past the run it belongs to.
                                 FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
                                 -- Wait before setting off again. Sprinting straight back
@@ -3913,6 +3952,8 @@ diagSec:Button("Log Capability Report", function()
         FM.Dropped or 0))
     local t, nm = _G.SEHUB_HELDEGG()
     print(string.format("   holding right now     %s", t and tostring(nm) or "nothing"))
+    print(string.format("   eggs stowed / failed  %d / %d  (auto-unequip at the safe zone)",
+        FM.Stowed or 0, FM.StowFail or 0))
     print(string.format("   fallback holds used   %d  (instant patch failed on these)",
         FM.Fallbacks or 0))
     print(string.format("   anti-boss ticks       %d", W.ticks or 0))
