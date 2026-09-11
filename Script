@@ -5,15 +5,28 @@
 --
 -- What this executor can and cannot do, MEASURED in this game, not assumed:
 --
---   CFrame writes        WORK. 40, 100, 200 and 300 stud hops all held. One
---                        350 stud hop was dragged back after ~1.2s, cause not
---                        yet established. (An earlier note claiming CFrame
---                        writes were silently discarded was a bad measurement:
---                        the test moved 8 studs UP and read back 150ms later,
---                        by which point gravity had returned the character.)
---   Velocity writes      WORK, with no speed ceiling found. 205 studs/s
---                        sustained - 12.8x walk speed - covering 411 studs in
---                        two seconds, with no pull-back afterwards.
+--   CFrame writes        WORK, but a SINGLE write loses - ragdoll physics
+--                        overrides it on the next step, so write it 3x a few
+--                        ms apart (see teleportTo).
+--                        SCOPED: the long hops in the note this replaces were
+--                        measured at spawn, which is outside the check. Re-run
+--                        inside an egg area, 60 studs holds exactly (0.00
+--                        error), 150 and 300 revert having gained nothing, and
+--                        600 reverts AND kills. Snap the final approach; never
+--                        try to snap the journey.
+--                        CFrame.new(Vector3) DOES NOT EXIST here - it takes 0,
+--                        3, 6 or 12 numbers. The 6-arg form is (pos, lookAt),
+--                        verified against LookVector.
+--   Velocity writes      WORK, and there IS a ceiling - the earlier "none
+--                        found" only ever tested 205. In an egg area:
+--                        220 -> 207 actual, 260 -> 250, 300 -> 288, and then
+--                        320 -> 42 (rubber-banded) and 430 -> dead.
+--   THE ONE NUMBER       The server allows ~290 studs/s of NET DISPLACEMENT in
+--                        the egg areas and enforces it identically against
+--                        velocity, chained CFrame snaps, and single hops.
+--                        Bursting is strictly worse than steady: 900 studs/s
+--                        for 0.25s in every 1s averaged 37 studs/s, against
+--                        282 for a flat 300. There is no trick under it.
 --   Flight               WORKS. Climbed 135 studs in 3s, descended, landed at
 --                        the starting height on full health. Zero vertical
 --                        velocity still drifts down ~12 studs/s, so holding an
@@ -450,7 +463,22 @@ end
 -- Drawing is used instead of a ScreenGui because this executor cannot create Instances at
 -- all (Instance.new is nil), so there is no GUI to build. Every Drawing goes through the
 -- registry wrapper above, which is what stops a reload leaking them.
-local TOAST = { list = {}, w = 340, h = 46, pad = 10, margin = 18 }
+-- Sized from the text rather than fixed. TextBounds turns out to be READABLE here, which
+-- means the card can measure its own contents, wrap a long line properly and grow to fit -
+-- instead of the old fixed 340x46 box that clipped anything longer than a few words and
+-- squashed everything into two cramped lines.
+local TOAST = {
+    list = {}, pad = 12, gap = 9, margin = 20, lineGap = 4,
+    minW = 240, maxW = 420, titleSize = 15, bodySize = 13, bar = 3,
+}
+-- Accent per kind. OutlineColor cannot be written in this executor, so the colour has to
+-- come from the bar and the title rather than from a text outline.
+local TOAST_KIND = {
+    info = { 96, 165, 250 },
+    good = { 74, 222, 128 },
+    warn = { 250, 204, 21 },
+    bad  = { 248, 113, 113 },
+}
 
 -- Viewport size, by whatever means answers. Camera.ViewportSize is the direct read and may
 -- come back nil like so much else here, so the fallback measures the largest GuiObject in
@@ -498,43 +526,111 @@ local function setp(obj, key, value)
     pcall(function() obj[key] = value end)
 end
 
-local function toastPush(title, msg, dur)
-    if not Drawing then return false end
-    local okv, vp = pcall(viewportSize)
-    if not okv or not vp then return false end
-    local t = { until_ = tick() + (dur or 3), parts = {} }
+-- Width of a string, asked of the renderer. One hidden Text drawing is reused as a ruler:
+-- set the text, read TextBounds. Guessing from character count was the alternative and it
+-- is wrong by 30% on anything with capitals or punctuation.
+local function measure(txt, size)
+    if not TOAST.ruler then
+        TOAST.ruler = newDrawing("Text")
+        if TOAST.ruler then setp(TOAST.ruler, "Visible", false) end
+    end
+    local r = TOAST.ruler
+    if not r then return #tostring(txt) * size * 0.55 end
+    setp(r, "Font", 2); setp(r, "Size", size); setp(r, "Text", tostring(txt))
+    local ok, b = pcall(function() return r.TextBounds end)
+    if ok and b and b.X and b.X > 0 then return b.X end
+    return #tostring(txt) * size * 0.55
+end
 
-    -- The two text lines are the toast. Everything else is decoration, created separately
-    -- so that an executor without Drawing "Square" still shows you the message.
+-- Greedy word wrap to a pixel width. Long status lines - the rift area list, the "need X, Y,
+-- Z" line - used to run off the edge of the card and simply vanish.
+local function wrapText(txt, size, maxW)
+    local lines, cur = {}, ""
+    for word in string.gmatch(tostring(txt), "%S+") do
+        local try = (cur == "") and word or (cur .. " " .. word)
+        if cur ~= "" and measure(try, size) > maxW then
+            lines[#lines + 1] = cur
+            cur = word
+        else
+            cur = try
+        end
+    end
+    if cur ~= "" then lines[#lines + 1] = cur end
+    if #lines == 0 then lines[1] = "" end
+    return lines
+end
+
+local function toastPush(title, msg, dur, kind)
+    if not Drawing then return false end
+    local accent = TOAST_KIND[kind or "info"] or TOAST_KIND.info
+
+    -- Measure first, then build to fit.
+    local innerMax = TOAST.maxW - TOAST.pad * 2 - TOAST.bar
+    local titleW = measure(title, TOAST.titleSize)
+    local body = wrapText(msg, TOAST.bodySize, innerMax)
+    local widest = titleW
+    for _, l in ipairs(body) do
+        local w = measure(l, TOAST.bodySize)
+        if w > widest then widest = w end
+    end
+    local cardW = math.max(TOAST.minW, math.min(TOAST.maxW, widest + TOAST.pad * 2 + TOAST.bar + 6))
+    local lineH = TOAST.bodySize + TOAST.lineGap
+    local cardH = TOAST.pad * 2 + TOAST.titleSize + 5 + (#body * lineH) - TOAST.lineGap
+
+    local t = {
+        born = tick(), until_ = tick() + (dur or 3),
+        w = cardW, h = cardH, body = body, parts = {},
+    }
+
+    -- Title and body are the message; everything else is decoration and is created
+    -- separately, so a missing Square type costs you the styling and not the words.
     local h1 = newDrawing("Text")
     if not h1 then return false end
-    local h2 = newDrawing("Text")
-    if not h2 then dropDrawing(h1) return false end
-    setp(h1, "Text", tostring(title)); setp(h1, "Size", 15)
-    setp(h1, "Color", rgb(255, 255, 255)); setp(h1, "Outline", true); setp(h1, "Visible", true)
-    setp(h2, "Text", tostring(msg));   setp(h2, "Size", 13)
-    setp(h2, "Color", rgb(200, 205, 215)); setp(h2, "Outline", true); setp(h2, "Visible", true)
-    t.parts.h1, t.parts.h2 = h1, h2
+    setp(h1, "Font", 2); setp(h1, "Size", TOAST.titleSize)
+    setp(h1, "Color", rgb(accent[1], accent[2], accent[3]))
+    setp(h1, "Outline", true); setp(h1, "Text", tostring(title)); setp(h1, "Visible", true)
+    setp(h1, "ZIndex", 12)
+    t.parts.h1 = h1
 
+    t.lines = {}
+    for i, l in ipairs(body) do
+        local tl = newDrawing("Text")
+        if tl then
+            setp(tl, "Font", 2); setp(tl, "Size", TOAST.bodySize)
+            setp(tl, "Color", rgb(226, 232, 240))
+            setp(tl, "Outline", true); setp(tl, "Text", l); setp(tl, "Visible", true)
+            setp(tl, "ZIndex", 12)
+            t.lines[i] = tl
+        end
+    end
+
+    local shadow = newDrawing("Square")
+    if shadow then
+        setp(shadow, "Filled", true); setp(shadow, "Color", rgb(0, 0, 0))
+        setp(shadow, "Size", Vector2.new(cardW + 4, cardH + 4)); setp(shadow, "ZIndex", 9)
+        setp(shadow, "Visible", true)
+        t.parts.shadow = shadow
+    end
     local bg = newDrawing("Square")
     if bg then
-        setp(bg, "Filled", true); setp(bg, "Color", rgb(18, 18, 22))
-        setp(bg, "Transparency", 0.82); setp(bg, "Size", Vector2.new(TOAST.w, TOAST.h))
+        setp(bg, "Filled", true); setp(bg, "Color", rgb(17, 21, 30))
+        setp(bg, "Size", Vector2.new(cardW, cardH)); setp(bg, "ZIndex", 10)
         setp(bg, "Visible", true)
         t.parts.bg = bg
     end
     local bar = newDrawing("Square")
     if bar then
-        setp(bar, "Filled", true); setp(bar, "Color", rgb(120, 200, 255))
-        setp(bar, "Transparency", 1); setp(bar, "Size", Vector2.new(3, TOAST.h))
+        setp(bar, "Filled", true); setp(bar, "Color", rgb(accent[1], accent[2], accent[3]))
+        setp(bar, "Size", Vector2.new(TOAST.bar, cardH)); setp(bar, "ZIndex", 11)
         setp(bar, "Visible", true)
         t.parts.bar = bar
     end
+
     table.insert(TOAST.list, 1, t)      -- newest nearest the bottom
-    -- Cap the stack. Without this a night respawn plus a rift report can fill the screen.
     while #TOAST.list > 5 do
         local old = table.remove(TOAST.list)
         for _, p in pairs(old.parts) do dropDrawing(p) end
+        for _, p in ipairs(old.lines or {}) do dropDrawing(p) end
     end
     return true
 end
@@ -547,30 +643,101 @@ local function toastLayout()
         local t = TOAST.list[i]
         if now > t.until_ then
             for _, p in pairs(t.parts) do dropDrawing(p) end
+            for _, p in ipairs(t.lines or {}) do dropDrawing(p) end
             table.remove(TOAST.list, i)
         end
     end
-    for i, t in ipairs(TOAST.list) do
-        local x = vp.X - TOAST.w - TOAST.margin
-        local y = vp.Y - TOAST.margin - (TOAST.h + 8) * i
+
+    local yCursor = vp.Y - TOAST.margin
+    for _, t in ipairs(TOAST.list) do
+        -- Slides in from the right over 0.18s and fades out over the last 0.35s. Drawing has
+        -- no animation of its own, but this loop already runs at 10Hz, so it is free.
+        local inA  = math.min(1, (now - t.born) / 0.18)
+        local outA = math.min(1, math.max(0, (t.until_ - now) / 0.35))
+        local a = math.min(inA, outA)
+        local slide = (1 - inA) * 40
+
+        local x = vp.X - t.w - TOAST.margin + slide
+        local y = yCursor - t.h
+        yCursor = y - TOAST.gap
+
         -- Positioned one at a time. Grouped in a single pcall, a missing background would
         -- abort the whole block and leave the TEXT sitting at 0,0 - the decoration failing
         -- must not take the message with it.
-        if t.parts.bg  then setp(t.parts.bg,  "Position", Vector2.new(x, y)) end
-        if t.parts.bar then setp(t.parts.bar, "Position", Vector2.new(x, y)) end
-        setp(t.parts.h1, "Position", Vector2.new(x + TOAST.pad + 4, y + 6))
-        setp(t.parts.h2, "Position", Vector2.new(x + TOAST.pad + 4, y + 24))
+        if t.parts.shadow then
+            setp(t.parts.shadow, "Position", Vector2.new(x - 2, y - 2))
+            setp(t.parts.shadow, "Transparency", 0.35 * a)
+        end
+        if t.parts.bg then
+            setp(t.parts.bg, "Position", Vector2.new(x, y))
+            setp(t.parts.bg, "Transparency", 0.93 * a)
+        end
+        if t.parts.bar then
+            setp(t.parts.bar, "Position", Vector2.new(x, y))
+            setp(t.parts.bar, "Transparency", a)
+        end
+        local tx = x + TOAST.bar + TOAST.pad
+        setp(t.parts.h1, "Position", Vector2.new(tx, y + TOAST.pad - 2))
+        setp(t.parts.h1, "Transparency", a)
+        local ly = y + TOAST.pad + TOAST.titleSize + 3
+        for i, tl in ipairs(t.lines or {}) do
+            setp(tl, "Position", Vector2.new(tx, ly + (i - 1) * (TOAST.bodySize + TOAST.lineGap)))
+            setp(tl, "Transparency", a)
+        end
     end
 end
 
-local function notify(title, msg, dur)
+-- Deduplicated. Several of these fire from loops that run every second or every tick, so
+-- the same line stacks up four or five deep and buries anything new. An identical message
+-- inside eight seconds is the same event being reported again, not a new one worth reading.
+local NOTIFY_LAST = {}
+local function notify(title, msg, dur, kind)
+    local key = tostring(title) .. "\0" .. tostring(msg)
+    local now = tick()
+    if NOTIFY_LAST[key] and (now - NOTIFY_LAST[key]) < 8 then return end
+    NOTIFY_LAST[key] = now
+    -- Keep the table from growing across a long session.
+    if not NOTIFY_LAST.__n then NOTIFY_LAST.__n = 0 end
+    NOTIFY_LAST.__n = NOTIFY_LAST.__n + 1
+    if NOTIFY_LAST.__n > 60 then
+        for k, t in pairs(NOTIFY_LAST) do
+            if type(t) == "number" and k ~= "__n" and (now - t) > 30 then NOTIFY_LAST[k] = nil end
+        end
+        NOTIFY_LAST.__n = 0
+    end
+
     -- Ours first; Lib.Notify only if Drawing is unavailable, so a notification is never
     -- silently lost just because the toast could not be built.
-    if not toastPush(title, msg, dur or 3) then
+    -- Kind is inferred when the caller does not say, so existing calls get sensible colour
+    -- without every site being rewritten.
+    if not kind then
+        local m = string.lower(tostring(msg))
+        if string.find(m, "unreadable") or string.find(m, "stale") or string.find(m, "no safe zone")
+           or string.find(m, "cannot") or string.find(m, "failed") then kind = "warn"
+        elseif string.find(m, "complete") or string.find(m, "collected") or string.find(m, "owned")
+           or string.find(m, "saved") or string.find(m, "restored") then kind = "good"
+        end
+    end
+    if not toastPush(title, msg, dur or 3, kind) then
         if Lib and Lib.Notify then pcall(function() Lib.Notify(title, msg, dur or 2) end) end
     end
 end
+-- A closure, not a direct reference. Assigning `notify` straight into _G here produced nil
+-- while the very next line assigning toastLayout worked, which I could not explain and did
+-- not want to spend the session on - a wrapper resolves the upvalue when it is called and
+-- behaves identically for every caller.
+_G.SEHUB_NOTIFY = function(a, b, c, d) return notify(a, b, c, d) end
 _G.SEHUB_TOASTLAYOUT = toastLayout
+_G.SEHUB_TOASTINFO = function()
+    local out = {}
+    for i, t in ipairs(TOAST.list) do
+        local nparts = 0
+        for _ in pairs(t.parts) do nparts = nparts + 1 end
+        out[i] = string.format("w=%d h=%d lines=%d parts=%d left=%.1fs",
+            t.w or -1, t.h or -1, #(t.lines or {}), nparts, (t.until_ or 0) - tick())
+    end
+    return out
+end
 
 SESPAWN("toasts", function()
     while _G.SEHUB_GEN == GEN do
@@ -742,6 +909,13 @@ ST.origLOS    = ST.origLOS or {} -- [address] = original line-of-sight byte
 -- the same object with the same values - rewriting it is six memory operations for nothing.
 -- Measured at 65ms average per sweep before this, which is a hitch you can feel.
 ST.doneAt     = ST.doneAt or {}
+-- [address] = when we dropped its activation distance so it could not steal a grab.
+-- Tracked separately so the sweep can tell "suppressed on purpose" from "never patched".
+ST.suppressed = ST.suppressed or {}
+-- How long a suppression outranks the sweep. Long enough to cover the press it was made
+-- for (patch, read hold, tap, verify - a couple of hundred ms) and short enough that an
+-- egg we suppressed is usable again almost immediately afterwards.
+ST.SUPPRESS_TTL = 1.0
 ST.REPATCH    = 3.0             -- seconds before an address is worth writing again
 ST.sweepN     = 0
 ST.offsetsOk  = true
@@ -777,15 +951,28 @@ local function promptsNear(pos, radius)
                     local okg, sub = pcall(function() return c:GetChildren() end)
                     if okg and sub then
                         for _, pr in ipairs(sub) do
-                            local okcl, cl = pcall(function() return pr.ClassName end)
-                            -- EGG PROMPTS ONLY, by name. Learned from the reference script
-                            -- and confirmed here: the 54 egg prompts are all called
-                            -- "CarryAreaEgg", and the other 6 under SmartPromptPart are
-                            -- machines, shops and the hatch prompts on your own plot.
-                            -- Patching those was pointless at best - it was zeroing the
-                            -- hold time on your own eggs' hatch prompts as a side effect.
-                            if okcl and cl == "ProximityPrompt"
-                               and (pr.Name == "CarryAreaEgg" or ST.AnyPrompt) then
+                            -- EGG PROMPTS ONLY, BY NAME - and by name ALONE.
+                            --
+                            -- There used to be an `and ClassName == "ProximityPrompt"`
+                            -- here, and it was quietly throwing eggs away. Counted live:
+                            --
+                            --   52 objects named CarryAreaEgg
+                            --   44 of them report ClassName "ProximityPrompt"
+                            --    8 of them report ClassName "Part"
+                            --
+                            -- Same name, same parent shape, same job - ClassName simply
+                            -- reads wrong for some of them, which this file already knows
+                            -- (it misreported the egg-slot prompts too). Those 8 were
+                            -- never patched, so walking up to one of those eggs gave you
+                            -- the full hold time while its neighbours took instantly.
+                            -- That is the "only 3 of the 5 eggs near me are instant".
+                            --
+                            -- Dropping the check costs no safety: promptWritable() is the
+                            -- real gate, and it reads the memory itself rather than
+                            -- trusting a property. A non-prompt that sneaks in by name
+                            -- fails there and is never written to.
+                            local okn, nm2 = pcall(function() return pr.Name end)
+                            if okn and (nm2 == "CarryAreaEgg" or ST.AnyPrompt) then
                                 out[#out + 1] = { p = pr, d = d }
                             end
                         end
@@ -806,9 +993,9 @@ local function promptsNear(pos, radius)
                     local okd, desc = pcall(function() return m:GetDescendants() end)
                     if okd and desc then
                         for _, pr in ipairs(desc) do
-                            local okcl, cl = pcall(function() return pr.ClassName end)
-                            if okcl and cl == "ProximityPrompt"
-                               and (pr.Name == "CarryAreaEgg" or ST.AnyPrompt) then
+                            -- By name here too, for the same reason as above.
+                            local okn, nm2 = pcall(function() return pr.Name end)
+                            if okn and (nm2 == "CarryAreaEgg" or ST.AnyPrompt) then
                                 out[#out + 1] = { p = pr, d = d }
                             end
                         end
@@ -848,6 +1035,38 @@ local function addrOf(p)
     return nil
 end
 
+-- THE CRASH GATE. Read before you write, and only write if what is there still looks like a
+-- ProximityPrompt.
+--
+-- This is the fix for the crash that has come back about twenty-five times in different
+-- disguises. Taking an egg destroys its prompt, and the patch sweep writes to prompt
+-- addresses - so the write lands in memory the game freed a moment earlier, which is a
+-- native crash that pcall cannot catch. Checking Parent first is not enough: the object can
+-- be freed between the check and the write, and an address that was a prompt a second ago
+-- can be anything now.
+--
+-- Measured on 54 live egg prompts: every one reads hold = 1.200. Patched ones read 0. The
+-- reference script gates on the same idea, accepting 1.2 and 0.25. Freed and reused memory
+-- reads as garbage - huge, negative, denormal - and fails this test, so the write never
+-- happens. Real prompts whose struct we cannot parse (the slot-owned ones read -0.5) fail
+-- it too, which is correct: if the layout does not look right, do not write into it.
+local function promptWritable(a)
+    if not a then return false end
+    -- The KEY CODE is the real signature. All 54 live egg prompts read 101 at +0x124, which
+    -- is Enum.KeyCode.E - the key you press to take an egg. Freed and reused memory reads 0
+    -- or garbage there.
+    --
+    -- The hold time alone was not enough to gate on: an unrelated address happened to read
+    -- 0.0, which is inside any sane range for a duration and would have been written to.
+    -- Two fields agreeing is a much narrower coincidence than one.
+    local okk, k = pcall(function() return memory_read("int", a + 0x124) end)
+    if not okk or k ~= 101 then return false end
+    local ok, h = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
+    if not ok or type(h) ~= "number" then return false end
+    if h ~= h then return false end                 -- NaN
+    return h >= 0 and h <= 5.0
+end
+
 local function patchPrompts()
     if not memory_write or not memory_read then
         ST.State = "memory_write unavailable"
@@ -868,6 +1087,19 @@ local function patchPrompts()
         -- none, across every prompt in range, every 0.75 seconds.
         if a and (now - (ST.doneAt[a] or 0)) < ST.REPATCH then
             n = n + 1
+            a = nil
+        end
+        -- Nothing is written to an address whose contents no longer look like a prompt.
+        if a and not promptWritable(a) then
+            ST.Rejected = (ST.Rejected or 0) + 1
+            a = nil
+        end
+        -- LEAVE A SUPPRESSED PROMPT ALONE while its suppression is live. The sweep runs
+        -- every 0.75s and suppressOthers deliberately forgets the address so it WILL be
+        -- restored - but not before the press it was suppressed for. Without this the
+        -- sweep handed the big neighbour its range back between the suppression and the
+        -- keypress, which is a race the sweep usually won.
+        if a and ST.suppressed[a] and (now - ST.suppressed[a]) < (ST.SUPPRESS_TTL or 1.0) then
             a = nil
         end
         if a then
@@ -931,6 +1163,17 @@ local function patchNear(pos, radius)
     local n = 0
     for _, e in ipairs(promptsNear(pos, radius or 30)) do
         local a = addrOf(e.p)   -- nil once the prompt is gone
+        -- Same gate as the sweep. This one runs at the exact moment an egg is being taken,
+        -- which is precisely when its prompt is being destroyed, so it is the call site that
+        -- was most likely to write into freed memory.
+        if a and not promptWritable(a) then
+            ST.Rejected = (ST.Rejected or 0) + 1
+            a = nil
+        end
+        -- Same rule as the sweep: a live suppression outranks a re-patch.
+        if a and ST.suppressed[a] and (tick() - ST.suppressed[a]) < (ST.SUPPRESS_TTL or 1.0) then
+            a = nil
+        end
         if a then
             if not ST.orig[a] then
                 local okh, h = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
@@ -959,6 +1202,63 @@ local function patchNear(pos, radius)
     return n
 end
 _G.SEHUB_PATCHNEAR = patchNear
+
+-- TAKE THE COMPETITION OUT OF RANGE. This is the answer to big eggs stealing the grab.
+--
+-- The game activates the CLOSEST ELIGIBLE prompt, and a 13.5 stud egg sitting over its
+-- neighbours is closer to you than the small one you are standing on, however carefully
+-- you aim. Standing inside the target (the 1.5 stud reach) and rotating the approach both
+-- help and neither is decisive, because they are attempts to win a contest on position.
+--
+-- But eligibility is not physics, it is a float in the prompt's struct - the SAME float
+-- this script already writes 15 into on every sweep, at ST.OFF_DIST. So rather than
+-- out-positioning a big neighbour, make it ineligible: drop every OTHER prompt near the
+-- target to an activation distance nothing can satisfy, press, and let the sweep put them
+-- back. The target is the only prompt the game can still see.
+--
+-- 0.5 rather than 0, because 0 is ambiguous - in some Roblox versions it reads as "no
+-- limit" rather than "no range", and a prompt that suddenly had infinite reach would be
+-- the exact opposite of what this is for. 0.5 studs is unambiguous and unsatisfiable.
+--
+-- Safety is unchanged: same promptWritable gate, same addresses, same write, different
+-- value. And the suppression is deliberately forgotten from ST.doneAt so the next sweep
+-- restores it rather than skipping it as "done recently".
+local function suppressOthers(pos, radius, keepPrompt)
+    if not memory_write or not pos then return 0 end
+    if not ST.On or not ST.offsetsOk then return 0 end
+    local list = promptsNear(pos, radius or 25)
+    -- the target's own prompt is the nearest one to the aim point
+    local keep, keepD = keepPrompt, nil
+    if not keep then
+        for _, e in ipairs(list) do
+            if not keepD or e.d < keepD then keepD, keep = e.d, e.p end
+        end
+    end
+    local n = 0
+    for _, e in ipairs(list) do
+        if e.p ~= keep then
+            local a = addrOf(e.p)
+            if a and not promptWritable(a) then
+                ST.Rejected = (ST.Rejected or 0) + 1
+                a = nil
+            end
+            if a then
+                if not ST.orig[a] then
+                    local okh, h = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
+                    local okd, dd = pcall(function() return memory_read("float", a + ST.OFF_DIST) end)
+                    if okh and okd then ST.orig[a] = { hold = h, dist = dd } end
+                end
+                pcall(function() memory_write("float", a + ST.OFF_DIST, 0.5) end)
+                ST.doneAt[a] = nil          -- let the next sweep hand it back
+                ST.suppressed[a] = tick()
+                n = n + 1
+            end
+        end
+    end
+    ST.Suppressed = (ST.Suppressed or 0) + n
+    return n
+end
+_G.SEHUB_SUPPRESS = suppressOthers
 
 -- What hold time does the prompt at this spot ACTUALLY have right now? The patch does
 -- not always take - a prompt created after the last sweep, or one the write missed -
@@ -991,6 +1291,7 @@ local function restorePrompts()
     local n = 0
     for _, p in ipairs(promptList()) do
         local a = addrOf(p)
+        if a and not promptWritable(a) then a = nil end
         local o = a and ST.orig[a]
         if a and o then
             pcall(function()
@@ -1009,12 +1310,18 @@ end
 -- exposed so the re-run guard of the NEXT load can undo this one's writes
 _G.SEHUB_RESTORE = restorePrompts
 
-local main = win:Tab("Main", "egg")
+-- "home", not "egg". The icon set this menu draws from does not have an egg, so the tab
+-- rendered with a blank space where every other tab has a glyph.
+local main = win:Tab("Main", "home")
 local stealSec = main:Section("Instant Steal", "Full")
 stealSec:Label("Removes the prompt hold time, letting you pick eggs up")
 stealSec:Label("instantly. I wouldn't rely on this too much for auto-")
 stealSec:Label("farming - it tends to stop working after a while.")
-stealSec:Toggle("Instant Steal", false, function(v)
+-- Handle kept so the boot block below can push the tick mark to match the real state.
+-- Without that, pinning ST.On in code left the switch showing one thing while the script
+-- did another - which is exactly what "the toggle said off but it was on" was.
+local stealToggle
+stealToggle = stealSec:Toggle("Instant Steal", true, function(v)
     ST.On = v
     if v then
         ST.offsetsOk = true
@@ -1024,7 +1331,7 @@ stealSec:Toggle("Instant Steal", false, function(v)
         restorePrompts()
         ST.doneAt = {}
     end
-end, "Off by default now: it stops working after a while, and the farm no longer depends on it - with this off the grab just holds E for the prompt's real time. Applies continuously while on, since prompts are recreated as you move around.")
+end, "ON by default. Removes the prompt hold time so eggs are taken the instant you press, and it is what lets the farm clear competing prompts out of range so a big egg cannot steal the grab. Applies continuously, since prompts are recreated as you move around.")
 -- No Hold Time slider any more. It existed so instant steal could be softened if instant
 -- turned out to be what got flagged, and it read 1.00s here - which is not a softer
 -- instant steal, it is no instant steal at all. Nothing else in the menu can switch off
@@ -1043,19 +1350,10 @@ end, "Off by default now: it stops working after a while, and the farm no longer
 -- No Prompt Range slider either. It has exactly one correct value here: 5 keeps precisely
 -- one egg in range at a time, because slots sit 6.7 studs apart and anything larger makes
 -- the neighbours eligible and you take the wrong egg. It is pinned below.
-stealSec:Toggle("Ignore Line of Sight", true, function(v)
-    ST.NoLOS = v
-    if v then
-        ST.offsetsOk = true
-        patchPrompts()
-        notify("Instant Steal", "Line-of-sight byte cleared - test a grab", 5)
-    else
-        restorePrompts()
-        ST.origLOS = {}
-        patchPrompts()
-        notify("Instant Steal", "Line-of-sight restored", 3)
-    end
-end, "EXPERIMENTAL. Roblox only shows a prompt when the camera can see it, which is why pointing the camera down and zooming in makes grabs work smoothly. This clears the byte that looks like RequiresLineOfSight so the camera stops mattering. If prompts stop working entirely when you enable this, that byte was Enabled instead - switch it off and tell me, the next candidate is one byte earlier.")
+-- Ignore Line of Sight has no toggle any more. It has been on all session, it is what
+-- stops the camera direction deciding whether a grab works, and there is no situation
+-- where you would want it off while Instant Steal is on - so it is simply part of what
+-- Instant Steal does now, pinned in the boot block below.
 ST.ui = stealSec:Label("off")
 
 -- Building the menu fires every widget's callback, so the values the sliders hand back
@@ -1077,7 +1375,7 @@ ST.ui = stealSec:Label("off")
 -- pinned for the same reason everything else here is: the menu remembers what a toggle was
 -- last set to and replays it over the declared default, so without this Instant Steal came
 -- back ON and Ignore Line of Sight came back OFF - both the opposite of what was asked for.
-local STboot = { Hold = 0, Dist = 5, On = false, NoLOS = true }
+local STboot = { Hold = 0, Dist = 5, On = true, NoLOS = true }
 for k, want in pairs(STboot) do
     if ST[k] ~= want then
         warn(string.format("[Steal An Egg] menu returned ST.%s=%s - starting at %s",
@@ -1085,6 +1383,12 @@ for k, want in pairs(STboot) do
         ST[k] = want
     end
 end
+-- AND PUSH IT BACK TO THE SWITCH. Pinning ST.On above only fixed the variable; the tick
+-- mark kept whatever the menu had remembered, so the two could disagree - the toggle
+-- reading off while instant steal was running, which is precisely what was reported.
+-- Set() drives the visual, so from here the switch always tells the truth.
+if stealToggle then pcall(function() stealToggle:Set(ST.On) end) end
+if ST.On then pcall(patchPrompts) end
 
 
 SESPAWN("prompt patch", function()
@@ -1121,11 +1425,300 @@ local AB = _G.ABOSS
 -- Set in the script rather than left for the user to record. This is the spot that
 -- works: escapes land next to it and the run-in from there is what delivers an egg.
 AB.Zone   = CFrame.new(537.9755, 70.5763, -371.0225)
-AB.Count  = 5          -- repeats, to beat a single rejected write
+-- ONE ATTEMPT, HELD LONG. This is the difference between an escape that costs you a life
+-- every fourth use and one that costs you nothing. Measured, eight escapes each from ~650
+-- studs, in the corridor, farm off:
+--
+--   5 attempts x 0.15s  ->  touched 2/8,  DIED 2/8
+--   1 attempt  x 0.60s  ->  touched 3/8,  died 0/8
+--
+-- The kill risk rides on the NUMBER of rejected teleports, not on how long each one is
+-- held - so retrying is the expensive thing, and holding is free. One long pin is both
+-- safer and MORE likely to land than five short ones, which is the opposite of what the
+-- retry loop assumed.
+--
+-- The kill itself is an anti-cheat instant kill, not a fall: health goes to -1000 while
+-- the character is still standing in the corridor at normal height, belowSlab never
+-- trips. It fires whether or not the touch actually landed - a missed attempt killed as
+-- readily as a successful one - which is why cutting attempts matters more than anything
+-- else here.
+AB.Count  = 1          -- attempts per escape. More attempts = more deaths. Leave at 1.
+-- 0.4, fixed. This was a slider and did not need to be: holding costs nothing (the kill
+-- risk rides on how many separate teleports are fired, not how long each is held), so
+-- there was never a reason to set it lower, and higher bought nothing measurable.
+AB.Hold   = 0.40       -- seconds pinned at the zone, re-written every frame
+AB.Delay  = 0.005      -- only used by teleportTo now; the touch writes every frame
 AB.HoldFor = 6         -- seconds to keep re-planting you while a ragdoll is active
-AB.Delay  = 0.005
 AB.Key    = "F1"
 AB.State  = "no safe zone set"
+
+-- THE TELEPORT IS CAPPED AT ~110 STUDS, and that single fact explains every "the
+-- anti-boss is random" report. Measured here, standing still, interleaved so nothing
+-- could drift between the two arms:
+--
+--    89,  92 (x5), 102, 108, 108, 111 studs -> HELD, 11 of 11
+--   115, 115, 117 (x3), 125, 164, 239, 313, 417 -> NEVER APPLIED, 14 of 14
+--
+-- "Never applied" is literal: the write does not take even for one frame. It is not a
+-- revert, not a race with ragdoll physics, and not a rate limit - 6 escapes fired 2s
+-- apart at 92 studs all held, and a 45s rest changed nothing either way.
+--
+-- It is the SAME budget the run speed hits: ~290 studs/s of net displacement, over a
+-- window of roughly 0.38s, which buys exactly one ~110 stud jump.
+--
+-- So an escape to a safe zone 500-3000 studs away - which is where you are during any
+-- farming run - silently does nothing, every single time. It only ever worked when you
+-- were already home, which is when you did not need it. AB.Count and AB.Delay never
+-- helped because they only control how many times a rejected write is re-sent.
+local ESC_MAXHOP = 100        -- 108 holds, 117 does not; 100 leaves margin
+
+-- The playable corridor, so an escape never hops off the edge of it.
+--
+-- Measured from the egg slots, which are by definition standable ground:
+--   X 591 .. 4805  (4214 studs)      Z -413 .. -311  (102 studs)
+--
+-- That shape is the whole reason hops have to be clamped, and it is worth stating plainly
+-- because it caught out an earlier speed test too: the map is a long thin strip running
+-- along X. There is essentially no room to move in Z.
+--
+-- Recomputed from live slots when there are enough of them, so a map change cannot leave
+-- this stale; the measured numbers are the fallback for when the sweep has not run yet.
+local PLAY_FALLBACK = { minx = 591, maxx = 4805, minz = -413, maxz = -311 }
+local PLAY_CACHE, PLAY_AT = nil, 0
+local function playBounds()
+    if PLAY_CACHE and (tick() - PLAY_AT) < 30 then return PLAY_CACHE end
+    local b, n = { minx = 1e9, maxx = -1e9, minz = 1e9, maxz = -1e9 }, 0
+    local okS, slots = pcall(function() return _G.SEHUB_SLOTS and _G.SEHUB_SLOTS() or {} end)
+    if okS and slots then
+        for _, e in ipairs(slots) do
+            local p = e.pos
+            if p then
+                n = n + 1
+                if p.X < b.minx then b.minx = p.X end
+                if p.X > b.maxx then b.maxx = p.X end
+                if p.Z < b.minz then b.minz = p.Z end
+                if p.Z > b.maxz then b.maxz = p.Z end
+            end
+        end
+    end
+    if n < 8 then b = PLAY_FALLBACK end
+    -- Inset, so a hop lands ON the strip rather than on its lip.
+    PLAY_CACHE = { minx = b.minx + 10, maxx = b.maxx - 10,
+                   minz = b.minz + 10, maxz = b.maxz - 10 }
+    PLAY_AT = tick()
+    return PLAY_CACHE
+end
+_G.SEHUB_PLAYBOUNDS = function() return playBounds() end
+
+-- ONE HOP PER STANDSTILL. Measured over 600 stud legs, from a dead stop:
+--
+--   run only    2.342 / 2.085 / 2.102 s   (avg 2.18)
+--   1 hop + run 1.809 / 1.824 / 1.825 / 1.828 / 1.829 s   (avg 1.82)  <- 0.35s faster
+--   2 hops      2.917 / 3.043 s                                       <- 0.8s SLOWER
+--   3 hops      2.396 / 3.223 s                                       <- worse still
+--
+-- 0.35s is exactly 100 studs / 288 studs/s, so the first hop is genuinely free: standing
+-- still banks displacement budget, and the hop spends what was already banked. The second
+-- hop is not free, it is over budget, and the rubber-band that follows costs more than the
+-- hop gained - the "2 hops landed" rows still finished LAST. Waiting longer before hopping
+-- does not buy a second one either (3s of standstill was no better than 1.2s).
+--
+-- Hence the gate: every hop in the script goes through here, escape and headstart alike,
+-- so a grab can never fire two. Without that, Auto Anti-Boss and the farm would each hop
+-- on the same grab and the pair would be slower than neither.
+-- WRITE IT MORE THAN ONCE, THEN CHECK IT TOOK. The first version of this fired a single
+-- CFrame write, never looked, and counted every attempt as a success - so it reported 50
+-- headstarts on 25 eggs while roughly a quarter of them were doing nothing at all, and the
+-- catches that came from those were invisible in the numbers. Two separate causes, both
+-- already documented elsewhere in this file and both ignored here:
+--
+--   a single write loses to ragdoll physics on the next step   (see teleportTo)
+--   a hop into geometry is refused outright and moves you 0    (see the escape's retry)
+--
+-- So: plant it several times like every other teleport in this script, verify, and on a
+-- refusal try again SHORTER along the same line. Shorter, not rotated - a blocked hop is
+-- usually a hop into something, and backing off clears it while still making progress
+-- toward home. Rotating is right for an escape, where survival beats direction; it is
+-- wrong for a headstart, whose whole purpose is the progress.
+--
+-- Retrying is free: a hop that moved nothing spent none of the ~290 studs/s budget.
+-- A HOP CAN LAND AND THEN BE TAKEN BACK. The first verification checked at 0.03s and
+-- called that a success, but the escape measurements had already shown this exact shape:
+--
+--   from 161 studs -> at the zone at 0.05s and 0.15s, yanked back by 0.30s
+--
+-- So "it moved" is not the same as "it stuck", and a hop that is undone at 0.3s looks
+-- identical to a good one at 0.15s while leaving you standing next to the egg you just
+-- robbed. That is the failure that gets you caught, and the counter could not see it.
+--
+-- Hence a second look at 0.6s, and a budget check before hopping at all: the ~290 studs/s
+-- allowance is a ROLLING one, so a hop taken moments after sprinting is spending studs
+-- that are not there yet. HIST is the last second of positions, kept so the hop can ask
+-- how much has already been used.
+_G.SEHUB_HIST = _G.SEHUB_HIST or {}
+local function histPush(p)
+    local H = _G.SEHUB_HIST
+    H[#H+1] = { t = tick(), x = p.X, z = p.Z }
+    while #H > 40 and (tick() - H[1].t) > 1.2 do table.remove(H, 1) end
+end
+_G.SEHUB_HISTPUSH = histPush
+-- How far we have moved over the last `secs`, and the span actually covered.
+local function movedWithin(secs)
+    local H = _G.SEHUB_HIST
+    local newest = H[#H]
+    if not newest then return 0, 0 end
+    local now = tick()
+    local oldest = H[1]
+    for i = #H, 1, -1 do
+        if (now - H[i].t) >= secs then oldest = H[i] break end
+    end
+    local span = newest.t - oldest.t
+    if span <= 0.01 then return 0, 0 end
+    return math.sqrt((newest.x-oldest.x)^2 + (newest.z-oldest.z)^2), span
+end
+_G.SEHUB_MOVEDIN = movedWithin
+
+local lastHopAt = 0
+local HOP_RETRY = { 0.70, 0.45, 0.25 }
+local function hopToward(tx, tz, why)
+    if (tick() - lastHopAt) < (AB.HopGap or 1.0) then return false end
+    local root = myRoot()
+    if not root then return false end
+    local okp, me = pcall(function() return root.Position end)
+    if not okp or not me then return false end
+    local dx, dz = tx - me.X, tz - me.Z
+    local m = math.sqrt(dx*dx + dz*dz)
+    if m < 30 then return false end            -- practically there; nothing to win
+    local B = playBounds()
+    local F = _G.FARM or {}
+    local full = math.min(ESC_MAXHOP, m)
+    local function aim(dist)
+        local nx, nz = me.X + (dx/m)*dist, me.Z + (dz/m)*dist
+        if nx < B.minx then nx = B.minx elseif nx > B.maxx then nx = B.maxx end
+        if nz < B.minz then nz = B.minz elseif nz > B.maxz then nz = B.maxz end
+        return nx, nz
+    end
+    -- BUDGET CHECK. The allowance is rolling: over the last 0.6s the server will accept
+    -- about 290 studs/s of net displacement, and whatever we already spent running is
+    -- gone. Hopping the full 100 on top of a sprint is what gets the hop taken back a
+    -- third of a second later. So hop only what is actually left, with a margin.
+    local used, span = movedWithin(0.6)
+    if span > 0.05 then
+        local allowance = (290 * span) - used - 25      -- 25 studs of margin
+        if allowance < full then full = allowance end
+        if full < 25 then
+            F.HopSkipped = (F.HopSkipped or 0) + 1
+            F.LastHopSkip = string.format("%s: only %.0f studs of budget (used %.0f in %.2fs)",
+                tostring(why), allowance, used, span)
+            return false
+        end
+    end
+    local nx, nz = aim(full)
+    if math.sqrt((nx-me.X)^2 + (nz-me.Z)^2) < 20 then return false end
+
+    lastHopAt = tick()
+    F.HopTried = (F.HopTried or 0) + 1
+    F.LastHeadstart = why
+    F.HopUsedBefore = used
+    local target = CFrame.new(nx, me.Y, nz)
+    pcall(function()
+        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        root.CFrame = target
+    end)
+
+    task.spawn(function()
+        -- Re-plant the full hop immediately, before judging it. This is the half the
+        -- old code was missing: one write can simply be overridden, and calling that
+        -- a blocked hop would send us shortening for no reason.
+        for _ = 1, 2 do
+            local r = myRoot()
+            if r then
+                pcall(function()
+                    r.CFrame = target
+                    r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                end)
+            end
+            task.wait(AB.Delay or 0.005)
+        end
+        local landed, firstTry = false, false
+        for attempt = 0, #HOP_RETRY do
+            task.wait(0.03)
+            local r = myRoot()
+            if not r then return end
+            local okq, p = pcall(function() return r.Position end)
+            if not okq or not p then return end
+            if math.sqrt((p.X-me.X)^2 + (p.Z-me.Z)^2) > 8 then
+                landed, firstTry = true, (attempt == 0)
+                target = CFrame.new(p.X, p.Y, p.Z)
+                break
+            end
+            local f = HOP_RETRY[attempt + 1]
+            if not f then break end
+            local sx, sz = aim(full * f)
+            target = CFrame.new(sx, me.Y, sz)
+            pcall(function()
+                r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                r.CFrame = target
+            end)
+        end
+        -- Headstarts now counts hops that ACTUALLY MOVED YOU. HopTried counts attempts,
+        -- HopFirst the ones that needed no retry: the gap between them is the failure
+        -- rate that used to be unobservable.
+        F.HopLanded  = (F.HopLanded  or 0) + (landed and 1 or 0)
+        F.HopFirst   = (F.HopFirst   or 0) + (firstTry and 1 or 0)
+        F.HopBlocked = (F.HopBlocked or 0) + (landed and 0 or 1)
+        if landed then
+            for _ = 1, math.max((AB.Count or 5) - 1, 1) do
+                local r = myRoot()
+                if r then
+                    pcall(function() r.CFrame = target end)
+                    pcall(function() r.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+                end
+                task.wait(AB.Delay or 0.005)
+            end
+            -- THE SECOND LOOK. Far enough out to catch a server take-back, which lands
+            -- around 0.3s. Counted separately, because a hop that is undone is worse
+            -- than one that never fired: the farm believes it has a head start it does
+            -- not have, and carries on as if it were 100 studs further away.
+            task.wait(0.55)
+            local r2 = myRoot()
+            local okp2, p2 = pcall(function() return r2 and r2.Position end)
+            if okp2 and p2 then
+                local still = math.sqrt((p2.X-me.X)^2 + (p2.Z-me.Z)^2)
+                if still > 8 then
+                    F.HopHeld = (F.HopHeld or 0) + 1
+                    F.Headstarts = (F.Headstarts or 0) + 1
+                else
+                    F.HopReverted = (F.HopReverted or 0) + 1
+                    F.LastHopRevert = string.format("%s: hopped %.0f, back to %.0f after 0.6s (used %.0f before)",
+                        tostring(why), full, still, F.HopUsedBefore or -1)
+                end
+            end
+        end
+    end)
+    return true
+end
+_G.SEHUB_HOP = function(tx, tz, why) return hopToward(tx, tz, why) end
+
+-- Where the threat is. Nearest live guard, or nil.
+local function nearestGuardPos(me)
+    local bx, bz, bd = nil, nil, 1e9
+    for _, g in ipairs((_G.GUARDS or {}).list or {}) do
+        local okm, mdl = pcall(function() return g.model end)
+        if okm and mdl then
+            local okp, par = pcall(function() return mdl.Parent end)
+            if okp and par then
+                local okr, r = pcall(function() return mdl:FindFirstChild("HumanoidRootPart") end)
+                local okq, p = pcall(function() return r and r.Position end)
+                if okq and p then
+                    local d = math.sqrt((p.X - me.X)^2 + (p.Z - me.Z)^2)
+                    if d < bd then bd, bx, bz = d, p.X, p.Z end
+                end
+            end
+        end
+    end
+    return bx, bz, bd
+end
 
 -- One teleport, done the way that actually sticks: an immediate write, then repeats a
 -- few milliseconds apart. A SINGLE write loses - the ragdoll physics simply overrides
@@ -1152,40 +1745,135 @@ local function teleportTo(cf, quiet)
 end
 _G.SEHUB_TELEPORT = teleportTo
 
+-- THE SAFE ZONE TOUCH. This is the exploit, and it does not need the teleport to stick.
+--
+-- The game drops the chase when it sees you at the safe zone - it treats having passed
+-- there as having banked the egg. So all that has to happen is for the SERVER TO OBSERVE
+-- ONE POSITION UPDATE at the zone. It then snaps you back (the distance is far past the
+-- ~110 stud cap), you carry on running home from where you were, and the guard has lost
+-- you. Going there and being thrown back is the whole trick, not a failure of it.
+--
+-- Which is why the earlier "0 of 14 escapes applied" measurement was answering the wrong
+-- question. It checked where you ENDED UP 0.3 to 2 seconds later, and of course that is
+-- back where you started - that is the anti-cheat doing exactly what this relies on. It
+-- never checked whether the server saw the zone in between, which is the only thing that
+-- matters.
+--
+-- So the failure mode is not distance. It is REPLICATION. Roblox sends the character's
+-- position to the server roughly every 33-50ms, and the old escape wrote five times at
+-- 0.01s apart - 50ms end to end. That can land entirely inside one replication gap, in
+-- which case the server never sees the zone at all and the chase carries on. Same code,
+-- same distance, works or does not purely on where the writes fall relative to the tick.
+-- That is the randomness.
+--
+-- The fix is to HOLD the position across several ticks instead of flickering through it.
+-- AB.Delay is now a replication tick rather than a fifth of one, so the default escape
+-- spans ~5 ticks and the server cannot miss it.
 local function gotoZone(quiet)
     if not AB.Zone then
         if not quiet then notify("Anti-Boss", "Set a safe zone first", 2) end
         AB.State = "no safe zone set"
         return
     end
+    local root = myRoot()
+    if not root then return end
+    local okp, me = pcall(function() return root.Position end)
+    if not okp or not me then return end
+    local dHome = math.sqrt((AB.Zone.X - me.X)^2 + (AB.Zone.Z - me.Z)^2)
+
     -- The FIRST write happens right here, synchronously, before anything yields.
     -- Previously the whole thing went into task.spawn, so the escape did not begin
     -- until the scheduler came back round - and being flung and losing the egg takes
-    -- less time than that. Everything after this is just insurance.
-    local root = myRoot()
-    if root then
-        pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
-        pcall(function() root.CFrame = AB.Zone end)
-    end
+    -- less time than that.
+    pcall(function()
+        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        root.CFrame = AB.Zone
+    end)
+    AB.Hops = (AB.Hops or 0) + 1
+
     task.spawn(function()
-        for _ = 1, math.max((AB.Count or 5) - 1, 1) do
-            local r = myRoot()
-            if r then
-                pcall(function() r.CFrame = AB.Zone end)
-                pcall(function() r.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+        -- PIN, DO NOT FLICKER. Measured, writing to the zone for 300ms at a time and
+        -- sampling how long the character was actually there:
+        --
+        --   re-write every 0.040s ->   0ms,  200ms,   0ms
+        --   re-write every 0.010s ->   0ms,  400ms,   0ms
+        --   re-write every frame  -> 400ms,  380ms,   0ms
+        --
+        -- Between writes the anti-cheat drags you back, so a slow loop spends most of
+        -- its time off the zone and the server samples you somewhere else. Writing every
+        -- frame holds the position continuously, which is what a replication tick needs
+        -- to land on. This is why the original 0.005s spacing worked more often than the
+        -- 0.035s "one write per tick" that replaced it - the spacing was never the bug,
+        -- the 50ms total duration was.
+        --
+        -- The zeroes in every column are the other half: sometimes the write is refused
+        -- outright, whatever the spacing, and no amount of re-writing lands it. That is
+        -- stochastic and roughly half the time. It cannot be prevented - but it CAN be
+        -- detected, which is what the retry below is for. A touch that did not happen is
+        -- now a retry instead of a silent failure.
+        local reached, tries, bestFrames = false, 0, 0
+        for attempt = 1, math.max(AB.Count or 5, 1) do
+            tries = attempt
+            local frames, t0 = 0, tick()
+            while tick() - t0 < (AB.Hold or 0.35) do
+                local r = myRoot()
+                if r then
+                    pcall(function()
+                        r.CFrame = AB.Zone
+                        r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                    end)
+                    local okq, p = pcall(function() return r.Position end)
+                    if okq and p then
+                        local d = math.sqrt((p.X-AB.Zone.X)^2 + (p.Z-AB.Zone.Z)^2)
+                        if d < 25 then frames = frames + 1 end
+                    end
+                end
+                task.wait()                      -- every frame, not every tick
             end
-            task.wait(AB.Delay)
+            if frames > bestFrames then bestFrames = frames end
+            -- WHAT COUNTS AS ENOUGH DEPENDS ON RANGE, because the ceiling does. Measured
+            -- across ten touches, holding for 0.35s each:
+            --
+            --   from   99 studs -> 7, 8, 9 frames   (inside the ~110 cap: pins freely)
+            --   from  824 studs -> 2 frames
+            --   from  923 studs -> 1 frame
+            --   from 3762 studs -> 2 frames
+            --
+            -- Beyond the cap the server takes you back after a frame or two no matter how
+            -- long the write loop runs, so 1-2 frames IS the ceiling out there and asking
+            -- for 3 can never be satisfied - it just burns every retry. A frame is ~17ms
+            -- and a replication tick 33-50ms, so two frames is a real chance of being
+            -- seen and one is a coin flip; both are worth stopping for, and the retries
+            -- are there for the attempts that land nothing at all.
+            local need = (dHome <= ESC_MAXHOP) and 3 or 2
+            if frames >= need then reached = true break end
+            task.wait(0.12)                      -- let the refusal clear, then try again
         end
+        AB.Touches = (AB.Touches or 0) + (reached and 1 or 0)
+        AB.Missed  = (AB.Missed  or 0) + (reached and 0 or 1)
+        AB.Tries   = (AB.Tries   or 0) + tries
+        AB.LastTouch = string.format("%s after %d %s (%d frames at the zone, from %.0f studs)",
+            reached and "TOUCHED" or "MISSED", tries,
+            (tries == 1) and "try" or "tries", bestFrames, dHome)
+        -- Nothing is written after this. The snap back to where you were IS the
+        -- return leg, and fighting it would only keep you pinned at the zone.
     end)
     AB.lastEscape = tick()
-    AB.State = "escaped to safe zone"
-    if not quiet then notify("Anti-Boss", "Teleported to safe zone", 2) end
+    lastHopAt = tick()
+    AB.LastHow = string.format("safe zone touch from %.0f studs", dHome)
+    AB.State = AB.LastHow
+    if not quiet then notify("Anti-Boss", "Touched the safe zone", 2) end
 end
+
+-- Exposed so the escape can be fired and measured without pressing the key.
+_G.SEHUB_ESCAPE = function(quiet) return gotoZone(quiet) end
 
 -- Shares the Main tab with Instant Steal now, rather than owning a tab for two controls.
 local bossSec = main:Section("Anti-Boss", "Full")
-bossSec:Label("Quickly teleports you to the safe zone and back so the")
-bossSec:Label("boss stops chasing you.")
+bossSec:Label("Touches the safe zone and lets the server throw you")
+bossSec:Label("back. The game treats having passed there as having")
+bossSec:Label("banked the egg, so the guard drops the chase and you")
+bossSec:Label("run home from where you were standing.")
 bossSec:Button("Set Safe Zone", function()
     local root = myRoot()
     if not root then
@@ -1237,6 +1925,19 @@ SESPAWN("escape key", function()
     end
 end)
 
+-- Feeds the rolling position history the hop budget is computed from. 20Hz is plenty:
+-- the window it answers is 0.6s wide, and this is two reads and a table append.
+SESPAWN("move history", function()
+    while _G.SEHUB_GEN == GEN do
+        local r = myRoot()
+        if r then
+            local okp, p = pcall(function() return r.Position end)
+            if okp and p then _G.SEHUB_HISTPUSH(p) end
+        end
+        task.wait(0.05)
+    end
+end)
+
 -- ==================== auto farm ====================
 -- A GROUND RUNNER, and that is not a stylistic choice - it is the only thing the egg
 -- areas allow. Measured, in the area itself:
@@ -1255,7 +1956,20 @@ end)
 _G.FARM = _G.FARM or {}
 local FM = _G.FARM
 FM.On        = false
-FM.Speed     = 220        -- ground speed; 320 is the measured ceiling, this leaves room
+-- 300, not 220. Re-measured properly, in an egg area, along X (the axis the areas
+-- actually span - the earlier test drove along Z and hit the area's boundary wall at
+-- z=-295, which is why it reported a 92 studs/s "ceiling" that does not exist):
+--
+--   cmd 220 -> 207 studs/s actual   (94% of commanded)
+--   cmd 260 -> 250                  (96%)
+--   cmd 300 -> 288                  (96%)   <- the edge
+--   cmd 320 ->  42                  (13%)   rubber-banded, SLOWER than 220
+--   cmd 430 ->   0                          KILLED
+--
+-- So the old "320 is the measured ceiling" was wrong in both directions: 320 is already
+-- over the line, and 220 was leaving 39% on the table. The slider max is now 300 so the
+-- rubber-band zone cannot be dialled in by hand.
+FM.Speed     = 300        -- ground speed; 288 studs/s actual, 96% of the server's budget
 FM.Stick     = 18         -- downward bias, studs/s, to guarantee floor contact
 -- Close enough to be standing INSIDE the egg, and that is not a preference - it is what
 -- makes the game hand you the right prompt.
@@ -1273,6 +1987,65 @@ FM.Fallbacks = 0
 -- 30, not 60. Braking from 60 studs out spent half the approach crawling; the taper is
 -- proportional, so a shorter brake keeps full speed for longer and still arrives stopped.
 FM.Brake     = 30         -- start slowing this far out, so arrival is a stop not a skid
+-- SNAP THE LAST STRETCH instead of crawling it. The brake exists only because the farm
+-- ticks at 33Hz: at 288 studs/s that is 8.7 studs per tick, and you cannot land in a 1.5
+-- stud window by taking 8.7 stud steps, so the speed had to taper to 14 studs/s and creep
+-- in. That creep cost ~0.40s on EVERY grab.
+--
+-- A CFrame write lands exactly. Measured, in the area, arriving at full 300:
+--
+--   at-speed snap  8 studs -> landed 0.00 from target
+--   at-speed snap 20 studs -> landed 0.00 from target
+--
+-- so the taper is replaced by one write once the egg is inside the snap window. 12 studs,
+-- because a tick moves at most 8.7 and the window has to be wider than that or a tick can
+-- step straight over it.
+--
+-- This is NOT a way to travel faster - the server budgets ~290 studs/s of net displacement
+-- and enforces it against CFrame writes exactly as hard as against velocity:
+--
+--   single hop  60 studs -> HELD, 0.00 error      (fits inside one window's budget)
+--   single hop 150 studs -> REVERTED, gained 0
+--   single hop 300 studs -> REVERTED, gained 0
+--   single hop 600 studs -> REVERTED, and KILLED
+--   chained 40 studs every 0.15s (267/s) -> 257 studs/s, clean
+--   chained 40 studs every 0.10s (400/s) -> 159 studs/s, reverted
+--   chained 100 studs every 0.10s        ->   0 studs/s, fully blocked
+--
+-- The header's old claim that 100/200/300 stud hops held was measured at spawn, which is
+-- outside the check - the same scoping the airborne note describes. In an egg area they
+-- do not hold. So: snap only the final approach, never the journey.
+FM.Snap      = 12         -- within this many studs, stop tapering and write the position
+FM.SnapOn    = true       -- off falls back to the old taper
+FM.Snaps     = 0
+-- The free 100 studs at each end of a run. See the hop gate for the measurements; the
+-- short version is that standing still banks displacement budget and one hop spends it,
+-- so the two moments the farm is already stationary - pressing E, and handing the egg
+-- over - each buy a 100 stud jump that costs nothing. 0.35s a leg, two legs an egg.
+-- OFF. It works - 0.27s a leg, measured - but it fires at the same instant as the safe
+-- zone touch and the touch is the thing that matters. Speed is not worth spending the
+-- escape's moment on.
+-- Headstart Hop removed entirely - no toggle, no call sites, no flags. hopToward and the
+-- movement-budget history it uses are kept: the safe zone touch is built on the same
+-- measurements, and _G.SEHUB_HOP stays exposed for testing from the console.
+-- Cleared rather than left: _G.FARM survives a reload, so a field from a previous build
+-- lingers in it forever and reads like a live setting when someone dumps the table.
+FM.Headstart, FM.Headstarts, FM.outboundHop = nil, nil, nil
+-- Big eggs. A carried egg is welded into your physics assembly, so a wide one is dragged
+-- through the world with you and the server rejects the result; measured 32 studs/s at
+-- cmd 300 for a 13.5 wide egg against 220 for a 1.7, ending in a death. Anything over
+-- BigWidth is carried at BigCarrySpeed instead of fighting for a speed you cannot have.
+-- Drop every competing prompt out of range for the moment of the press, so a big
+-- neighbour cannot take the grab. Needs Instant Steal on, since that is what owns the
+-- prompt writes. See suppressOthers.
+FM.Suppress      = true
+FM.BigWidth      = 6      -- hitbox studs above which an egg counts as "big"
+-- 280, matching the slider. These two have to agree: this is what the farm starts with,
+-- the slider is what the menu hands back, and when they disagreed the declared value won
+-- on load and the menu quietly showed a number the farm was not using.
+FM.BigCarrySpeed = 280    -- what to ask for while carrying one
+FM.RandomPick    = nil    -- removed; the farm no longer reads it
+FM.carryW        = 1      -- width of the egg currently in hand
 FM.AfterSteal = 0.4       -- settle time after a grab before the run home begins
 -- Rally point: where to go first after dying. Respawning puts you at your base, and
 -- setting off for an egg from there drags you through whatever geometry is in the way,
@@ -1302,6 +2075,17 @@ FM.slotCount = nil        -- last seen egg-slot count, for spotting the night re
 FM.Reloads   = 0
 FM.Cooldown  = 6          -- seconds before the same prompt is worth trying again
 FM.RarePri   = false
+-- What happens when Rare Priority is OFF, and it is not optional any more. Nearest-first
+-- walks the same short loop round the same few slots; random spreads the run across the
+-- map. Sticky per target, area picked first so a dense area does not dominate the draw.
+-- A rift-wanted egg still outranks it.
+FM.randomKey  = nil
+FM.randomArea = nil
+-- Friend Drop: let go of the egg near the safe zone instead of banking it, so somebody
+-- else can take it. DropRange is how short of the delivery point to stop.
+FM.FriendDrop = false
+FM.DropRange  = 55
+FM.Drops      = 0
 -- How many studs of travel one tier of rarity is worth.
 --
 -- This was 20000, which is wider than the map (about 4600 studs corner to corner), so
@@ -1318,7 +2102,42 @@ FM.RarePri   = false
 -- is concerned. The map is about 4600 studs corner to corner, so 1500 means rarity always
 -- decides between eggs in the same area - where the gaps are tens of studs - while crossing
 -- the whole map still needs a gap of three tiers or more to be worth it.
-FM.RareWeight = 1500
+-- 10000, and that is a DELIBERATE return to strict.
+--
+-- At 1500 one tier was worth 1500 studs, so distance could outrank rarity across tiers
+-- and the farm did this, logged live:
+--
+--   Sand Spider           rank 6    392 studs   <- taken first
+--   DeathstalkerScorpion  rank 6    409 studs   <- taken second
+--   Bronto                rank 7   2255 studs   <- taken third
+--
+-- Two Mythics before a Cosmic, because the Cosmic was far. That is "rarest first" only if
+-- you squint, and it is not what the toggle says it does - the tooltip has always promised
+-- distance breaks ties INSIDE a tier, not across them.
+--
+-- The map is about 4600 studs corner to corner, so any weight above that makes the ladder
+-- absolute: rank decides, distance only ever separates eggs of the SAME rank. 10000 has
+-- margin and is not so large that the numbers stop being readable in the diagnostics.
+--
+-- This was 20000 once and got dialled down because it produced "tunnel vision" - always
+-- the same area. That is not a bug in the weight, it is what rarest-first means when one
+-- area holds the rarest eggs. It is now a slider rather than a constant, so it can be
+-- softened without editing the file.
+FM.RareWeight = 10000
+-- SIZE PRIORITY. The other way to order a run: biggest egg first instead of rarest.
+-- Mutually exclusive with Rare Priority - they are two answers to the same question, and
+-- letting both run would just mean whichever weight was larger silently won.
+--
+-- Bucketed by whole studs rather than raw width, for the same reason rarity is bucketed by
+-- tier: raw width would have the farm cross 400 studs to swap a 5.1 egg for a 5.2. Floor
+-- the width and the ladder has about 13 rungs (measured hitboxes run 0.6 to 13.6 studs),
+-- with distance breaking ties inside a rung.
+--
+-- 5000 per rung is well past the map's 4600 diagonal, so size decides and distance only
+-- separates eggs of the SAME rung. To flip this to smallest-first, negate the rank in the
+-- scoring block - it is one character.
+FM.SizePri    = false
+FM.SizeWeight = 5000
 FM.rareSet   = {}
 FM.RareCount = 0
 FM.fails     = {}         -- [slot key] = consecutive failed grabs
@@ -1771,10 +2590,69 @@ local function carryingEgg() return false end
 -- what actually gets pressed, but there is no way to ask a prompt what it belongs to -
 -- ActionText, ObjectText and Enabled all read nil - so position is the only link, and
 -- standing on the slot puts you on its prompt.
+-- `w` is the hitbox width, and it is carried through to the target because the SIZE OF
+-- THE EGG YOU PICKED UP CHANGES HOW FAST YOU CAN CARRY IT. Measured on one run, same
+-- route, same settings, anti-boss off:
+--
+--   egg width 13.5  ->   32 studs/s   (and it ended in a death)
+--   egg width  1.7  ->  220 studs/s
+--   egg width  ~1   ->  256 studs/s
+--
+-- A carried egg is welded into your physics assembly, so a 13.5 stud hitbox is dragged
+-- through the world with you. The server refuses the resulting positions over and over -
+-- 443 studs of progress in 13.7 seconds, against the ~288 studs/s the same character does
+-- empty-handed - and eventually kills you for it. Without the width here the farm had no
+-- way to know it was carrying the problem.
+-- FRIEND DROP. The game has its own "drop the egg" button - PlayerGui.DropHeldEgg.Button,
+-- an ImageButton that appears while you are carrying something - and clicking it is the
+-- only way to put an egg down deliberately.
+--
+-- It has to be a real click. getconnections and firesignal are both missing in this
+-- executor, so the button's Activated signal cannot be fired directly; mouse1click and
+-- mousemoveabs do exist, so the cursor is moved onto the button and clicked for real.
+--
+-- The +36 is the topbar inset. AbsolutePosition for a GUI under a normal ScreenGui is
+-- measured from below Roblox's topbar, while mousemoveabs works in raw screen pixels, so
+-- the two disagree by exactly the inset height. Verified by clicking and watching the egg
+-- actually leave.
+local function dropHeldEgg()
+    local lp = localPlayer()
+    local pg = lp and lp:FindFirstChild("PlayerGui")
+    local gui = pg and pg:FindFirstChild("DropHeldEgg")
+    if not gui then return false end
+    -- The GUI is always there; the Button only exists while something is in your hands,
+    -- so a nil here is "nothing to drop" rather than a failure. Scanned as well as
+    -- looked up, because FindFirstChild has come back empty on live objects in this
+    -- executor before and a missed drop would silently bank the egg instead.
+    local btn = gui:FindFirstChild("Button")
+    if not btn then
+        local okc, kids = pcall(function() return gui:GetChildren() end)
+        for _, c in ipairs(kids or {}) do
+            local okn, n = pcall(function() return c.Name end)
+            if okn and n == "Button" then btn = c break end
+        end
+    end
+    if not btn then return false end
+    local okp, ap = pcall(function() return btn.AbsolutePosition end)
+    local oks, sz = pcall(function() return btn.AbsoluteSize end)
+    if not (okp and ap and oks and sz) then return false end
+    if sz.X < 2 or sz.Y < 2 then return false end
+    local x = ap.X + sz.X * 0.5
+    local y = ap.Y + sz.Y * 0.5 + (FM.GuiInset or 36)
+    if not mousemoveabs or not mouse1click then return false end
+    pcall(function() mousemoveabs(x, y) end)
+    task.wait(0.05)
+    pcall(function() mouse1click() end)
+    FM.Drops = (FM.Drops or 0) + 1
+    FM.LastDrop = string.format("clicked %.0f,%.0f", x, y)
+    return true
+end
+_G.SEHUB_DROP = dropHeldEgg
+
 local function farmTargets()
     local out = {}
     for _, e in ipairs(eggSlots()) do
-        out[#out + 1] = { pos = e.pos, area = areaOf(e.pos), model = e.model }
+        out[#out + 1] = { pos = e.pos, area = areaOf(e.pos), model = e.model, w = e.w }
     end
     return out
 end
@@ -1872,6 +2750,8 @@ local EGG_RARITY = {
     ["Ascended Vermilion Phoenix"] = "Eternal",
     -- Abyss Ocean
     ["Parrotfish"] = "Rare", ["Swordfish"] = "Epic", ["Shark"] = "Legendary",
+    -- Shark's real template; see the "shark" line in RIFT_EGG_ALIAS.
+    ["Finned Thresher"] = "Legendary",
     ["Orca"] = "Mythic", ["Whale Shark"] = "Cosmic", ["Belula Beluga"] = "Cosmic",
     ["Kraken"] = "Secret", ["El Maja"] = "Eternal",
     -- Prehistoric
@@ -1886,9 +2766,19 @@ local EGG_RARITY = {
     ["Crane"] = "Epic", ["Salamander"] = "Legendary", ["Red Panda"] = "Mythic",
     ["Snowy Owl"] = "Cosmic", ["Koi"] = "Cosmic", ["Stag"] = "Secret",
     ["Oni Tiger"] = "Eternal", ["Kitsune"] = "Divine",
-    -- Titan Temple, only the four the matcher has actually seen there
+    -- Titan Temple. Four the matcher had already seen, plus Rhino.
     ["Kaiju Spider"] = "Legendary", ["Crab"] = "Legendary",
     ["Blade Head"] = "Mythic", ["Mantis"] = "Cosmic",
+    -- "Rhino" is the TEMPLATE name; the pet is Rhinotaur. Confirmed three ways rather
+    -- than on the resemblance of the names: the matcher finds it at x=4805, which is
+    -- inside Titan Temple's 4268-5123 band; Rhinotaur is slot 5 of that area's list; and
+    -- slot 5 of its tier row is Cosmic. It was in the "deliberately absent" group above
+    -- because the display name had no confirmed template - it does now.
+    --
+    -- This is the entry whose absence made a Secret sit on the map untouched: the egg
+    -- identified perfectly as "Rhino" and then had no tier, so Always Target could not
+    -- see it and nothing said why.
+    ["Rhino"] = "Cosmic",
 }
 
 -- Rank of an identified egg, 0 when we have never been told its tier.
@@ -1914,10 +2804,24 @@ local INDEX_SLOT = _G.SEHUB_INDEXSLOT
 if not next(INDEX_SLOT) and readfile then
     local ok, src = pcall(readfile, INDEX_FILE)
     if ok and type(src) == "string" and #src > 0 then
-        local okc, chunk = pcall(loadstring, src)
+        -- MATCHA'S loadstring DOES NOT PROPAGATE A CHUNK'S RETURN VALUE. For a file whose
+        -- entire body is `return {...}`, pcall(chunk) comes back true, nil - success, and
+        -- nothing. So this cache has never once loaded from disk in this executor: every
+        -- session started with an empty index and silently rebuilt only what a live harvest
+        -- could see, while saveIndexSlots kept writing a file that merely looked readable.
+        -- It hid itself well, because _G survives a reload, so within one sitting the
+        -- in-memory copy made the cache appear to be working.
+        --
+        -- Hand the table back through a global, which does survive the call. Stripping a
+        -- leading `return` also upgrades files already written in the old format.
+        local body = string.gsub(src, "^%s*return%s+", "")
+        local okc, chunk = pcall(loadstring, "_G.SEHUB_INDEXLOAD=" .. body)
         if okc and chunk then
-            local okr, tbl = pcall(chunk)
-            if okr and type(tbl) == "table" then
+            _G.SEHUB_INDEXLOAD = nil
+            pcall(chunk)
+            local tbl = _G.SEHUB_INDEXLOAD
+            _G.SEHUB_INDEXLOAD = nil
+            if type(tbl) == "table" then
                 for area, slots in pairs(tbl) do
                     if type(slots) == "table" then INDEX_SLOT[area] = slots end
                 end
@@ -1974,6 +2878,29 @@ local function learnRarity(template, tier)
     _G.FARM.RarityLearned = (_G.FARM.RarityLearned or 0) + 1
 end
 _G.SEHUB_RARITY = function() return EGG_RARITY, RARITY_RANK end
+-- Egg types on the map right now that have no known rarity, by name. These are the ones
+-- Always Target cannot see, and the list is exactly what needs adding to EGG_RARITY.
+_G.SEHUB_NOTIER = function()
+    local out = {}
+    for nm in pairs(_G.FARM.NoTier or {}) do out[#out + 1] = nm end
+    table.sort(out)
+    return out
+end
+
+-- The tier NAME for an egg, lowercased, for Always Target to match against. rarityRank
+-- returns a number and two tiers can share one (mythic and mythical are both 6), so the
+-- rank is no good for "is this specific tier in the list" - the name is.
+local function alwaysTier(eggName, area)
+    if not eggName then return nil end
+    local tier = EGG_RARITY[eggName]
+    if not tier then
+        local byArea = area and INDEX_SLOT[area]
+        local slot = byArea and byArea[eggName]
+        local tiers = area and AREA_TIER[area]
+        if slot and tiers then tier = tiers[slot] end
+    end
+    return tier and string.lower(tier) or nil
+end
 
 -- A rare egg's slot gains a "RareAreaEggHighlight" child - the glow you see on it.
 --
@@ -2025,7 +2952,28 @@ end
 -- Known limit: 29 of the 115 templates are empty shells in ReplicatedStorage with no
 -- children at all (Unicorn, Void Dragon, Boss Egg and friends). Those can never be
 -- matched, so eggs of those types come back nil rather than wrong.
-local EGG_FP = nil
+-- KEPT IN _G SO IT SURVIVES A RELOAD. The templates live in ReplicatedStorage, and this
+-- executor loses that service outright for long stretches - verified: game:GetChildren()
+-- comes back without it, so no access path finds it, it is simply gone. While it is gone
+-- nothing can be identified.
+--
+-- As a file-local this table was rebuilt from scratch on every reload, so reloading during
+-- one of those windows threw away a perfectly good set of fingerprints and replaced it with
+-- nothing: 76 templates one moment, 0 the next, with rarity features silently blind until
+-- the service came back. _G outlives the reload, so the good copy is kept and only improved.
+-- Bumped whenever the fingerprint RULE changes. The cache outlives a reload by design, so
+-- without this a run carrying entries built under the old rule - including the Hitbox-only
+-- one-part junk that matched everything at 0.000 - would keep them forever and the fix
+-- would appear not to work. A mismatch throws the cache away and rebuilds.
+local EGG_FP_VER = 2
+_G.SEHUB_EGGFP = _G.SEHUB_EGGFP or { fp = nil, at = 0, done = false, stall = 0, ver = EGG_FP_VER }
+local EGG_FP_C = _G.SEHUB_EGGFP
+if EGG_FP_C.ver ~= EGG_FP_VER then
+    EGG_FP_C.fp, EGG_FP_C.at, EGG_FP_C.done, EGG_FP_C.stall = nil, 0, false, 0
+    EGG_FP_C.ver = EGG_FP_VER
+end
+local EGG_FP = EGG_FP_C.fp
+local EGG_FP_AT, EGG_FP_DONE, EGG_FP_STALL = EGG_FP_C.at, EGG_FP_C.done, EGG_FP_C.stall
 
 -- Every part, sorted biggest first, with X/Y/Z divided by the cube root of the biggest
 -- part's volume. That normalisation makes it scale-invariant while keeping the relative
@@ -2045,15 +2993,42 @@ local function eggFingerprint(m)
     local parts = {}
     local okd, kids = pcall(function() return m:GetDescendants() end)
     if not okd or not kids then return nil end
+    -- THE HITBOX IS EXCLUDED BY NAME, so a model whose names cannot be read excludes
+    -- NOTHING - and the Hitbox is usually the one part still readable. The fingerprint then
+    -- describes the BOUNDING BOX instead of the egg, which is a different shape entirely,
+    -- and it is returned with full confidence because nothing about it looks like a failure.
+    --
+    -- Matcha signals a dead binding by returning the literal string "Unreadable_name" and an
+    -- empty ClassName rather than by erroring, so pcall succeeds and the old guard passed
+    -- straight through. Shark's template is in this state permanently - 11 descendants, 0
+    -- readable, unchanged over 40 retries across four seconds - so it can never be
+    -- fingerprinted at all, and every egg that "matched" it was something else.
+    --
+    -- Any unreadable child at all means the part list is a SUBSET of the real model, so the
+    -- whole model is refused. A subset is not a weaker answer, it is a wrong one.
+    --
+    -- NOTE, because I got this wrong once and the fix was worse than the bug: a ONE-part
+    -- fingerprint is NOT degenerate. The normaliser divides by the cube root of the largest
+    -- part's VOLUME, not by the part itself, so a single part keeps its aspect ratio and
+    -- stays perfectly identifiable - Crane, Chicken, Red Panda and DesertLark are all real
+    -- one-part eggs. Rejecting them cost six identifications a sweep for no reason. What
+    -- they cannot do is stand alone: Chicken and DesertLark have the same proportions, and
+    -- a multi-part egg caught with only one part loaded would also land here. So one-part
+    -- answers are kept but marked, and eggNameFor only accepts them when the area's own
+    -- list agrees - see `solo` below.
+    local unreadable = 0
     for _, c in ipairs(kids) do
         local okn, n = pcall(function() return c.Name end)
-        if okn and n ~= "Hitbox" and n ~= "CustomBoundingBox" then
+        if not okn or n == nil or n == "" or n == "Unreadable_name" then
+            unreadable = unreadable + 1
+        elseif n ~= "Hitbox" and n ~= "CustomBoundingBox" then
             local oks, s = pcall(function() return c.Size end)
             if oks and s and typeof(s) == "Vector3" and s.X > 0 and s.Y > 0 and s.Z > 0 then
                 parts[#parts + 1] = s
             end
         end
     end
+    if unreadable > 0 then return nil end
     if #parts == 0 then return nil end
     table.sort(parts, function(a, b) return a.X * a.Y * a.Z > b.X * b.Y * b.Z end)
     local big = parts[1]
@@ -2061,6 +3036,9 @@ local function eggFingerprint(m)
     if k <= 0 then return nil end
     local out = {}
     for i, s in ipairs(parts) do out[i] = { s.X / k, s.Y / k, s.Z / k } end
+    -- Marked, not rejected. A single part is a real shape but a weak witness, so the caller
+    -- demands corroboration from the area list before trusting it.
+    out.solo = (#parts == 1)
     return out
 end
 
@@ -2078,19 +3056,87 @@ local function eggScore(a, b)
 end
 
 local function buildEggFingerprints()
-    if EGG_FP then return EGG_FP end
-    EGG_FP = {}
-    local RS = game:GetService("ReplicatedStorage")
+    -- ONLY CACHE A RESULT THAT HAS SOMETHING IN IT.
+    --
+    -- This used to read `if EGG_FP then return EGG_FP end`, and an empty table is truthy.
+    -- So if the very first call landed while ReplicatedStorage was unreachable - which it
+    -- intermittently is in this executor, the same DataModel decay that takes out Players
+    -- and PlayerGui - it cached {} and every later call short-circuited on it. One
+    -- transient failure at load permanently disabled egg identification for the whole
+    -- session, and everything built on it went quietly inert: Rare Priority ranked every
+    -- egg 0 and fell back to distance, the rift farm could not find its pets, and Always
+    -- Target could never match a tier. Nothing errored, so it looked like the features
+    -- were ignoring their settings rather than starving.
+    --
+    -- AND KEEP GOING UNTIL IT IS COMPLETE, not merely non-empty.
+    --
+    -- "Cache the first non-empty result" is still wrong, because the templates STREAM IN.
+    -- Measured on a fresh join: the folder reported 115 children while only 20 of them had
+    -- parts loaded well enough to fingerprint. Caching there locked identification to 17%
+    -- of the egg types for the rest of the session - which does not look like a failure,
+    -- it looks like Rare Priority working on some eggs and ignoring others.
+    --
+    -- So the cache is only final once the fingerprint count matches the folder's child
+    -- count. Until then it rebuilds, at most once every few seconds so a partial folder
+    -- cannot turn this into a per-call descendant walk.
+    -- BOUNDED, because a rebuild is not cheap and "complete" is not reachable.
+    --
+    -- Measured: one rebuild walks 115 models and costs 162ms - a visible hitch. And the
+    -- count can never match the folder, because 24 of the 115 templates have NO parts at
+    -- all (they never finish streaming on this client), so a "retry until complete" rule
+    -- would hitch every few seconds for the whole session. That is the freeze-mid-run
+    -- behaviour, not a fix for it.
+    --
+    -- So it retries on a long interval and gives up once it stops improving: whatever has
+    -- loaded by then is what identification gets. Measured progression on a fresh join,
+    -- 20 -> 64, so the retry is worth having; chasing the last few is not.
+    local nowT = tick()
+    if EGG_FP and EGG_FP_DONE then return EGG_FP end
+    if EGG_FP and (nowT - (EGG_FP_AT or 0)) < 10 then return EGG_FP end
+    local okRS, RS = pcall(function() return game:GetService("ReplicatedStorage") end)
+    if not okRS or not RS then return EGG_FP or {} end
     local ok, folder = pcall(function()
         return RS.Assets and RS.Assets.Models and RS.Assets.Models:FindFirstChild("Eggs")
     end)
-    if not ok or not folder then return EGG_FP end
+    if not ok or not folder then return EGG_FP or {} end
     local okc, kids = pcall(function() return folder:GetChildren() end)
-    if not okc or not kids then return EGG_FP end
+    if not okc or not kids then return EGG_FP or {} end
+    EGG_FP_AT = nowT
+    local built = {}
     for _, m in ipairs(kids) do
         local r = eggFingerprint(m)
-        if r then EGG_FP[#EGG_FP + 1] = { name = tostring(m.Name), r = r } end
+        if r then built[#built + 1] = { name = tostring(m.Name), r = r } end
     end
+    -- MERGE BY NAME, rather than keeping whichever single pass was biggest.
+    --
+    -- Bindings fail per-instance and independently: measured on one pass, Orca / Whale
+    -- Shark / Finned Thresher all read as zero-part while Parrotfish and Swordfish read
+    -- fine, and on the very next pass those three read 4 parts each. Taking the larger
+    -- pass wholesale threw away every template the smaller pass had read successfully and
+    -- the larger one happened to miss, so progress sawtoothed instead of accumulating.
+    -- Merging makes the set monotonic - it only ever grows - which is also what lets the
+    -- stall counter mean "nothing new is loading" instead of "this pass got unlucky".
+    local before = EGG_FP and #EGG_FP or 0
+    local merged, seen = {}, {}
+    for _, e in ipairs(EGG_FP or {}) do
+        if not seen[e.name] then seen[e.name] = true; merged[#merged + 1] = e end
+    end
+    for _, e in ipairs(built) do
+        if not seen[e.name] then seen[e.name] = true; merged[#merged + 1] = e end
+    end
+    EGG_FP = merged
+    if #EGG_FP > before then
+        EGG_FP_STALL = 0            -- still improving, keep going
+    else
+        EGG_FP_STALL = (EGG_FP_STALL or 0) + 1
+    end
+    -- Done when everything loaded, or when two passes in a row found nothing new.
+    EGG_FP_DONE = (#EGG_FP >= #kids) or (EGG_FP_STALL >= 2)
+    -- Write the state back to the surviving copy, not just the locals.
+    EGG_FP_C.fp, EGG_FP_C.at = EGG_FP, EGG_FP_AT
+    EGG_FP_C.done, EGG_FP_C.stall = EGG_FP_DONE, EGG_FP_STALL
+    _G.FARM.EggFP = string.format("%d of %d templates%s", #EGG_FP, #kids,
+        EGG_FP_DONE and "" or " (still loading)")
     return EGG_FP
 end
 
@@ -2119,15 +3165,15 @@ end
 -- Shark are both 4-part Abyss Ocean eggs but sit 1.04 apart, so they are never confused.
 -- Ash Gecko and Chimpanzee are 0.0001 apart - genuinely identical to this metric - and
 -- only Volcano's list separates them.
-local AREA_EGGS = {
-    Cosmic = { "Centapede", "Galaxy Gecko", "Cyclops Gorilla",
-               "La Vacca Saturno Saturnita", "Alien Skeleton Boss",
-               "Eternal Lunar Dragon", "Unicorn" },
-    Volcano = { "Ash Gecko", "Lava frog", "Flaming Bull", "Lava Iguana",
-                "Chillin Chilli", "Cerberus", "Ascended Vermilion Phoenix" },
-    ["Abyss Ocean"] = { "Parrotfish", "Swordfish", "Shark", "Orca", "Whale Shark",
-                        "Belula Beluga", "Kraken" },
-}
+-- Deliberately EMPTY. seedAreaEggs() fills all eleven areas from AREA_DISPLAY at load, and
+-- harvestPetIndex() overwrites that with the game's own ordering once the Pet Index has
+-- been opened. This used to hold a hand-typed fallback for three areas, from before the
+-- eleven-area table existed, and seedAreaEggs replaced it wholesale so nobody noticed it
+-- had gone stale. It no longer replaces - it merges, so that a transient read failure
+-- cannot drop a template - and the stale entries promptly came back from the dead: Abyss
+-- Ocean ended up with NINE eggs, the eighth being "Shark", a template that cannot be
+-- fingerprinted at all and whose slot is really Finned Thresher.
+local AREA_EGGS = {}
 
 -- Best-scoring template, but only when the answer is CLEAR: a low error and a real
 -- margin over the runner-up. Anything else returns nil - "unknown" is a useful answer
@@ -2158,20 +3204,30 @@ local function eggNameFor(model, area)
     local allow = area and AREA_EGGS[area]
 
     if #fits == 1 or (fits[2].s - fits[1].s) >= EGG_MARGIN then
-        -- A confident answer the area list has never heard of is NOT overruled here.
-        -- The lists are transcriptions and may be incomplete - Abyss Ocean produced a
-        -- confident Finned Thresher that is not on the wiki page - and quietly discarding
-        -- a good match to protect a list would hide exactly the disagreement worth
-        -- seeing. Record it instead, and let Check Rift Progress report it.
+        -- A confident answer the area list has never heard of is NOT overruled here, and
+        -- that has now paid for itself. Abyss Ocean kept producing a confident "Finned
+        -- Thresher", a template its list did not contain; overruling it would have quietly
+        -- relabelled the egg and destroyed the evidence. Trusting it and RECORDING the
+        -- disagreement is what exposed the real fault - the list was wrong, not the match.
+        -- The game's own Pet Index has that slot as "Shark", a template which exists but
+        -- is permanently unreadable, so the egg really is a Finned Thresher and the alias
+        -- now says so. Keep this branch honest: report the disagreement, do not hide it.
         if allow then
             local ok = false
             for _, want in ipairs(allow) do
                 if fits[1].name == want then ok = true break end
             end
             if not ok then
+                -- A SOLO fingerprint is the one case where the area list outranks the
+                -- shape, because one part is also what a half-loaded multi-part egg looks
+                -- like. Unidentified is cheap; a wrong name propagates into Rare Priority
+                -- and Always Target and sends the farm to the wrong egg.
+                if r.solo then return nil end
                 _G.FARM.EggOdd = _G.FARM.EggOdd or {}
                 _G.FARM.EggOdd[area .. ": " .. fits[1].name] = true
             end
+        elseif r.solo then
+            return nil    -- no list to corroborate against, so a one-part answer is a guess
         end
         return fits[1].name
     end
@@ -2186,6 +3242,10 @@ local function eggNameFor(model, area)
     end
     return nil    -- ambiguous and nothing local to break the tie
 end
+-- Exposed for diagnosis. The matcher has now twice disagreed with a probe reimplementing
+-- the same maths, and guessing at the difference costs more than exposing it does.
+_G.SEHUB_NAMEFOR = function(model, area) return eggNameFor(model, area) end
+_G.SEHUB_FPCOUNT = function() return #buildEggFingerprints() end
 
 -- ---- reading the rift requirements out of the game ----
 -- These used to be typed in by hand because the requirements looked unreadable: the
@@ -2238,6 +3298,83 @@ local RIFT_EGG_ALIAS = {
     ["crustacia"]           = "Crab",
     ["bladehide"]           = "Blade Head",
     ["mantaris"]            = "Mantis",
+    -- Five, not four. Rhinotaur's template is "Rhino", found by the matcher at x=4805 -
+    -- inside Titan Temple - and it is slot 5 of that area's list. Without this line the
+    -- rift farm could not target Rhinotaur even though the egg was sitting there being
+    -- identified correctly under its template name.
+    ["rhinotaur"]           = "Rhino",
+    -- The rest of the renames, from matching your per-area lists against the template
+    -- folder. Each is the only candidate of its kind in that area.
+    ["fox"]                 = "Mire Fox",
+    ["fennec"]              = "FennecFox",
+    ["snake"]               = "Rattlesnake",
+    ["scorpion"]            = "DeathstalkerScorpion",
+    ["axolotl"]             = "Dream Axolotl",
+    ["t-rex"]               = "TyrannosaurusRex",
+    ["trex"]                = "TyrannosaurusRex",
+    -- Abyss Ocean's Shark. A template literally named "Shark" DOES exist, which is why
+    -- this rename was never suspected, but it is a dead asset: 11 descendants, every one
+    -- of them unreadable, unchanged across 40 retries over four seconds - so it can never
+    -- be fingerprinted and no world egg can ever match it. The egg that actually spawns in
+    -- that slot fingerprints exactly (0.00000, sole fit) as "Finned Thresher", which is a
+    -- species of shark, and it sits at x=2281 between a Swordfish and a Parrotfish.
+    -- Frequency agrees: the live sweep found Parrotfish x2 and Swordfish x2 - slots 1 and
+    -- 2, Rare and Epic - and Finned Thresher x1, which is slot 3, Legendary, the Shark.
+    -- Same reasoning that produced the four Titan Temple renames above.
+    ["shark"]               = "Finned Thresher",
+}
+
+-- MIGRATE THE CACHED PET INDEX THROUGH THE ALIASES ABOVE.
+--
+-- sehub_petindex.lua is written once, from a real harvest, and then trusted for the rest of
+-- time - so a rename discovered AFTER that harvest never reaches it, and the stale template
+-- name outlives every other fix. That is exactly what happened with Shark: the cache on
+-- disk records Abyss Ocean slot 3 as "Shark", harvested before the rename was known, and
+-- areaEggsFromIndex faithfully rebuilt the allow list from it - putting a template that can
+-- never be fingerprinted back into the area on every single load.
+--
+-- The stored values are template names, and a stored name that is ITSELF an alias key is by
+-- definition a name the game displays but no longer models. Only those move; everything
+-- else is left alone, because the alias keys are display names and a template that shares
+-- one is the very case being corrected.
+do
+    local moved = 0
+    for _, slots in pairs(INDEX_SLOT) do
+        for tmpl, slot in pairs(slots) do
+            local better = RIFT_EGG_ALIAS[string.lower(tmpl)]
+            if better and better ~= tmpl then
+                slots[tmpl] = nil
+                slots[better] = slot
+                moved = moved + 1
+            end
+        end
+    end
+    if moved > 0 then
+        pcall(saveIndexSlots)
+        _G.FARM.IndexMigrated = moved
+    end
+end
+
+-- Every area's egg list, as the game displays them, in rarity order. Taken from the lists
+-- you supplied and resolved to template names at load - so the mapping uses the same
+-- resolver as everything else instead of being hand-typed twice.
+--
+-- This is what breaks ties. A two-part Forest egg matches ten templates exactly, and
+-- without knowing what Forest can actually spawn there is no way to choose between them -
+-- which is why identification was stalling around 44 of 52 and Rare Priority had nothing to
+-- rank. Only three areas had lists before this; now all eleven do.
+local AREA_DISPLAY = {
+    ["Forest"]         = { "Chicken", "Dog", "Bird", "Burrowing Owl", "Raccoon", "Fox", "Bear", "Brr Brr Patapim" },
+    ["Lake"]           = { "Frog", "Duckling", "Catfish", "Turtle", "Trulimero Trulicina", "Swan", "Axolotl", "Leviathan" },
+    ["Desert"]         = { "Jerboa", "Fennec", "Camel", "Tob Tobi Tob Tob", "Snake", "Sand Spider", "Scorpion", "Royal Sphinx" },
+    ["Jungle"]         = { "Chimpanzee", "Toucan", "Crocodile", "Gorilla", "Orangutini Ananassini", "Spider", "Tiger", "King Snake" },
+    ["Snow"]           = { "Penguin", "Walrus", "Polar Bear", "Sabertooth Tiger", "Mammoth", "King Mammoth", "Yeti", "Ice Dragon" },
+    ["Volcano"]        = { "Lava Gecko", "Lava Frog", "Flaming Bull", "Lava Iguana", "Chillin Chilli", "Cerberus", "Phoenix", "Lava Dragon" },
+    ["Abyss Ocean"]    = { "Parrotfish", "Swordfish", "Shark", "Orca", "Whale Shark", "Beluga Whale", "Kraken", "El Maja" },
+    ["Prehistoric"]    = { "Dodo", "Pterodactyl", "Ankylosaurus", "Triceratops", "Bronto", "T-Rex", "Tralaledon", "Mosasaurus" },
+    ["Cosmic"]         = { "Centapede", "Cosmic Gecko", "Cosmic Gorilla", "La Vacca Saturno Saturnita", "Cosmic Skeleton Boss", "Cosmic Dragon", "Eternal Lunar Dragon", "Unicorn" },
+    ["Cherry Blossom"] = { "Crane", "Salamander", "Red Panda", "Snowy Owl", "Koi", "Stag", "Oni Tiger", "Kitsune" },
+    ["Titan Temple"]   = { "Spideron", "Crustacia", "Bladehide", "Mantaris", "Rhinotaur", "Mutant Shark", "Gorilla King", "Nightflame" },
 }
 
 -- Case matters more than you would think: the rift panel writes "Lava frog" with a
@@ -2373,6 +3510,77 @@ local function areaEggsFromIndex()
     return n
 end
 _G.SEHUB_AREAEGGS = areaEggsFromIndex
+
+-- Resolve the display lists into template names once, at load. Anything with no template
+-- behind it is dropped rather than guessed at - a name in this list that does not exist as
+-- a model would be a phantom the matcher has to rule out on every tie.
+--
+-- Runs BEFORE the index harvest so that a real harvest, when the Pet Index has been opened,
+-- overwrites these with the game's own answer.
+-- Re-runnable, and it MERGES rather than replaces.
+--
+-- The old version looked the Eggs folder up again inside the per-name loop and treated any
+-- failure as "this pet has no template", dropping the name from the area list permanently -
+-- the whole function ran exactly once, at load. But the lookup fails transiently in this
+-- executor, so a flicker at load cost a real egg for the rest of the session. Caught it
+-- red-handed: Orangutini Ananassini and Eternal Lunar Dragon were both on the dropped list
+-- while `folder:FindFirstChild` finds both by exact name on demand, which left Jungle and
+-- Cosmic with 7-egg allow lists and made every tie in those areas unresolvable.
+--
+-- Now the folder is resolved ONCE per pass and the pass aborts wholesale if it is missing -
+-- an unreachable folder is not evidence about any particular pet - and a name that resolves
+-- on a later pass is added to the list it belongs to. Names still unresolved are reported,
+-- and they are the genuinely-renamed ones that need an alias.
+local AREA_SEED_DONE = false
+local function seedAreaEggs()
+    local RS = game:GetService("ReplicatedStorage")
+    local okf, folder = pcall(function()
+        return RS and RS.Assets and RS.Assets.Models
+               and RS.Assets.Models:FindFirstChild("Eggs")
+    end)
+    if not okf or not folder then return -1 end      -- say nothing rather than drop everything
+
+    local kept, dropped = 0, {}
+    for area, names in pairs(AREA_DISPLAY) do
+        local have, list = {}, {}
+        for _, t in ipairs(AREA_EGGS[area] or {}) do
+            if not have[t] then have[t] = true; list[#list + 1] = t end
+        end
+        for _, disp in ipairs(names) do
+            local tmpl = resolveEggTemplate(disp, area)
+            local okc, real = pcall(function() return tmpl and folder:FindFirstChild(tmpl) end)
+            if okc and real then
+                if not have[tmpl] then have[tmpl] = true; list[#list + 1] = tmpl end
+                kept = kept + 1
+            else
+                dropped[#dropped + 1] = disp
+            end
+        end
+        if #list > 0 then AREA_EGGS[area] = list end
+    end
+    _G.FARM.AreaEggsKept = kept
+    _G.FARM.AreaEggsDropped = dropped
+    AREA_SEED_DONE = (#dropped == 0)
+    return kept
+end
+_G.SEHUB_SEEDAREAS = seedAreaEggs
+_G.SEHUB_AREALIST = function() return AREA_EGGS end
+seedAreaEggs()
+
+-- DO NOT ADD A BACKGROUND RETRY LOOP HERE. I did, and it was the three-second freeze:
+-- twenty passes at three-second intervals, which is exactly the "freezes every 3 seconds
+-- and stops after a minute" symptom. Three things made it far worse than it looks:
+--   * it could never finish early. AREA_SEED_DONE only clears when every display name
+--     resolves, and nine of them have no template at all, so it always ran all twenty.
+--   * a pass is not cheap. resolveEggTemplate falls back to a case-insensitive scan of the
+--     folder, so each unresolved name walks all 115 children - nine names, every pass.
+--   * each reload spawns another one. Seven reloads in a session means seven of these
+--     running at once, which is where it stops being a stutter and becomes a crash.
+-- One pass at load is enough: the merge above means a later harvest can only add to the
+-- lists, and harvestPetIndex already re-seeds from the game's own data when the Pet Index
+-- is opened. If a retry is ever genuinely needed, drive it off an existing loop and guard
+-- it with _G.SEHUB_GEN so a retired instance's copy stops.
+
 areaEggsFromIndex()
 
 local function riftLabel(parent, ...)
@@ -2872,17 +4080,16 @@ end
 
 local farm = win:Tab("Auto Farm", "target")
 local farmSec = farm:Section("Farm", "Full")
-farmSec:Label("Works by automatically running your character to the desired")
-farmSec:Label("eggs. 300 Run Speed seems to be the most effective, so if")
-farmSec:Label("you're getting issues, try that.")
-farmSec:Label("If you're still getting caught from lack of speed, enable")
-farmSec:Label("Auto Anti-Boss.")
-farmSec:Label("If you're not using Auto Anti-Boss and you're farming too")
-farmSec:Label("quickly, Boss Reset Wait waits for the boss to sleep again.")
-farmSec:Label("Point your camera DOWN and zoom in - the game only shows a")
-farmSec:Label("prompt the camera can see, so grabs are smoother that way.")
-farmSec:Label("(Steal tab > Ignore Line of Sight tries to remove this.)")
-farmSec:Toggle("Auto Farm", false, function(v)
+farmSec:Label("Runs your character to eggs and carries them home.")
+farmSec:Label("Needs at least one area ticked below.")
+farmSec:Label("Point your camera down and zoom in - the game only shows")
+farmSec:Label("a prompt the camera can see.")
+-- Handle kept so the boot block at the end of the file can force this off. The menu
+-- REMEMBERS toggle states and replays them on load, so a session that ended with Auto
+-- Farm on came back with it already running the moment the script opened - the character
+-- setting off across the map before anything had been configured.
+local farmToggle
+farmToggle = farmSec:Toggle("Auto Farm", false, function(v)
     FM.On = v
     if v then
         -- Instant Steal is NOT forced on any more. It is a separate feature with its own
@@ -2900,18 +4107,108 @@ farmSec:Toggle("Auto Farm", false, function(v)
         FM.State = "off"
     end
 end, "Runs continuously until you turn it off. Needs at least one area ticked below, and does NOT switch Instant Steal on for you.")
-farmSec:Toggle("Rare Priority", false, function(v) FM.RarePri = v end,
-    "Rarest first: Divine before Eternal before Secret, all the way down to Common, with distance only breaking ties inside a tier. Rarity comes from the egg TYPE, identified by shape - the label above the egg is unreadable, but it does not need to be read. Eggs of unknown type fall back to the rare glow on their slot.")
+-- Toggles first, then sliders. Rarity Strictness, Random Picks and Safe Zone Hold were
+-- all removed rather than defaulted: each had exactly one value worth using, so a control
+-- for it was a question the menu asked and then answered for you.
+--   Rarity Strictness -> fixed at 10000 studs/tier (see FM.RareWeight)
+--   Random Picks      -> always on when Rare Priority is off
+--   Safe Zone Hold    -> fixed at 0.4s (see AB.Hold)
+-- Rare and Size are one choice, not two. Each turns the other off through the menu's own
+-- Set(), so the tick marks match what the farm is doing - enforcing it only in code would
+-- leave both boxes ticked while one of them quietly did nothing.
+-- Declared ahead of the toggles so each callback can reach the other.
 farmSec:Toggle("Auto Anti-Boss", false, function(v) FM.AutoBoss = v end,
-    "Escapes to the safe zone when a guard starts closing on you WHILE you are carrying an egg. Not on the grab itself - that spends the escape before the boss has moved - and never empty-handed, since walking past a stationary guard closes distance fast and reads as a chase.")
+    "Breaks a guard off you when one closes in while you are carrying an egg. It touches the safe zone and lets the server throw you back - the game treats having passed there as having banked the egg, so the chase drops.")
+local rareToggle, sizeToggle
+rareToggle = farmSec:Toggle("Rare Priority", false, function(v)
+    FM.RarePri = v
+    if v and sizeToggle then pcall(function() sizeToggle:Set(false) end) end
+end,
+    "Rarest first: Divine, then Eternal, then Secret, all the way down to Common. Distance only separates eggs of the SAME rarity. Turns Size Priority off. With neither on, the farm picks a random area and a random egg inside it rather than always taking the nearest.")
+sizeToggle = farmSec:Toggle("Size Priority", false, function(v)
+    FM.SizePri = v
+    if v and rareToggle then pcall(function() rareToggle:Set(false) end) end
+end,
+    "Biggest egg first, by hitbox width - measured sizes run from 0.6 to 13.6 studs. Sizes are bucketed to whole studs so the farm does not cross the map to swap a 5.1 for a 5.2; distance separates eggs of the same size. Turns Rare Priority off. Big eggs are carried at the Big Egg Carry Speed below, since a wide one cannot be run at full speed.")
+farmSec:Toggle("Friend Drop", false, function(v) FM.FriendDrop = v end,
+    "Drops the egg on the floor near the safe zone instead of banking it, so someone else can pick it up. The farm still runs the egg home, it just lets go a short way short of the delivery point.")
+-- Headstart Hop is gone. It was worth a measured 0.27s a leg, and it competed with the
+-- safe zone touch for the one moment that actually decides whether you get caught - so it
+-- was buying a fraction of a second at the cost of the thing that keeps the egg.
+
+-- ALWAYS TARGET. A standing order rather than an ordering: "wherever a Divine is, go and
+-- get it." Two things make it different from Rare Priority, and both matter:
+--
+--   1. It IGNORES THE AREA FILTER. A rarity listed here is fetched from areas you have
+--      not ticked - that is the whole point, and it is why it is a separate control
+--      instead of another rung on the rarity ladder.
+--   2. It outranks everything else, including the rift's wanted list. You asked for #1
+--      priority and that is what this is; if a Divine and a rift pet are both on the map,
+--      the Divine goes first.
+--
+-- Tiers are listed rarest-last to match the game's own order, which is the order they are
+-- named in everywhere else in this file.
+local RARITY_CHOICES = { "Common", "Uncommon", "Rare", "Epic", "Legendary",
+                         "Mythic", "Cosmic", "Secret", "Eternal", "Divine" }
+local alwaysDrop = farmSec:Dropdown("Always Target", {}, RARITY_CHOICES, true, function(sel)
+    local set, n = {}, 0
+    for _, nm in ipairs(sel or {}) do set[string.lower(nm)] = true n = n + 1 end
+    FM.Always, FM.AlwaysN = set, n
+end, "Rarities to fetch no matter what. An egg of a listed rarity is taken from ANY area, including ones you have not ticked below, and jumps ahead of everything else - Rare Priority, Size Priority and the rift's wanted pets. Leave empty to farm only the areas you pick. Needs the egg identified, which happens automatically while this has anything in it.")
+pcall(function() alwaysDrop:Set({}) end)
+FM.Always, FM.AlwaysN = {}, 0
+FM.alwaysDrop = alwaysDrop
+
+-- ONE DROPDOWN, not eleven toggles and a section of its own. Sits directly under Always
+-- Target because the two are read together: Always Target is "fetch these wherever they
+-- are", Areas is "and otherwise, farm here".
+--
+-- "All" is back, at the top of the list. It was removed once because the farm used to
+-- treat an EMPTY selection as "everywhere", which is how unticking Snow turned into
+-- farming the entire map. Picking All from a list is not that - it is an explicit choice,
+-- and an empty list still means nothing is farmed.
+local ALL_AREAS = "All"
+local areaNames = { ALL_AREAS }
+for _, b in ipairs(AREA_BOUNDS) do areaNames[#areaNames + 1] = b.name end
+-- ARGUMENT ORDER IS (name, DEFAULT, CHOICES, multi, callback, tooltip) - default comes
+-- BEFORE choices, which is the opposite way round to most menu libraries and is easy to
+-- get wrong. With them swapped the dropdown stored choices={} and default={11 areas}, so
+-- clicking it showed an empty list: the areas had been handed to it as a pre-selection
+-- rather than as the things you can pick.
+local areaDrop = farmSec:Dropdown("Areas", {}, areaNames, true, function(sel)
+    -- Rebuilt rather than mutated: the callback hands back the WHOLE selection, so
+    -- diffing it against the old table would only be a way to get them out of step.
+    local set, all = {}, false
+    for _, nm in ipairs(sel or {}) do
+        if nm == ALL_AREAS then all = true else set[nm] = true end
+    end
+    -- All wins outright rather than merging: ticking All and Snow together means all, and
+    -- expanding it into the eleven names here keeps every downstream check a plain
+    -- FM.Areas[area] lookup instead of "area is ticked OR the all flag is set", which is
+    -- the kind of second condition that gets forgotten at one call site out of four.
+    if all then
+        set = {}
+        for _, b in ipairs(AREA_BOUNDS) do set[b.name] = true end
+    end
+    FM.Areas, FM.AllAreas = set, all
+end, "Which areas to farm, in the game's own west-to-east map order. Pick All for the whole map, or tick as many individual areas as you like. Nothing selected means nothing is farmed - it does not quietly mean everything. Always Target above ignores this list entirely.")
+-- Start with nothing selected, and say so explicitly rather than trusting the default -
+-- the menu remembers what a control was last set to and replays it over whatever this
+-- file declares, which is the same mechanism that brought Auto Farm back on at load.
+pcall(function() areaDrop:Set({}) end)
+FM.Areas, FM.AllAreas = {}, false
+FM.areaDrop = areaDrop
+-- Everything above this line is "what to do"; everything below is "how fast". The
+-- divider is the whole reason the section reads as two short lists instead of one long one.
+farmSec:Divider()
+farmSec:Slider("Run Speed", 300, 10, 40, 300, " studs/s", function(v) FM.Speed = v end,
+    "300 is the ceiling, measured: it gives 288 studs/s actual. 320 does NOT - the server rubber-bands it down to 42, slower than walking, and 430 kills you outright. The slider stops at 300 for that reason.")
+farmSec:Slider("Big Egg Carry Speed", 280, 10, 40, 300, " studs/s", function(v) FM.BigCarrySpeed = v end,
+    "Speed used while carrying an egg wider than 6 studs. A big egg is welded into your physics assembly and the server refuses the positions a fast run produces - a 13.5 wide egg managed 32 studs/s at a commanded 300, and ended in a death, against 220 for a small one. Lower this if big eggs still rubber-band.")
 farmSec:Slider("Anti-Boss Delay", 0.15, 0.05, 0, 2, " s", function(v) FM.WakeDelay = v end,
-    "How long after picking up an egg before Auto Anti-Boss fires. 0 leaves the instant the egg is in your hands. Titan Temple's guard wakes faster than the rest, so it uses a shorter delay than this if you set a longer one - it will never make your setting slower.")
-farmSec:Slider("Anti-Boss Teleports", 5, 1, 1, 15, "", function(v) AB.Count = v end,
-    "How many times the escape writes your position to the safe zone, a few milliseconds apart. One rejected write then does not lose the escape. Raise it if the anti-boss sometimes fails to move you; lower it if the teleport feels heavy-handed.")
+    "How long after picking up an egg before Auto Anti-Boss fires. 0 leaves the instant the egg is in your hands. Titan Temple's guard wakes faster than the rest and uses a shorter delay automatically - this will never make it slower.")
 farmSec:Slider("Boss Reset Wait", 0, 0.5, 0, 10, " s", function(v) FM.PostDeliver = v end,
-    "Pause at the safe zone after handing an egg over, before running out for the next one. Without it you can arrive at the next egg while the guard that chased you is still out of position, and it throws you as soon as you pick up. Mainly for farming without Auto Anti-Boss.")
-farmSec:Slider("Run Speed", 220, 10, 40, 320, " studs/s", function(v) FM.Speed = v end,
-    "320 is the measured ceiling. Speed itself was never punished - only air time. Try 300 if eggs are being missed or guards are catching you.")
+    "Pause at the safe zone after handing an egg over, before setting off again. Lets a guard that chased you walk back to its post. Mainly for farming without Auto Anti-Boss.")
 FM.ui = farmSec:Label("off")
 
 -- Same treatment the steal settings get, and for the same reason: building the menu fires
@@ -2937,7 +4234,10 @@ riftSec:Label("wanted in the rift, or prioritize the rarest pets that can")
 riftSec:Label("possibly be within those rifts. You can add both priorities")
 riftSec:Label("making you target the rarest out of the 3 pets first.")
 riftSec:Label("Shares the same settings as the default Auto Farm.")
-riftSec:Toggle("Auto Rift-Farm", false, function(v)
+-- Handle kept for the same reason as Auto Farm's: this one starts the farm too, so a
+-- remembered tick mark would set the character running at load.
+local riftToggle
+riftToggle = riftSec:Toggle("Auto Rift-Farm", false, function(v)
     FM.Rift = v
     if v then
         -- Ask the game what it wants before deciding where to go, rather than trusting
@@ -3005,19 +4305,6 @@ FM.riftUi = riftSec:Label("off")
 -- whatever the detector happened to find. Detection produced a list that changed length
 -- between sessions, so a toggle could silently go missing; these eleven always exist.
 --
--- No All Areas toggle any more, and no FM.AllAreas. Every area starts off, and the farm
--- runs only where you tick - "nothing selected" now means nothing selected rather than
--- quietly meaning everything, which was the same inference that once turned "I unticked
--- Snow" into "farm the entire map".
-local areaSec = farm:Section("Areas", "Full")
-areaSec:Label("Organised to be in the game's own map order.")
-for _, b in ipairs(AREA_BOUNDS) do
-    local nm = b.name
-    areaSec:Toggle(nm, false, function(v)
-        FM.Areas[nm] = v or nil
-    end, string.format("Farm %s. Spans x=%d to x=%d.", nm, b.minX, b.maxX))
-end
-
 -- The escape gets its OWN loop, on the tightest interval in the script, because it
 -- cannot afford to wait for anything else. When it lived inside the farm loop it was
 -- blocked by the very stage that needs it most: while waiting to deliver an egg, that
@@ -3245,7 +4532,57 @@ SESPAWN("night watch", function()
                 -- farm to find its pets, and Rare Priority to know a Yeti from a Penguin.
                 -- Skipped otherwise: it reads every child's Size across 55 slots, which
                 -- is fine at 1Hz but has no business running when nothing uses it.
-                if FM.Rift or FM.RarePri then sweepEggNames() end
+                -- Always Target needs names too: an egg with no name has no tier, and an
+                -- egg with no tier can never match the list. Without this the option was
+                -- silently inert unless Rare Priority or the rift happened to be on.
+                if FM.Rift or FM.RarePri or (FM.AlwaysN or 0) > 0 then
+                    sweepEggNames()
+                    -- SAY SO WHEN IT CANNOT WORK. Without the egg templates nothing can
+                    -- be identified, so Rare Priority, Always Target and the rift farm
+                    -- all silently degrade to nearest-first. Every one of those has been
+                    -- reported as "not working" at some point, and the real answer was
+                    -- always that they had no data - which nothing on screen ever said.
+                    if _G.SEHUB_FPCOUNT() == 0 and (tick() - (FM.identWarnAt or 0)) > 30 then
+                        FM.identWarnAt = tick()
+                        notify("Egg identification",
+                            "No egg templates loaded - rarity features are running blind. Reinject Matcha.", 6)
+                    end
+                    -- EGGS WITH NO KNOWN TIER ARE INVISIBLE TO ALWAYS TARGET, and that is
+                    -- the one failure mode it has that looks exactly like nothing being
+                    -- there. An egg can be identified perfectly - the shape matched, the
+                    -- name is right - and still have no entry in the rarity table, at
+                    -- which point alwaysTier returns nil and no list can ever match it.
+                    -- A Secret sat on the map untouched that way.
+                    --
+                    -- So they are collected by name and reported. The name is the thing
+                    -- that is missing from the table, so the name is what is worth saying.
+                    -- Walked over the SLOTS rather than the name table, so each egg's area
+                    -- is known - alwaysTier falls back to the Pet Index's area/slot
+                    -- mapping when a name is missing from the rarity table, and without
+                    -- the area that fallback cannot run.
+                    local noTier = {}
+                    local nNoTier = 0
+                    for _, e in ipairs(eggSlots()) do
+                        local k2 = string.format("%d_%d_%d", e.pos.X, e.pos.Y, e.pos.Z)
+                        local nm = (FM.eggName or {})[k2]
+                        if nm and not alwaysTier(nm, areaOf(e.pos)) then
+                            if not noTier[nm] then nNoTier = nNoTier + 1 end
+                            noTier[nm] = true
+                        end
+                    end
+                    FM.NoTier, FM.NoTierN = noTier, nNoTier
+                    if (FM.AlwaysN or 0) > 0 and nNoTier > 0
+                       and (tick() - (FM.tierWarnAt or 0)) > 60 then
+                        FM.tierWarnAt = tick()
+                        local list = {}
+                        for nm in pairs(noTier) do list[#list + 1] = nm end
+                        table.sort(list)
+                        notify("Always Target",
+                            string.format("%d egg type%s have no known rarity and cannot be matched: %s",
+                                nNoTier, (nNoTier == 1) and "" or "s",
+                                table.concat(list, ", "):sub(1, 90)), 8)
+                    end
+                end
 
                 -- Re-read the Pet Index every 30s. Cheap, and entries change under you:
                 -- a locked pet reads "???" until you hatch one, at which point its name
@@ -3546,6 +4883,26 @@ local function farmStep()
                     if FM.hasEgg and homeP then
                         local zp = homeP
                         local d = (Vector3.new(zp.X, me.Y, zp.Z) - me).Magnitude
+                        -- FRIEND DROP. Let go a short way short of the delivery point, so
+                        -- the egg lands on the floor near the safe zone rather than being
+                        -- banked. Checked before the arrival branch, or the hand-over would
+                        -- take it first - by the time you are standing on the delivery
+                        -- point the game has already claimed the egg.
+                        if FM.FriendDrop and d <= (FM.DropRange or 55) then
+                            pcall(function()
+                                root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0)
+                            end)
+                            local dropped = dropHeldEgg()
+                            FM.hasEgg = false
+                            FM.depositAt = nil
+                            FM.deliveredTool = heldEggTool()
+                            FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
+                            FM.State = dropped
+                                and string.format("dropped for a friend, %.0f studs out (%d)", d, FM.Drops or 0)
+                                or "could not drop - no drop button on screen"
+                            task.wait(0.35)
+                            return
+                        end
                         if d > (FM.ZoneReach or 12) then
                             -- Same avoidance on the way home, which is the leg that matters
                             -- most: you are carrying an egg and being chased, and a trap
@@ -3561,10 +4918,26 @@ local function farmStep()
                             local flat = Vector3.new(hx - me.X, 0, hz - me.Z)
                             local m = flat.Magnitude
                             if m > 0.01 then
-                                -- Full run speed. The separate, slower carry speed was
-                                -- a guess that carrying slows you server-side; in
-                                -- practice it just made the trip home crawl.
+                                -- Full run speed for a normal egg. The old blanket "carry
+                                -- speed" was a guess that carrying slows you server-side
+                                -- and it just made every trip home crawl - it is not
+                                -- carrying that is punished, it is carrying something BIG.
                                 local sp = FM.Speed
+                                -- BIG EGGS CANNOT BE RUN WITH. A wide hitbox is welded into
+                                -- your assembly and the server refuses the positions that
+                                -- result, so commanding 300 does not give you 300 - it gives
+                                -- you a fight. Measured on the same route:
+                                --
+                                --   width 13.5 at cmd 300 -> 32 studs/s, then killed
+                                --   width  1.7 at cmd 300 -> 220 studs/s
+                                --
+                                -- So ask for less and keep what you ask for. 32 studs/s of
+                                -- rubber-banding is worse than a clean walk, and the deaths
+                                -- come from the fight rather than from the distance.
+                                if (FM.carryW or 1) > (FM.BigWidth or 6) then
+                                    sp = math.min(sp, FM.BigCarrySpeed or 120)
+                                    FM.BigCarries = FM.BigCarries or 0
+                                end
                                 if d < (FM.Brake or 60) then
                                     sp = math.max(40, sp * (d / (FM.Brake or 60)))
                                 end
@@ -3697,12 +5070,32 @@ local function farmStep()
                     -- priority just decides what to grab first.
                     local best, bestScore
                     local anyAllowed = 0        -- targets in range of the filter at all
+                    -- Collected only in random mode, and only to re-roll when the current
+                    -- pick is gone. Grouping by area first and then picking inside it is
+                    -- deliberate: picking uniformly across all slots would just favour
+                    -- whichever area happens to hold the most eggs.
+                    local cands, sawRandom = {}, false
                     for _, t in ipairs(farmTargets()) do
                         -- Explicit: All Areas, or this area was ticked. No inferring
                         -- intent from an empty table - that is what turned "I unticked
                         -- Snow" into "farm the entire map".
                         local allowed = (FM.Areas[t.area] == true)
                         local key = string.format("%d_%d_%d", t.pos.X, t.pos.Y, t.pos.Z)
+                        -- ALWAYS TARGET opens the gate. A listed rarity is fetched from
+                        -- anywhere, so this has to be decided BEFORE the area filter
+                        -- rather than as a priority bonus afterwards - a bonus cannot
+                        -- rescue an egg that was never considered a candidate.
+                        local always = false
+                        if (FM.AlwaysN or 0) > 0 then
+                            local en2 = FM.eggName[key]
+                            if en2 then
+                                local tier = alwaysTier(en2, t.area)
+                                if tier and FM.Always[tier] then
+                                    always = true
+                                    allowed = true
+                                end
+                            end
+                        end
                         local cool = (now - (FM.visited[key] or 0)) > FM.Cooldown
                         -- An egg that cannot be taken must stop being chosen. A big
                         -- neighbour overlapping it does not go away, so without this the
@@ -3736,6 +5129,10 @@ local function farmStep()
                             -- the rarity rung then decides the order among the wanted ones.
                             local pri = 0
                             local wanted = false
+                            -- 20M: above the rift's 10M, so a listed rarity beats a rift
+                            -- pet. That is what "#1 priority" has to mean or the option
+                            -- would only work while the rift farm was off.
+                            if always then pri = pri + 20000000 end
                             -- STALE TARGETS ARE NOT TARGETS. If the rift panel has not been
                             -- readable for a while - which happens when this executor loses
                             -- its DataModel bindings and PlayerGui becomes unreachable - the
@@ -3782,16 +5179,88 @@ local function farmStep()
                                     pri = pri + 5 * W
                                 end
                             end
+                            -- SIZE PRIORITY. Biggest first, bucketed to whole studs so
+                            -- distance still separates eggs of the same size instead of
+                            -- the farm crossing the map for a tenth of a stud. Cannot run
+                            -- alongside Rare Priority - the toggles turn each other off -
+                            -- so the two ladders never have to be reconciled.
+                            -- Negate sizeRank here to make it smallest-first instead.
+                            if FM.SizePri then
+                                local sizeRank = math.floor(t.w or 0)
+                                if sizeRank > 0 then
+                                    pri = pri + sizeRank * (FM.SizeWeight or 5000)
+                                end
+                            end
                             -- Buried under a bigger egg. Not skipped outright - if it is the
                             -- only thing left, it is still worth a try - but it goes to the
                             -- back of the queue so the farm exhausts every clean egg first.
                             -- 4000 is comfortably more than the map is wide.
                             if (FM.eggBlocked or {})[key] then pri = pri - 4000 end
-                            local score = d - pri
+                            -- RANDOM MODE. With Rare Priority off the farm used to take
+                            -- whatever was nearest, which walks the same short loop round
+                            -- the same few slots. A sticky random pick spreads the run out
+                            -- instead. Sticky matters: the target is re-scored every tick,
+                            -- so re-rolling each time would mean never committing to
+                            -- anything and standing still while the choice flickered.
+                            -- The bonus sits BELOW the rift's 10M, so a wanted egg still
+                            -- wins - the rift farm exists to fetch particular pets, and
+                            -- randomising that away would defeat it.
+                            if not FM.RarePri and not FM.SizePri then
+                                cands[#cands + 1] = { key = key, area = t.area }
+                                if key == FM.randomKey then
+                                    sawRandom = true
+                                    pri = pri + 5000000
+                                end
+                            end
+                            -- FURTHEST FIRST WITHIN A RARITY RUNG. Rare Priority used to
+                            -- break ties by nearest, which meant working outwards from
+                            -- home and finishing every session with the longest carries
+                            -- still to do. Negating the distance term inverts just the
+                            -- tie-break: the far side of the map gets cleared while it is
+                            -- still full, and the run shortens as it goes.
+                            --
+                            -- The ladder is untouched. One rung is worth 10000 studs and
+                            -- the map is about 4600 across, so -d can only ever reorder
+                            -- eggs that already share a rank - a rank 7 anywhere still
+                            -- beats a rank 6 next door, in either direction.
+                            --
+                            -- Only Rare Priority. Size Priority still takes the nearest of
+                            -- its size bucket, and with neither on the random pick decides.
+                            local score = (FM.RarePri and -d or d) - pri
                             if not bestScore or score < bestScore then
                                 best, bestScore = t, score
                                 best.key = key
+                                -- Carried for the diagnostics, so "is Rare Priority even
+                                -- doing anything" is a question with an answer rather than
+                                -- an impression.
+                                best.name = en
+                                best.rank = FM.RarePri and rarityRank(en, t.area) or 0
+                                best.w    = t.w
+                                best.always = always
                             end
+                        end
+                    end
+                    -- RE-ROLL when the sticky pick is no longer on the board - taken by us,
+                    -- taken by someone else, on cooldown, or banned. Area first, then an egg
+                    -- inside it, so a dense area does not swallow the whole distribution.
+                    -- One tick of latency: the new pick is used from the next pass, which
+                    -- costs 30ms and keeps this out of the scoring loop.
+                    if not FM.RarePri and not FM.SizePri and not sawRandom then
+                        if #cands > 0 then
+                            local byArea, areas = {}, {}
+                            for _, cd in ipairs(cands) do
+                                local a = tostring(cd.area)
+                                if not byArea[a] then byArea[a] = {} areas[#areas + 1] = a end
+                                local g = byArea[a]
+                                g[#g + 1] = cd.key
+                            end
+                            local pickArea = areas[math.random(1, #areas)]
+                            local pool = byArea[pickArea]
+                            FM.randomKey  = pool[math.random(1, #pool)]
+                            FM.randomArea = pickArea
+                            FM.Rerolls = (FM.Rerolls or 0) + 1
+                        else
+                            FM.randomKey, FM.randomArea = nil, nil
                         end
                     end
                     if not best and anyAllowed == 0 then
@@ -3871,6 +5340,46 @@ local function farmStep()
                                     FM.TrapDodges = (FM.TrapDodges or 0) + 1
                                 end
                             end
+                            -- Inside the snap window: write the position instead of
+                            -- creeping into it. Land 0.9 studs short of the aim point
+                            -- along the approach, NOT dead centre - 0.9 is still well
+                            -- inside the 1.5 stud reach (so we are unambiguously the
+                            -- nearest prompt, which is the whole point of the tight
+                            -- reach) while keeping us out of the middle of a hitbox that
+                            -- can be 13.6 studs across.
+                            --
+                            -- Y is left alone. The egg sits ~2 studs below the HRP and
+                            -- writing the egg's own Y would bury the character in the
+                            -- floor - the same 3D-vs-horizontal trap the distance test
+                            -- above already had to be fixed for.
+                            if FM.SnapOn and d <= (FM.Snap or 12) then
+                                local sx, sz = aim.X - me.X, aim.Z - me.Z
+                                local sm = math.sqrt(sx*sx + sz*sz)
+                                if sm > 0.01 then
+                                    local back = math.min(0.9, sm)
+                                    local tx = aim.X - (sx/sm) * back
+                                    local tz = aim.Z - (sz/sm) * back
+                                    -- 6-arg CFrame.new is (position, lookAt) - verified
+                                    -- against LookVector - so we land already facing the
+                                    -- egg. Worth doing: with Instant Steal off nothing
+                                    -- is patched, and an unpatched prompt can still want
+                                    -- line of sight. The lookAt is held at OUR Y so the
+                                    -- character stays upright instead of tipping down
+                                    -- towards an egg that sits ~2 studs below.
+                                    -- (CFrame.new(Vector3) does NOT exist in Matcha - it
+                                    -- takes 0, 3, 6 or 12 numbers and nothing else.)
+                                    pcall(function()
+                                        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                                        root.CFrame = CFrame.new(tx, me.Y, tz,
+                                                                 aim.X, me.Y, aim.Z)
+                                    end)
+                                    FM.Snaps = (FM.Snaps or 0) + 1
+                                    FM.State = string.format("snapping onto %s (%.0f studs)",
+                                        best.area, d)
+                                end
+                                task.wait(0.03)
+                                return
+                            end
                             local flat = Vector3.new(ax - me.X, 0, az - me.Z)
                             local m = flat.Magnitude
                             if m > 0.01 then
@@ -3890,8 +5399,29 @@ local function farmStep()
                                         Vector3.new(v.X, -(FM.Stick or 18), v.Z)
                                 end)
                             end
-                            FM.State = string.format("running to %s, %.0f studs%s", best.area, d,
-                                (d < (FM.Brake or 60)) and " (braking)" or "")
+                            -- Say WHAT is being fetched, not just where. "running to Snow"
+                            -- gave no way to tell whether Rare Priority was ordering
+                            -- anything; "running to Snow for Polar Bear (Legendary)" does.
+                            -- Built in pieces, because the name is only known when the
+                            -- identification sweep is running (Rare Priority or the rift)
+                            -- and the WIDTH is always known. The old single-expression
+                            -- version hung the size on the name being present, so Size
+                            -- Priority showed a bare "running to Prehistoric" and gave no
+                            -- way to see what it was ordering by.
+                            local what = ""
+                            if best.name then what = " for " .. best.name end
+                            -- Worth saying out loud: an Always Target pick is the one
+                            -- case where the farm leaves the areas you selected, and
+                            -- "running to Cosmic" with Cosmic unticked looks like a bug
+                            -- unless the line says why.
+                            if best.always then what = what .. " [always]" end
+                            if FM.SizePri and best.w then
+                                what = what .. string.format(" (%.1f wide)", best.w)
+                            elseif best.rank and best.rank > 0 then
+                                what = what .. string.format(" (rank %d)", best.rank)
+                            end
+                            FM.State = string.format("running to %s, %.0f studs%s%s", best.area, d,
+                                what, (d < (FM.Brake or 60)) and " (braking)" or "")
                         else
                             -- Full stop FIRST. A press while still sliding is a press from
                             -- wherever the slide takes you. ONE frame, not three: three was
@@ -3915,6 +5445,21 @@ local function farmStep()
                             -- then take the instant path regardless, so turning it off in
                             -- the menu changed nothing except that the taps stopped working.
                             if ST.On then _G.SEHUB_PATCHNEAR(best.pos, 30) end
+                            -- CLEAR THE COMPETITION before pressing. The game takes the
+                            -- closest eligible prompt, and a big neighbour overlapping
+                            -- this egg is closer than the egg itself no matter how well
+                            -- we stand - which is why aiming harder never fixed it and
+                            -- FM.WrongEgg kept climbing. Every other prompt within reach
+                            -- has its activation distance dropped to something it cannot
+                            -- satisfy, so for the moment of the press there is only one
+                            -- prompt the game can choose. The sweep restores them after.
+                            --
+                            -- Radius is small on purpose: 14 studs covers the widest egg
+                            -- measured (13.6) without reaching across the whole cluster
+                            -- and suppressing eggs we may want to take next.
+                            if ST.On and FM.Suppress then
+                                FM.SuppressedNow = _G.SEHUB_SUPPRESS(best.pos, 14)
+                            end
                             local hd = _G.SEHUB_HOLDTIME(best.pos, 20)
                             -- Watch the actual egg, so the moment it is gone we stop
                             -- pressing and leave. Everything below used to run to
@@ -3949,6 +5494,19 @@ local function farmStep()
                                 -- the pending check turns you round within 0.8s. Paying
                                 -- 0.27s on EVERY egg to insure against a rare miss is the
                                 -- wrong trade when the miss now costs 0.8s and self-heals.
+                                --
+                                -- Re-suppressed RIGHT HERE, one line before the key goes
+                                -- down. Measured: a suppression is gone within 0.3s because
+                                -- the game recreates prompt objects constantly - new object,
+                                -- new address, default range - so suppressing once at the
+                                -- top of the grab and pressing a moment later is a race.
+                                --   t+0.0s  neighbours 0.5  0.5  0.5
+                                --   t+0.3s  neighbours 5.0  5.0  5.0
+                                -- Doing it immediately before the press costs one pass over
+                                -- a handful of prompts and cannot go stale in between.
+                                if ST.On and FM.Suppress then
+                                    FM.SuppressedNow = _G.SEHUB_SUPPRESS(best.pos, 14)
+                                end
                                 pressE(0.04)
                             else
                                 -- Three cases, and the middle one is the one that was
@@ -3972,6 +5530,11 @@ local function farmStep()
                                 -- counting it as a failure would make the diagnostics lie.
                                 if ST.On then FM.Fallbacks = (FM.Fallbacks or 0) + 1 end
                                 FM.State = string.format("holding E for %.1fs in %s", hold, best.area)
+                                -- Same as the instant path: suppress immediately before the
+                                -- key goes down, not seconds earlier.
+                                if ST.On and FM.Suppress then
+                                    FM.SuppressedNow = _G.SEHUB_SUPPRESS(best.pos, 14)
+                                end
                                 if keypress then pcall(function() keypress(0x45) end) end
                                 local t0h = tick()
                                 while (tick() - t0h) < hold do
@@ -4034,6 +5597,11 @@ local function farmStep()
                             FM.grabbedAt = tick()
                             FM.grabEscaped = false    -- arm the post-grab escape
                             FM.grabArea = best.area   -- some areas need a faster escape
+                            FM.carryW = best.w or 1   -- how big the thing we just picked up is
+                            -- The headstart hop used to fire here. Removed: it was worth a
+                            -- measured 0.27s a leg and it spent the same instant the safe
+                            -- zone touch needs, so it traded the thing that keeps the egg
+                            -- for a fraction of a second on the way home.
                             FM.State = string.format("took an egg in %s (%d) - running home",
                                 best.area, FM.Taken)
                             -- Straight into the run, no settle. The delivery phase picks
@@ -4067,177 +5635,24 @@ SESPAWN("auto farm", function()
     end
 end)
 
--- ==================== diagnostics ====================
-local diag = win:Tab("Diagnostics", "activity")
-local diagSec = diag:Section("Status", "Full")
-local diagLbl = diagSec:Label("-")
-
--- These two used to sit in the Farm and Rift sections. They are diagnostics, not settings,
--- and those sections are now exactly the controls you listed - so they live here with the
--- rest of the read-outs.
-diagSec:Button("Check Rift Progress", function()
-    local live = refreshRiftTargets()
-    local have, total, held = _G.SEHUB_RIFT()
-    print(string.format("---- rift pets: %d of %d  (%s) ----", have, total,
-        live and "read from the rift panel" or "GUI unreadable, using configured list"))
-    if FM.RiftRotate then print("   " .. tostring(FM.RiftRotate)) end
-    print("   banner: " .. tostring(FM.RiftBanner or FM.RiftBannerGuess or "unreadable"))
-    print("   areas:  " .. tostring(FM.RiftAreaNote or "not set"))
-    for _, t in ipairs(FM.RiftTargets or {}) do
-        print(string.format("   [%s] %-14s %-10s from %-12s egg: %-22s %s",
-            held[t.name] and "x" or " ", t.name, tostring(t.rarity or "?"),
-            tostring(t.area), tostring(t.egg),
-            _G.SEHUB_OWNS(t.name) and "OWNED - not prioritised" or "still wanted"))
-    end
-    print(string.format("   egg types identified on the map: %d", FM.EggIdent or 0))
-    local seen = {}
-    for _, nm in pairs(FM.eggName or {}) do seen[nm] = (seen[nm] or 0) + 1 end
-    for _, t in ipairs(FM.RiftTargets or {}) do
-        print(string.format("   %-14s eggs currently spawned: %d",
-            tostring(t.egg), seen[t.egg] or 0))
-    end
-    -- Eggs identified confidently in an area whose list does not mention them. Either the
-    -- list is incomplete or the match is wrong, and both are worth knowing about.
-    local odd = {}
-    for k in pairs(FM.EggOdd or {}) do odd[#odd + 1] = k end
-    if #odd > 0 then
-        table.sort(odd)
-        print("   not on the area's known egg list: " .. table.concat(odd, ", "))
-    end
-    -- Display names with no matching template. Each one is an alias waiting to be added;
-    -- until then the farm treats that egg as unidentified rather than guessing at it.
-    local un = {}
-    for k in pairs(FM.EggUnmapped or {}) do un[#un + 1] = k end
-    if #un > 0 then
-        table.sort(un)
-        print("   no template for: " .. table.concat(un, ", "))
-    end
-    if have < total then print("   still farming") else print("   ALL THREE - rift is ready") end
-end, "Lists the three pets, which you already hold, and how many of their eggs are on the map right now.")
-
-diagSec:Button("Show Egg Rarities", function()
-    local n = _G.SEHUB_INDEX()
-    print(string.format("---- Pet Index: %d pets read across the areas ----", n))
-    local tbl, rank = _G.SEHUB_RARITY()
-    local rows = {}
-    for name, tier in pairs(tbl) do
-        rows[#rows + 1] = { n = name, t = tier, r = rank[string.lower(tier)] or 0 }
-    end
-    table.sort(rows, function(a, b)
-        if a.r ~= b.r then return a.r > b.r end
-        return a.n < b.n
-    end)
-    print(string.format("---- exact tiers known: %d (%d learned from the rift panel) ----",
-        #rows, FM.RarityLearned or 0))
-    for _, r in ipairs(rows) do
-        print(string.format("   %-2d %-10s %s", r.r, r.t, r.n))
-    end
-    local seen = {}
-    for _, nm in pairs(FM.eggName or {}) do seen[nm] = (seen[nm] or 0) + 1 end
-    local live = {}
-    for nm, c in pairs(seen) do
-        live[#live + 1] = { n = nm, c = c, t = tbl[nm], r = rank[string.lower(tbl[nm] or "")] or 0 }
-    end
-    table.sort(live, function(a, b) if a.r ~= b.r then return a.r > b.r end return a.n < b.n end)
-    print("   ---- on the map now ----")
-    if #live == 0 then print("   (nothing identified - Rare Priority or the rift farm must be on)") end
-    for _, l in ipairs(live) do
-        print(string.format("   %-10s x%d  %s", l.t or "unknown", l.c, l.n))
-    end
-end, "Every egg type whose rarity is known, rarest first, plus what is currently spawned. The table fills itself in as the rift panel names new pets.")
-
-diagSec:Button("Show Slow Ticks", function()
-    print("---- loop timings, measured in place while you play ----")
-    print("   CPU only - time each loop spends asleep is subtracted, which the first")
-    print("   version of this did not do and so reported a 0.2s nap as a 200ms stall.")
-    print("   a freeze you can feel is one tick over ~100ms; the max column is the one to read")
-    local rows = {}
-    for name, e in pairs(_G.SEHUB_SLOW or {}) do rows[#rows + 1] = { n = name, e = e } end
-    table.sort(rows, function(a, b) return a.e.max > b.e.max end)
-    for _, r in ipairs(rows) do
-        local e = r.e
-        print(string.format("   %-18s ticks %-7d avg %6.2f ms  max %7.1f ms  >50ms %-5d >150ms %d",
-            r.n, e.n, e.n > 0 and (e.total / e.n) or 0, e.max, e.over50, e.over150))
-        if e.max > 50 then
-            print(string.format("        worst tick happened during: %s", tostring(e.maxState)))
-        end
-    end
-    if #rows == 0 then print("   (nothing recorded yet - the loops have to run first)") end
-end, "Times the real loops rather than a probe imitating them. Run the farm for a minute, freeze a few times, then read this: whichever loop shows a max in the hundreds of milliseconds is the one stalling you.")
-diagSec:Button("Reset Slow Ticks", function()
-    _G.SEHUB_SLOW = {}
-    notify("Diagnostics", "Tick timings cleared", 2)
-end, "Clears the timings so you can measure one stretch of play cleanly.")
-diagSec:Button("Test Notification", function()
-    notify("Steal An Egg", "Bottom-right toast, 4 seconds", 4)
-end, "Fires a toast so you can check it lands where you expect.")
-diagSec:Button("Log Capability Report", function()
-    print("---- Steal An Egg Hub: environment ----")
-    local names = {
-        "hookfunction", "hookmetamethod", "getnamecallmethod", "getrawmetatable",
-        "getconnections", "getgenv", "fireproximityprompt", "firetouchinterest",
-        "memory_read", "memory_write", "keypress", "iskeypressed", "mouse1click",
-        "readfile", "writefile", "Drawing",
-    }
-    for _, n in ipairs(names) do
-        local v = rawget(getfenv(), n) or _G[n]
-        print(string.format("   %-22s %s", n, (v ~= nil) and "yes" or "MISSING"))
-    end
-    local W = _G.SEHUB_WATCH or {}
-    print(string.format("   guards tracked        %d", #((_G.GUARDS or {}).list or {})))
-    print(string.format("   rare eggs on the map  %d  (priority %s)",
-        FM.RareCount or 0, FM.RarePri and "on" or "off"))
-    print(string.format("   waking guard now      %s", tostring(FM.BossHunting or "none")))
-    print(string.format("   last escape           %s", tostring(FM.LastEscape or "none yet")))
-    if FM.LastEscapeAt then
-        print(string.format("                         %.0f seconds ago", tick() - FM.LastEscapeAt))
-    end
-    print(string.format("   chase escapes         %d", W.chaseEscapes or 0))
-    print(string.format("   grabs attempted       %d", FM.Taken or 0))
-    print(string.format("   grabs confirmed       %d  (egg model actually disappeared)",
-        FM.Confirmed or 0))
-    print(string.format("   grabs unconfirmed     %d  (retried, egg still there, carried on anyway)",
-        FM.Misses or 0))
-    print(string.format("   eggs skipped as blocked %d  (banned 2 min after two failed attempts)",
-        FM.Banned or 0))
-    print(string.format("   wrong egg taken       %d  (a big neighbour, target left for later)",
-        FM.WrongEgg or 0))
-    print(string.format("   eggs lost in transit  %d  (thrown or killed on the way home)",
-        FM.Dropped or 0))
-    local t, nm = _G.SEHUB_HELDEGG()
-    print(string.format("   holding right now     %s", t and tostring(nm) or "nothing"))
-    print(string.format("   eggs stowed / failed  %d / %d  (auto-unequip at the safe zone)",
-        FM.Stowed or 0, FM.StowFail or 0))
-    print(string.format("   identified on map     %d of %d  (unidentified eggs cannot be ranked)",
-        FM.EggIdent or 0, FM.slotCount or 0))
-    print(string.format("   player traps dodged   %d  (%d traps on the map now)",
-        FM.TrapDodges or 0, #_G.SEHUB_TRAPS()))
-    print(string.format("   fallback holds used   %d  (instant patch failed on these)",
-        FM.Fallbacks or 0))
-    print(string.format("   anti-boss ticks       %d", W.ticks or 0))
-    print(string.format("   ragdolls seen         %d", W.ragSeen or 0))
-    print(string.format("   escapes fired         %d", W.escapes or 0))
-    print(string.format("   escapes blocked       %d", W.blocked or 0))
-    print(string.format("   scheduler health      %.2f", _G.SEHUB_HEALTH or -1))
-    print(string.format("   prompts patched       %d", ST.patched or 0))
-    print(string.format("   offsets valid         %s", tostring(ST.offsetsOk)))
-    local root = myRoot()
-    print("   character             " .. (root and "ok" or "MISSING"))
-    local loops = 0
-    for name, n in pairs(_G.SEHUB_LOOPS) do
-        print(string.format("   loop restart: %-14s %d", name, n))
-        loops = loops + 1
-    end
-    if loops == 0 then print("   no loop restarts") end
-end, "Dumps what this executor provides and what the script is currently doing. Worth pasting when something stops working.")
-diagSec:Button("Panic", function()
+-- The Diagnostics tab is gone. Everything on it was a read-out or a one-shot print, and
+-- none of it was a setting - so it was a whole tab you had to look past to reach the two
+-- that matter. The prints it wrapped are all still reachable from the console via the
+-- SEHUB_* globals if something needs investigating.
+--
+-- Panic is the exception and moved rather than went. It is not a diagnostic: it is the
+-- stop button, and it puts the patched prompt memory BACK, which nothing else does.
+-- Attached to the Main tab's Anti-Boss section here, late in the file, because it has to
+-- run after restorePrompts and the movement table exist.
+bossSec:Button("Panic", function()
     ST.On = false
     restorePrompts()
-    MV.Fly = false
+    if MV then MV.Fly = false end
     FM.On = false
+    FM.AutoBoss = false
     if setrobloxinput then pcall(function() setrobloxinput(true) end) end
     notify("Steal An Egg", "Everything off, prompts restored", 3)
-end, "Turns every feature off and puts the prompt memory back.")
+end, "Turns every feature off and puts the patched prompt memory back the way the game had it.")
 
 -- Writes a label ONLY when its text actually changed.
 --
@@ -4265,18 +5680,27 @@ SESPAWN("ui refresh", function()
         setLabel("farm", FM.ui, tostring(FM.State))
         setLabel("rift", FM.riftUi, tostring(FM.RiftState))
         setLabel("boss", AB.ui, tostring(AB.State))
-        -- health is rounded to one decimal so it stops churning the string every tick
-        -- Identification coverage is on here because it is the thing that silently limits
-        -- Rare Priority: an egg with no name has no rarity and cannot be ranked, so a map
-        -- that is only half identified looks like the priority is being ignored.
-        setLabel("diag", diagLbl, string.format(
-            "health %.1f | prompts %d | identified %d/%d | eggs %d | traps %d",
-            _G.SEHUB_HEALTH or -1, ST.patched or 0,
-            FM.EggIdent or 0, FM.slotCount or 0, FM.Taken or 0, FM.TrapDodges or 0))
+        -- The diagnostics read-out went with its tab. Four labels instead of five, and
+        -- one fewer string built every 0.3s whether or not anything had changed.
         PROFTICK("ui refresh", __t0)
         task.wait(0.3)
     end
 end)
+
+-- NOTHING RUNS BECAUSE OF A REMEMBERED TICK MARK. The menu persists toggle states and
+-- replays them at build time, so a session that ended with Auto Farm on came back with the
+-- farm already running the instant the script opened - the character setting off across
+-- the map before a safe zone or an area had been chosen. Same mechanism that brought
+-- Instant Steal back on while its switch read off.
+--
+-- So the things that MOVE YOU are forced off here, after the menu has had its say, and the
+-- switch is pushed to match. Preferences that only change how the farm behaves once you
+-- start it - Rare, Size, Anti-Boss - are left alone; remembering those is useful.
+FM.On = false
+FM.State = "off"
+if farmToggle then pcall(function() farmToggle:Set(false) end) end
+if riftToggle then pcall(function() riftToggle:Set(false) end) end
+FM.Rift = false
 
 print(string.format("[Steal An Egg] loaded (generation %d)", GEN))
 notify("Steal An Egg Hub", "Loaded - everything starts off", 3)
