@@ -2750,8 +2750,6 @@ local EGG_RARITY = {
     ["Ascended Vermilion Phoenix"] = "Eternal",
     -- Abyss Ocean
     ["Parrotfish"] = "Rare", ["Swordfish"] = "Epic", ["Shark"] = "Legendary",
-    -- Shark's real template; see the "shark" line in RIFT_EGG_ALIAS.
-    ["Finned Thresher"] = "Legendary",
     ["Orca"] = "Mythic", ["Whale Shark"] = "Cosmic", ["Belula Beluga"] = "Cosmic",
     ["Kraken"] = "Secret", ["El Maja"] = "Eternal",
     -- Prehistoric
@@ -2804,24 +2802,10 @@ local INDEX_SLOT = _G.SEHUB_INDEXSLOT
 if not next(INDEX_SLOT) and readfile then
     local ok, src = pcall(readfile, INDEX_FILE)
     if ok and type(src) == "string" and #src > 0 then
-        -- MATCHA'S loadstring DOES NOT PROPAGATE A CHUNK'S RETURN VALUE. For a file whose
-        -- entire body is `return {...}`, pcall(chunk) comes back true, nil - success, and
-        -- nothing. So this cache has never once loaded from disk in this executor: every
-        -- session started with an empty index and silently rebuilt only what a live harvest
-        -- could see, while saveIndexSlots kept writing a file that merely looked readable.
-        -- It hid itself well, because _G survives a reload, so within one sitting the
-        -- in-memory copy made the cache appear to be working.
-        --
-        -- Hand the table back through a global, which does survive the call. Stripping a
-        -- leading `return` also upgrades files already written in the old format.
-        local body = string.gsub(src, "^%s*return%s+", "")
-        local okc, chunk = pcall(loadstring, "_G.SEHUB_INDEXLOAD=" .. body)
+        local okc, chunk = pcall(loadstring, src)
         if okc and chunk then
-            _G.SEHUB_INDEXLOAD = nil
-            pcall(chunk)
-            local tbl = _G.SEHUB_INDEXLOAD
-            _G.SEHUB_INDEXLOAD = nil
-            if type(tbl) == "table" then
+            local okr, tbl = pcall(chunk)
+            if okr and type(tbl) == "table" then
                 for area, slots in pairs(tbl) do
                     if type(slots) == "table" then INDEX_SLOT[area] = slots end
                 end
@@ -2961,17 +2945,8 @@ end
 -- one of those windows threw away a perfectly good set of fingerprints and replaced it with
 -- nothing: 76 templates one moment, 0 the next, with rarity features silently blind until
 -- the service came back. _G outlives the reload, so the good copy is kept and only improved.
--- Bumped whenever the fingerprint RULE changes. The cache outlives a reload by design, so
--- without this a run carrying entries built under the old rule - including the Hitbox-only
--- one-part junk that matched everything at 0.000 - would keep them forever and the fix
--- would appear not to work. A mismatch throws the cache away and rebuilds.
-local EGG_FP_VER = 2
-_G.SEHUB_EGGFP = _G.SEHUB_EGGFP or { fp = nil, at = 0, done = false, stall = 0, ver = EGG_FP_VER }
+_G.SEHUB_EGGFP = _G.SEHUB_EGGFP or { fp = nil, at = 0, done = false, stall = 0 }
 local EGG_FP_C = _G.SEHUB_EGGFP
-if EGG_FP_C.ver ~= EGG_FP_VER then
-    EGG_FP_C.fp, EGG_FP_C.at, EGG_FP_C.done, EGG_FP_C.stall = nil, 0, false, 0
-    EGG_FP_C.ver = EGG_FP_VER
-end
 local EGG_FP = EGG_FP_C.fp
 local EGG_FP_AT, EGG_FP_DONE, EGG_FP_STALL = EGG_FP_C.at, EGG_FP_C.done, EGG_FP_C.stall
 
@@ -2993,42 +2968,15 @@ local function eggFingerprint(m)
     local parts = {}
     local okd, kids = pcall(function() return m:GetDescendants() end)
     if not okd or not kids then return nil end
-    -- THE HITBOX IS EXCLUDED BY NAME, so a model whose names cannot be read excludes
-    -- NOTHING - and the Hitbox is usually the one part still readable. The fingerprint then
-    -- describes the BOUNDING BOX instead of the egg, which is a different shape entirely,
-    -- and it is returned with full confidence because nothing about it looks like a failure.
-    --
-    -- Matcha signals a dead binding by returning the literal string "Unreadable_name" and an
-    -- empty ClassName rather than by erroring, so pcall succeeds and the old guard passed
-    -- straight through. Shark's template is in this state permanently - 11 descendants, 0
-    -- readable, unchanged over 40 retries across four seconds - so it can never be
-    -- fingerprinted at all, and every egg that "matched" it was something else.
-    --
-    -- Any unreadable child at all means the part list is a SUBSET of the real model, so the
-    -- whole model is refused. A subset is not a weaker answer, it is a wrong one.
-    --
-    -- NOTE, because I got this wrong once and the fix was worse than the bug: a ONE-part
-    -- fingerprint is NOT degenerate. The normaliser divides by the cube root of the largest
-    -- part's VOLUME, not by the part itself, so a single part keeps its aspect ratio and
-    -- stays perfectly identifiable - Crane, Chicken, Red Panda and DesertLark are all real
-    -- one-part eggs. Rejecting them cost six identifications a sweep for no reason. What
-    -- they cannot do is stand alone: Chicken and DesertLark have the same proportions, and
-    -- a multi-part egg caught with only one part loaded would also land here. So one-part
-    -- answers are kept but marked, and eggNameFor only accepts them when the area's own
-    -- list agrees - see `solo` below.
-    local unreadable = 0
     for _, c in ipairs(kids) do
         local okn, n = pcall(function() return c.Name end)
-        if not okn or n == nil or n == "" or n == "Unreadable_name" then
-            unreadable = unreadable + 1
-        elseif n ~= "Hitbox" and n ~= "CustomBoundingBox" then
+        if okn and n ~= "Hitbox" and n ~= "CustomBoundingBox" then
             local oks, s = pcall(function() return c.Size end)
             if oks and s and typeof(s) == "Vector3" and s.X > 0 and s.Y > 0 and s.Z > 0 then
                 parts[#parts + 1] = s
             end
         end
     end
-    if unreadable > 0 then return nil end
     if #parts == 0 then return nil end
     table.sort(parts, function(a, b) return a.X * a.Y * a.Z > b.X * b.Y * b.Z end)
     local big = parts[1]
@@ -3036,9 +2984,6 @@ local function eggFingerprint(m)
     if k <= 0 then return nil end
     local out = {}
     for i, s in ipairs(parts) do out[i] = { s.X / k, s.Y / k, s.Z / k } end
-    -- Marked, not rejected. A single part is a real shape but a weak witness, so the caller
-    -- demands corroboration from the area list before trusting it.
-    out.solo = (#parts == 1)
     return out
 end
 
@@ -3107,24 +3052,10 @@ local function buildEggFingerprints()
         local r = eggFingerprint(m)
         if r then built[#built + 1] = { name = tostring(m.Name), r = r } end
     end
-    -- MERGE BY NAME, rather than keeping whichever single pass was biggest.
-    --
-    -- Bindings fail per-instance and independently: measured on one pass, Orca / Whale
-    -- Shark / Finned Thresher all read as zero-part while Parrotfish and Swordfish read
-    -- fine, and on the very next pass those three read 4 parts each. Taking the larger
-    -- pass wholesale threw away every template the smaller pass had read successfully and
-    -- the larger one happened to miss, so progress sawtoothed instead of accumulating.
-    -- Merging makes the set monotonic - it only ever grows - which is also what lets the
-    -- stall counter mean "nothing new is loading" instead of "this pass got unlucky".
+    -- Keep whichever attempt got further; a later pass during heavy streaming can come
+    -- back with fewer than an earlier one, and going backwards would be worse than stale.
     local before = EGG_FP and #EGG_FP or 0
-    local merged, seen = {}, {}
-    for _, e in ipairs(EGG_FP or {}) do
-        if not seen[e.name] then seen[e.name] = true; merged[#merged + 1] = e end
-    end
-    for _, e in ipairs(built) do
-        if not seen[e.name] then seen[e.name] = true; merged[#merged + 1] = e end
-    end
-    EGG_FP = merged
+    if not EGG_FP or #built > #EGG_FP then EGG_FP = built end
     if #EGG_FP > before then
         EGG_FP_STALL = 0            -- still improving, keep going
     else
@@ -3165,15 +3096,15 @@ end
 -- Shark are both 4-part Abyss Ocean eggs but sit 1.04 apart, so they are never confused.
 -- Ash Gecko and Chimpanzee are 0.0001 apart - genuinely identical to this metric - and
 -- only Volcano's list separates them.
--- Deliberately EMPTY. seedAreaEggs() fills all eleven areas from AREA_DISPLAY at load, and
--- harvestPetIndex() overwrites that with the game's own ordering once the Pet Index has
--- been opened. This used to hold a hand-typed fallback for three areas, from before the
--- eleven-area table existed, and seedAreaEggs replaced it wholesale so nobody noticed it
--- had gone stale. It no longer replaces - it merges, so that a transient read failure
--- cannot drop a template - and the stale entries promptly came back from the dead: Abyss
--- Ocean ended up with NINE eggs, the eighth being "Shark", a template that cannot be
--- fingerprinted at all and whose slot is really Finned Thresher.
-local AREA_EGGS = {}
+local AREA_EGGS = {
+    Cosmic = { "Centapede", "Galaxy Gecko", "Cyclops Gorilla",
+               "La Vacca Saturno Saturnita", "Alien Skeleton Boss",
+               "Eternal Lunar Dragon", "Unicorn" },
+    Volcano = { "Ash Gecko", "Lava frog", "Flaming Bull", "Lava Iguana",
+                "Chillin Chilli", "Cerberus", "Ascended Vermilion Phoenix" },
+    ["Abyss Ocean"] = { "Parrotfish", "Swordfish", "Shark", "Orca", "Whale Shark",
+                        "Belula Beluga", "Kraken" },
+}
 
 -- Best-scoring template, but only when the answer is CLEAR: a low error and a real
 -- margin over the runner-up. Anything else returns nil - "unknown" is a useful answer
@@ -3204,30 +3135,20 @@ local function eggNameFor(model, area)
     local allow = area and AREA_EGGS[area]
 
     if #fits == 1 or (fits[2].s - fits[1].s) >= EGG_MARGIN then
-        -- A confident answer the area list has never heard of is NOT overruled here, and
-        -- that has now paid for itself. Abyss Ocean kept producing a confident "Finned
-        -- Thresher", a template its list did not contain; overruling it would have quietly
-        -- relabelled the egg and destroyed the evidence. Trusting it and RECORDING the
-        -- disagreement is what exposed the real fault - the list was wrong, not the match.
-        -- The game's own Pet Index has that slot as "Shark", a template which exists but
-        -- is permanently unreadable, so the egg really is a Finned Thresher and the alias
-        -- now says so. Keep this branch honest: report the disagreement, do not hide it.
+        -- A confident answer the area list has never heard of is NOT overruled here.
+        -- The lists are transcriptions and may be incomplete - Abyss Ocean produced a
+        -- confident Finned Thresher that is not on the wiki page - and quietly discarding
+        -- a good match to protect a list would hide exactly the disagreement worth
+        -- seeing. Record it instead, and let Check Rift Progress report it.
         if allow then
             local ok = false
             for _, want in ipairs(allow) do
                 if fits[1].name == want then ok = true break end
             end
             if not ok then
-                -- A SOLO fingerprint is the one case where the area list outranks the
-                -- shape, because one part is also what a half-loaded multi-part egg looks
-                -- like. Unidentified is cheap; a wrong name propagates into Rare Priority
-                -- and Always Target and sends the farm to the wrong egg.
-                if r.solo then return nil end
                 _G.FARM.EggOdd = _G.FARM.EggOdd or {}
                 _G.FARM.EggOdd[area .. ": " .. fits[1].name] = true
             end
-        elseif r.solo then
-            return nil    -- no list to corroborate against, so a one-part answer is a guess
         end
         return fits[1].name
     end
@@ -3312,48 +3233,7 @@ local RIFT_EGG_ALIAS = {
     ["axolotl"]             = "Dream Axolotl",
     ["t-rex"]               = "TyrannosaurusRex",
     ["trex"]                = "TyrannosaurusRex",
-    -- Abyss Ocean's Shark. A template literally named "Shark" DOES exist, which is why
-    -- this rename was never suspected, but it is a dead asset: 11 descendants, every one
-    -- of them unreadable, unchanged across 40 retries over four seconds - so it can never
-    -- be fingerprinted and no world egg can ever match it. The egg that actually spawns in
-    -- that slot fingerprints exactly (0.00000, sole fit) as "Finned Thresher", which is a
-    -- species of shark, and it sits at x=2281 between a Swordfish and a Parrotfish.
-    -- Frequency agrees: the live sweep found Parrotfish x2 and Swordfish x2 - slots 1 and
-    -- 2, Rare and Epic - and Finned Thresher x1, which is slot 3, Legendary, the Shark.
-    -- Same reasoning that produced the four Titan Temple renames above.
-    ["shark"]               = "Finned Thresher",
 }
-
--- MIGRATE THE CACHED PET INDEX THROUGH THE ALIASES ABOVE.
---
--- sehub_petindex.lua is written once, from a real harvest, and then trusted for the rest of
--- time - so a rename discovered AFTER that harvest never reaches it, and the stale template
--- name outlives every other fix. That is exactly what happened with Shark: the cache on
--- disk records Abyss Ocean slot 3 as "Shark", harvested before the rename was known, and
--- areaEggsFromIndex faithfully rebuilt the allow list from it - putting a template that can
--- never be fingerprinted back into the area on every single load.
---
--- The stored values are template names, and a stored name that is ITSELF an alias key is by
--- definition a name the game displays but no longer models. Only those move; everything
--- else is left alone, because the alias keys are display names and a template that shares
--- one is the very case being corrected.
-do
-    local moved = 0
-    for _, slots in pairs(INDEX_SLOT) do
-        for tmpl, slot in pairs(slots) do
-            local better = RIFT_EGG_ALIAS[string.lower(tmpl)]
-            if better and better ~= tmpl then
-                slots[tmpl] = nil
-                slots[better] = slot
-                moved = moved + 1
-            end
-        end
-    end
-    if moved > 0 then
-        pcall(saveIndexSlots)
-        _G.FARM.IndexMigrated = moved
-    end
-end
 
 -- Every area's egg list, as the game displays them, in rarity order. Taken from the lists
 -- you supplied and resolved to template names at load - so the mapping uses the same
@@ -3517,40 +3397,19 @@ _G.SEHUB_AREAEGGS = areaEggsFromIndex
 --
 -- Runs BEFORE the index harvest so that a real harvest, when the Pet Index has been opened,
 -- overwrites these with the game's own answer.
--- Re-runnable, and it MERGES rather than replaces.
---
--- The old version looked the Eggs folder up again inside the per-name loop and treated any
--- failure as "this pet has no template", dropping the name from the area list permanently -
--- the whole function ran exactly once, at load. But the lookup fails transiently in this
--- executor, so a flicker at load cost a real egg for the rest of the session. Caught it
--- red-handed: Orangutini Ananassini and Eternal Lunar Dragon were both on the dropped list
--- while `folder:FindFirstChild` finds both by exact name on demand, which left Jungle and
--- Cosmic with 7-egg allow lists and made every tie in those areas unresolvable.
---
--- Now the folder is resolved ONCE per pass and the pass aborts wholesale if it is missing -
--- an unreachable folder is not evidence about any particular pet - and a name that resolves
--- on a later pass is added to the list it belongs to. Names still unresolved are reported,
--- and they are the genuinely-renamed ones that need an alias.
-local AREA_SEED_DONE = false
 local function seedAreaEggs()
-    local RS = game:GetService("ReplicatedStorage")
-    local okf, folder = pcall(function()
-        return RS and RS.Assets and RS.Assets.Models
-               and RS.Assets.Models:FindFirstChild("Eggs")
-    end)
-    if not okf or not folder then return -1 end      -- say nothing rather than drop everything
-
     local kept, dropped = 0, {}
     for area, names in pairs(AREA_DISPLAY) do
-        local have, list = {}, {}
-        for _, t in ipairs(AREA_EGGS[area] or {}) do
-            if not have[t] then have[t] = true; list[#list + 1] = t end
-        end
+        local list = {}
         for _, disp in ipairs(names) do
             local tmpl = resolveEggTemplate(disp, area)
-            local okc, real = pcall(function() return tmpl and folder:FindFirstChild(tmpl) end)
-            if okc and real then
-                if not have[tmpl] then have[tmpl] = true; list[#list + 1] = tmpl end
+            local RS = game:GetService("ReplicatedStorage")
+            local okf, folder = pcall(function()
+                return RS and RS.Assets and RS.Assets.Models
+                       and RS.Assets.Models:FindFirstChild("Eggs")
+            end)
+            if okf and folder and tmpl and folder:FindFirstChild(tmpl) then
+                list[#list + 1] = tmpl
                 kept = kept + 1
             else
                 dropped[#dropped + 1] = disp
@@ -3560,26 +3419,10 @@ local function seedAreaEggs()
     end
     _G.FARM.AreaEggsKept = kept
     _G.FARM.AreaEggsDropped = dropped
-    AREA_SEED_DONE = (#dropped == 0)
     return kept
 end
 _G.SEHUB_SEEDAREAS = seedAreaEggs
-_G.SEHUB_AREALIST = function() return AREA_EGGS end
 seedAreaEggs()
-
--- DO NOT ADD A BACKGROUND RETRY LOOP HERE. I did, and it was the three-second freeze:
--- twenty passes at three-second intervals, which is exactly the "freezes every 3 seconds
--- and stops after a minute" symptom. Three things made it far worse than it looks:
---   * it could never finish early. AREA_SEED_DONE only clears when every display name
---     resolves, and nine of them have no template at all, so it always ran all twenty.
---   * a pass is not cheap. resolveEggTemplate falls back to a case-insensitive scan of the
---     folder, so each unresolved name walks all 115 children - nine names, every pass.
---   * each reload spawns another one. Seven reloads in a session means seven of these
---     running at once, which is where it stops being a stutter and becomes a crash.
--- One pass at load is enough: the merge above means a later harvest can only add to the
--- lists, and harvestPetIndex already re-seeds from the game's own data when the Pet Index
--- is opened. If a retry is ever genuinely needed, drive it off an existing loop and guard
--- it with _G.SEHUB_GEN so a retired instance's copy stops.
 
 areaEggsFromIndex()
 
