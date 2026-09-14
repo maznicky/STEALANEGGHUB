@@ -312,12 +312,47 @@ do
         return false
     end
 
+    local PL_CACHE, PL_AT = {}, 0
+    local function playerSpots()
+        if (tick() - PL_AT) < 0.2 then return PL_CACHE end
+        local out = {}
+        local okp, P = pcall(function() return game:GetService("Players") end)
+        if okp and P then
+            local okm, myName = pcall(function() return P.LocalPlayer.Name end)
+            local okl, list = pcall(function() return P:GetPlayers() end)
+            if okl and list then
+                for _, pl in ipairs(list) do
+                    local okn, nm = pcall(function() return pl.Name end)
+                    if okn and not (okm and nm == myName) then
+                        local okr, pos = pcall(function()
+                            local c = pl.Character
+                            local r = c and c:FindFirstChild("HumanoidRootPart")
+                            return r and r.Position
+                        end)
+                        if okr and pos then out[#out + 1] = pos end
+                    end
+                end
+            end
+        end
+        PL_CACHE, PL_AT = out, tick()
+        return out
+    end
+
     function steerAround(me, tx, tz, speed)
         local dx, dz = tx - me.X, tz - me.Z
         local dist = math.sqrt(dx * dx + dz * dz)
         if dist < 0.01 then return 0, 0 end
         local ux, uz = dx / dist, dz / dist
         local traps = trapPositions()
+        local FMg = _G.FARM
+        if FMg and FMg.AvoidPlayers then
+            local merged = {}
+            for _, t in ipairs(traps) do merged[#merged + 1] = t end
+            for _, p in ipairs(playerSpots()) do
+                if ((p.X - tx) ^ 2 + (p.Z - tz) ^ 2) > 144 then merged[#merged + 1] = p end
+            end
+            traps = merged
+        end
         if #traps == 0 then return ux, uz end
         for _, t in ipairs(traps) do
             local ox, oz = me.X - t.X, me.Z - t.Z
@@ -1408,6 +1443,7 @@ end)
 _G.FARM = _G.FARM or {}
 local FM = _G.FARM
 FM.On        = false
+FM.AvoidPlayers = false
 FM.Speed     = 300
 FM.Stick     = 18
 FM.Reach     = 1.5
@@ -2717,6 +2753,11 @@ farmToggle = farmSec:Toggle("Auto Farm", false, function(v)
 end, "Farms eggs until you turn it off.")
 farmSec:Toggle("Auto Anti-Boss", false, function(v) FM.AutoBoss = v end,
     "Escapes a boss that chases you while you carry an egg.")
+farmSec:Toggle("Avoid Players", false, function(v) FM.AvoidPlayers = v end,
+    "Steers around other players, like traps and the boss rift.")
+FM.TreadmillFarm = false
+farmSec:Toggle("Auto Treadmill Farm", false, function(v) FM.TreadmillFarm = v end,
+    "Trains on your treadmill whenever there are no eggs to farm.")
 local rareToggle, sizeToggle
 rareToggle = farmSec:Toggle("Rare Priority", false, function(v)
     FM.RarePri = v
@@ -3343,6 +3384,34 @@ SESPAWN("night watch", function()
     end
 end)
 
+local TREAD_POS, TREAD_AT = nil, 0
+local function myTreadmill()
+    if TREAD_POS and (tick() - TREAD_AT) < 10 then return TREAD_POS end
+    TREAD_POS = nil
+    local lp = localPlayer()
+    local okn, myName = pcall(function() return lp and lp.Name end)
+    local plots = workspace:FindFirstChild("Plots")
+    if not (okn and myName and plots) then return nil end
+    local okc, list = pcall(function() return plots:GetChildren() end)
+    for _, pl in ipairs(okc and list or {}) do
+        local sign = pl:FindFirstChild("PlotSign")
+        local okd, desc = pcall(function() return sign and sign:GetDescendants() or {} end)
+        for _, d in ipairs(okd and desc or {}) do
+            local okt, t = pcall(function() return d.Name == "PlayerName" and d.Text end)
+            if okt and t == myName then
+                local tb = pl:FindFirstChild("TreadmillBottom")
+                local okp, p = pcall(function() return tb and tb.Position end)
+                if okp and p then
+                    TREAD_POS, TREAD_AT = p, tick()
+                    return p
+                end
+            end
+        end
+    end
+    return nil
+end
+_G.SEHUB_TREADMILL = myTreadmill
+
 local function farmStep()
     local task = PROF_TASK
     if not FM.On then task.wait(0.2) return end
@@ -3944,6 +4013,37 @@ local function farmStep()
                     end
                     FM.lockKey = best and best.key or nil
                     if not best and anyAllowed == 0 then
+                        FM.idleSince = FM.idleSince or now
+                        local tread = FM.TreadmillFarm and (now - FM.idleSince) >= 1.5 and myTreadmill() or nil
+                        if tread then
+                            FM.idleSpot = nil
+                            FM.treadVisit = true
+                            local dt = (Vector3.new(tread.X, me.Y, tread.Z) - me).Magnitude
+                            if dt > 4 then
+                                local flat = Vector3.new(tread.X - me.X, 0, tread.Z - me.Z)
+                                local m = flat.Magnitude
+                                if m > 0.01 then
+                                    local sp = FM.Speed
+                                    if dt < (FM.Brake or 60) then
+                                        sp = math.max(20, FM.Speed * (dt / (FM.Brake or 60)))
+                                    end
+                                    local ux, uz = steerAround(me, tread.X, tread.Z, sp)
+                                    drive(root, ux * sp, uz * sp, -(FM.Stick or 18))
+                                end
+                                FM.State = "Going to the treadmill"
+                                task.wait(0.03)
+                            else
+                                if not FM.onTreadmill then
+                                    pcall(function()
+                                        root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0)
+                                    end)
+                                end
+                                FM.onTreadmill = true
+                                FM.State = "Training on the treadmill"
+                                task.wait(0.5)
+                            end
+                            return
+                        end
                         local home = homePos()
                         if home then
                             FM.idleSpot = FM.idleSpot or pickHomeSpot() or home
@@ -3971,6 +4071,42 @@ local function farmStep()
                             FM.State = "Waiting for eggs to respawn"
                             task.wait(0.5)
                         end
+                        return
+                    end
+                    FM.idleSince = nil
+                    if FM.treadVisit then
+                        local tread = myTreadmill()
+                        if tread and (Vector3.new(tread.X, me.Y, tread.Z) - me).Magnitude < 14 then
+                            local tx = best and best.pos.X or (tread.X + 20)
+                            local tz = best and best.pos.Z or tread.Z
+                            local dx, dz = tx - tread.X, tz - tread.Z
+                            local dm = math.sqrt(dx * dx + dz * dz)
+                            if dm < 0.01 then dx, dz, dm = 1, 0, 1 end
+                            dx, dz = dx / dm, dz / dm
+                            FM.State = "Leaving the treadmill"
+                            local freed = false
+                            for _ = 1, 4 do
+                                if keypress then pcall(function() keypress(0x20) end) end
+                                task.wait(0.2)
+                                if keyrelease then pcall(function() keyrelease(0x20) end) end
+                                task.wait(0.15)
+                                local okp0, p0 = pcall(function() return root.Position end)
+                                drive(root, dx * 60, dz * 60, -(FM.Stick or 18))
+                                task.wait(0.2)
+                                local okp1, p1 = pcall(function() return root.Position end)
+                                if okp0 and okp1 and p0 and p1
+                                   and (Vector3.new(p1.X, 0, p1.Z) - Vector3.new(p0.X, 0, p0.Z)).Magnitude > 2 then
+                                    freed = true
+                                    break
+                                end
+                            end
+                            if not freed then
+                                FM.State = "Stuck on the treadmill - click into Roblox"
+                                task.wait(0.3)
+                                return
+                            end
+                        end
+                        FM.treadVisit, FM.onTreadmill = nil, nil
                         return
                     end
                     FM.idleSpot = nil
