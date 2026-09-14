@@ -1032,8 +1032,8 @@ local AB = _G.ABOSS
 AB.Zone   = CFrame.new(537.9755, 70.5763, -371.0225)
 AB.Count  = 1
 AB.RetryGap = 0
-AB.Teleports = 20
-AB.Hold   = 0.03
+AB.Teleports = 1
+AB.Hold   = 0.35
 AB.Delay  = 0.005
 AB.HoldFor = 6
 AB.Key    = "F1"
@@ -1239,6 +1239,41 @@ local function teleportTo(cf, quiet)
 end
 _G.SEHUB_TELEPORT = teleportTo
 
+do
+    local RS = game:GetService("RunService")
+    if _G.SEHUB_PINCONN then
+        for _, c in ipairs(_G.SEHUB_PINCONN) do pcall(function() c:Disconnect() end) end
+    end
+    local conns = {}
+    local function pinStep(countFrame)
+        if (AB.pinLive or 0) <= tick() or not AB.Zone then return end
+        local r = myRoot()
+        if not r then return end
+        if countFrame then
+            local okq, p = pcall(function() return r.Position end)
+            if okq and p and math.sqrt((p.X - AB.Zone.X) ^ 2 + (p.Z - AB.Zone.Z) ^ 2) < 25 then
+                AB.pinFrames = (AB.pinFrames or 0) + 1
+            end
+        end
+        pcall(function()
+            r.CFrame = AB.Zone
+            r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        end)
+        AB.pinWrites = (AB.pinWrites or 0) + 1
+    end
+    pcall(function()
+        conns[#conns + 1] = RS.Stepped:Connect(function()
+            if _G.SEHUB_GEN == GEN then pinStep(true) end
+        end)
+    end)
+    pcall(function()
+        conns[#conns + 1] = RS.Heartbeat:Connect(function()
+            if _G.SEHUB_GEN == GEN then pinStep(false) end
+        end)
+    end)
+    _G.SEHUB_PINCONN = conns
+end
+
 local function gotoZone(quiet)
     if not AB.Zone then
         if not quiet then notify("Anti-Boss", "Set a safe zone first", 2) end
@@ -1258,40 +1293,20 @@ local function gotoZone(quiet)
     end)
     AB.Hops = (AB.Hops or 0) + 1
     AB.pinning, AB.pinAt = true, tick()
-    local nTel = math.max(AB.Teleports or 1, AB.Count or 1)
-    AB.pinUntil = tick() + nTel * ((AB.Hold or 0.1) + 0.05) + 1
+    local nTel = math.max(AB.Teleports or 1, 1)
+    local hold = math.max(AB.Hold or 0.03, 0.03)
+    local gap = AB.RetryGap or 0
+    AB.pinUntil = tick() + nTel * (hold + gap + 0.05) + 1
 
     task.spawn(function()
-        local reached, tries, bestFrames = false, 0, 0
-        for attempt = 1, math.max(AB.Count or 5, 1) do
-            tries = attempt
-            local frames, t0 = 0, tick()
-            while tick() - t0 < (AB.Hold or 0.35) do
-                local r = myRoot()
-                if r then
-                    pcall(function()
-                        r.CFrame = AB.Zone
-                        r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-                    end)
-                    local okq, p = pcall(function() return r.Position end)
-                    if okq and p then
-                        local d = math.sqrt((p.X-AB.Zone.X)^2 + (p.Z-AB.Zone.Z)^2)
-                        if d < 25 then frames = frames + 1 end
-                    end
-                end
-                task.wait(0.03)
-            end
-            if frames > bestFrames then bestFrames = frames end
-            local need = (dHome <= ESC_MAXHOP) and 3 or 2
-            if frames >= need then reached = true break end
-            if (AB.RetryGap or 0) > 0 then task.wait(math.max(AB.RetryGap, 0.03)) end
-        end
-        local extra = 0
-        do
-            for _ = 1, math.max(0, (AB.Teleports or 1) - tries) do
-                if (AB.RetryGap or 0) > 0 then task.wait(math.max(AB.RetryGap, 0.03)) end
-                local t1 = tick()
-                while tick() - t1 < (AB.Hold or 0.35) do
+        local frames0, writes0 = AB.pinFrames or 0, AB.pinWrites or 0
+        local hooked = #(_G.SEHUB_PINCONN or {}) > 0
+        local done = 0
+        for i = 1, nTel do
+            local tEnd = tick() + hold
+            AB.pinLive = tEnd
+            repeat
+                if not hooked then
                     local r = myRoot()
                     if r then
                         pcall(function()
@@ -1299,19 +1314,26 @@ local function gotoZone(quiet)
                             r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
                         end)
                     end
-                    task.wait(0.03)
                 end
-                extra = extra + 1
+                task.wait(0.03)
+            until tick() >= tEnd
+            done = i
+            if i < nTel and gap > 0 then
+                AB.pinLive = 0
+                task.wait(math.max(gap, 0.03))
             end
         end
-        AB.ExtraDone = extra
+        AB.pinLive = 0
+        local frames = (AB.pinFrames or 0) - frames0
+        local writes = (AB.pinWrites or 0) - writes0
+        local reached = frames >= ((dHome <= ESC_MAXHOP) and 3 or 2)
+        AB.ExtraDone = math.max(0, done - 1)
         AB.pinning = false
         AB.Touches = (AB.Touches or 0) + (reached and 1 or 0)
         AB.Missed  = (AB.Missed  or 0) + (reached and 0 or 1)
-        AB.Tries   = (AB.Tries   or 0) + tries
-        AB.LastTouch = string.format("%s after %d %s (%d frames at the zone, from %.0f studs)",
-            reached and "TOUCHED" or "MISSED", tries,
-            (tries == 1) and "try" or "tries", bestFrames, dHome)
+        AB.Tries   = (AB.Tries   or 0) + done
+        AB.LastTouch = string.format("%s: %d teleports, %d writes, %d frames at the zone (from %.0f studs)",
+            reached and "TOUCHED" or "MISSED", done, writes, frames, dHome)
     end)
     AB.lastEscape = tick()
     lastHopAt = tick()
@@ -1425,7 +1447,7 @@ FM.RetryRange  = 300
 FM.RetryMax    = 0
 FM.EscapesPerWake = 1
 FM.ReEscapeGap    = 0.2
-FM.GrabEscapeDelay = 0
+FM.GrabEscapeDelay = 0.55
 FM.WakeEscape      = false
 FM.RarePri   = false
 FM.randomKey  = nil
@@ -2741,6 +2763,8 @@ farmSec:Slider("Big Egg Carry Speed", 260, 10, 40, 300, " studs/s", function(v) 
     "Speed while carrying a big egg. Lower it if you rubber-band.")
 farmSec:Slider("Boss Reset Wait", 0, 0.5, 0, 10, " s", function(v) FM.PostDeliver = v end,
     "Wait at the safe zone after delivering.")
+farmSec:Slider("Grab Escape Delay", 0.55, 0.05, 0, 1.5, " s", function(v) FM.GrabEscapeDelay = v end,
+    "Escape this long after grabbing an egg. 0 = as soon as the grab registers.")
 FM.ui = farmSec:Label("Off")
 
 for k, want in pairs({ GrabHold = 1.3 }) do
@@ -3678,8 +3702,9 @@ local function farmStep()
                         FM.homeSpot = FM.homeSpot or pickHomeSpot() or homeP
                         local zp = FM.homeSpot
                         local d = (Vector3.new(zp.X, me.Y, zp.Z) - me).Magnitude
-                        if d > (FM.SpotReach or 4) then
+                        if d > (FM.SpotReach or 4) and not (FM.depositAt and d <= (FM.ZoneReach or 12)) then
                             FM.depositAt = nil
+                            FM.depositToolSeen = nil
                             local flat = Vector3.new(zp.X - me.X, 0, zp.Z - me.Z)
                             local m = flat.Magnitude
                             if m > 0.01 then
@@ -3701,7 +3726,10 @@ local function farmStep()
                             end)
                             FM.depositAt = FM.depositAt or tick()
                             local held = tick() - FM.depositAt
-                            if FM.eggIsTool and not heldEggTool() then
+                            local toolNow = heldEggTool()
+                            if toolNow then FM.depositToolSeen = true end
+                            if (FM.eggIsTool or FM.depositToolSeen) and not toolNow then
+                                FM.depositToolSeen = nil
                                 FM.hasEgg = false
                                 FM.depositAt = nil
                                 FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
@@ -3721,7 +3749,8 @@ local function farmStep()
                                 task.wait(0.05)
                                 return
                             end
-                            if held > (FM.DeliverSettle or 2.5) then
+                            if held > ((FM.depositToolSeen and 2.5) or (FM.DeliverSettle or 2.5)) then
+                                FM.depositToolSeen = nil
                                 FM.hasEgg = false
                                 FM.depositAt = nil
                                 FM.deliveredTool = heldEggTool()
@@ -3744,6 +3773,7 @@ local function farmStep()
                                 return
                             end
                             if held > (FM.DepositWait or 20) then
+                                FM.depositToolSeen = nil
                                 FM.hasEgg = false
                                 FM.depositAt = nil
                                 FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
@@ -3753,7 +3783,7 @@ local function farmStep()
                                 return
                             end
                             FM.State = "Delivering..."
-                            task.wait(0.2)
+                            task.wait(0.1)
                         end
                         task.wait(0.03)
                         return
@@ -3761,16 +3791,28 @@ local function farmStep()
 
                     FM.depositAt = nil
 
-                    if FM.stowPending then
-                        FM.stowPending = nil
-                        if heldEggTool() and not FM.NoStow then
-                            if stowHeldEgg() then
-                                FM.Stowed = (FM.Stowed or 0) + 1
-                            else
-                                FM.StowFail = (FM.StowFail or 0) + 1
+                    local heldEgg = (not FM.NoStow) and heldEggTool() or nil
+                    if not heldEgg then FM.stowGaveUp, FM.stowTries = nil, nil end
+                    if heldEgg and not FM.stowGaveUp and (FM.stowPending or heldEgg == FM.deliveredTool) then
+                        stowHeldEgg()
+                        if heldEggTool() then
+                            FM.stowTries = (FM.stowTries or 0) + 1
+                            if FM.stowTries < 10 then
+                                pcall(function()
+                                    root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0)
+                                end)
+                                FM.State = "Putting the egg away"
+                                task.wait(0.1)
+                                return
                             end
+                            FM.StowFail = (FM.StowFail or 0) + 1
+                            FM.stowGaveUp = true
+                        else
+                            FM.Stowed = (FM.Stowed or 0) + 1
+                            FM.stowTries = nil
                         end
                     end
+                    FM.stowPending = nil
 
                     local best, bestScore
                     local anyAllowed = 0
@@ -4065,8 +4107,8 @@ local function farmStep()
                             FM.grabArea = best.area
                             FM.carryW = best.w or 1
                             FM.State = "Got an egg - heading home"
+                            task.wait(FM.AfterGrab or 0.1)
                             return
-                            task.wait(FM.AfterSteal or 0.4)
                         end
                     end
                 end
