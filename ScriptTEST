@@ -1,0 +1,4460 @@
+_G.SEHUB_GEN = (_G.SEHUB_GEN or 0) + 1
+local GEN = _G.SEHUB_GEN
+if GEN > 1 then
+    print(string.format("[Steal An Egg] reload #%d - retiring previous instance", GEN))
+    if _G.FARM then _G.FARM.On = false end
+    if _G.ABOSS then _G.ABOSS.pinLive, _G.ABOSS.pinning = 0, false end
+    task.wait(0.3)
+    if _G.SEHUB_RESTORE then pcall(_G.SEHUB_RESTORE) end
+    if _G.SEHUB_WIN then
+        for _, m in ipairs({ "Destroy", "Unload", "Close", "Remove" }) do
+            pcall(function() _G.SEHUB_WIN[m](_G.SEHUB_WIN) end)
+        end
+        _G.SEHUB_WIN = nil
+    end
+    if setrobloxinput then pcall(function() setrobloxinput(true) end) end
+    task.wait(0.2)
+end
+
+_G.SEHUB_SKIP = _G.SEHUB_SKIP or {}
+_G.SEHUB_LOOPS = {}
+_G.SEHUB_SLOW = _G.SEHUB_SLOW or {}
+
+local PWAIT_ACC = 0
+local function PWAIT(t)
+    local a = tick()
+    local r = task.wait(t)
+    PWAIT_ACC = PWAIT_ACC + (tick() - a)
+    return r
+end
+local function PROFRESET() PWAIT_ACC = 0 end
+local PROF_TASK = { wait = PWAIT, spawn = task.spawn, delay = task.delay, defer = task.defer }
+
+local function PROFTICK(name, t0, sub)
+    local ms = (tick() - t0) * 1000
+    if sub then ms = ms - PWAIT_ACC * 1000 end
+    if ms < 0 then ms = 0 end
+    local e = _G.SEHUB_SLOW[name]
+    if not e then
+        e = { n = 0, total = 0, max = 0, over50 = 0, over150 = 0, maxState = "?" }
+        _G.SEHUB_SLOW[name] = e
+    end
+    e.n, e.total = e.n + 1, e.total + ms
+    if ms > e.max then
+        e.max = ms
+        e.maxState = tostring((_G.FARM or {}).State)
+    end
+    if ms > 50 then e.over50 = e.over50 + 1 end
+    if ms > 150 then e.over150 = e.over150 + 1 end
+end
+
+local function SESPAWN(name, fn)
+    if _G.SEHUB_SKIP[name] then
+        print("[Steal An Egg] skipping loop: " .. name)
+        return
+    end
+    local restarts = 0
+    _G.SEHUB_LOOPERR = _G.SEHUB_LOOPERR or {}
+    task.spawn(function()
+        while _G.SEHUB_GEN == GEN do
+            local startedAt = tick()
+            local ok, err = pcall(fn)
+            if ok then return end
+            if _G.SEHUB_GEN ~= GEN then return end
+            local ranFor = tick() - startedAt
+            if ranFor > 60 then restarts = 0 end
+            restarts = restarts + 1
+            _G.SEHUB_LOOPS[name] = (_G.SEHUB_LOOPS[name] or 0) + 1
+            _G.SEHUB_LOOPERR[name] = string.format("%s  (after %.0fs, restart %d)",
+                tostring(err), ranFor, restarts)
+            if restarts > 5 then
+                warn(string.format("[Steal An Egg] '%s' died %d times in a row, leaving it stopped: %s",
+                    name, restarts, tostring(err)))
+                return
+            end
+            warn(string.format("[Steal An Egg] '%s' errored after %.0fs (restart %d): %s",
+                name, ranFor, restarts, tostring(err)))
+            task.wait(0.5)
+        end
+    end)
+end
+
+_G.SEHUB_DRAWINGS = _G.SEHUB_DRAWINGS or {}
+_G.SEHUB_DRAWOURS = _G.SEHUB_DRAWOURS or {}
+_G.SEHUB_DRAWDEAD = _G.SEHUB_DRAWDEAD or {}
+local function dropDrawing(d)
+    if not d or _G.SEHUB_DRAWDEAD[d] then return end
+    if not _G.SEHUB_DRAWOURS[d] then return end
+    _G.SEHUB_DRAWDEAD[d] = true
+    pcall(function() d.Visible = false end)
+    pcall(function() d:Remove() end)
+end
+_G.SEHUB_DROPDRAW = dropDrawing
+_G.SEHUB_DROP = nil
+
+local function newDrawing(kind)
+    if not Drawing then return nil end
+    local ok, obj = pcall(function() return Drawing.new(kind) end)
+    if not ok or not obj then return nil end
+    _G.SEHUB_DRAWOURS[obj] = true
+    table.insert(_G.SEHUB_DRAWINGS, obj)
+    return obj
+end
+
+if GEN > 1 then
+    local n = 0
+    for _, d in ipairs(_G.SEHUB_DRAWINGS) do
+        if _G.SEHUB_DRAWOURS[d] and not _G.SEHUB_DRAWDEAD[d] then
+            dropDrawing(d)
+            n = n + 1
+        end
+    end
+    print(string.format("[Steal An Egg] cleared %d of our own drawings (the menu's are its own)", n))
+end
+_G.SEHUB_DRAWINGS = {}
+_G.SEHUB_DRAWOURS = {}
+_G.SEHUB_DRAWDEAD = {}
+
+do
+    local waited, limit = 0, 10
+    local function handleOk()
+        local ok, lp = pcall(function() return game:GetService("Players").LocalPlayer end)
+        return ok and lp ~= nil
+    end
+    while not handleOk() and waited < limit do
+        task.wait(0.5)
+        waited = waited + 0.5
+    end
+    if not handleOk() then
+        warn("[Steal An Egg] Players handle is stale after " .. limit .. "s - the menu will")
+        warn("[Steal An Egg] render but not accept clicks. Reinject Matcha, then reload.")
+    elseif waited > 0 then
+        print(string.format("[Steal An Egg] waited %.1fs for the Players handle", waited))
+    end
+end
+
+local LIB_CACHE = "insui_cache.lua"
+local LIB_URLS = {
+    "https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua",
+    "https://cdn.jsdelivr.net/gh/neaxusxgod-png/INS-ui@main/uilib.min.lua",
+}
+local Lib
+do
+    local function usableSrc(s)
+        return type(s) == "string" and #s > 5000 and not string.find(s, "^%s*%d%d%d:")
+    end
+    local function usableLib(t) return type(t) == "table" and type(t.CreateWindow) == "function" end
+    local function try(src)
+        if not usableSrc(src) then return nil end
+        local chunk = loadstring(src)
+        if not chunk then return nil end
+        local okr, ret = pcall(chunk)
+        if okr and usableLib(ret) then return ret end
+        for _, name in ipairs({ "INSUI", "INSui", "insui" }) do
+            local g = _G[name] or rawget(getfenv(), name)
+            if usableLib(g) then return g end
+        end
+        return nil
+    end
+    local okc, cached = pcall(function() return readfile(LIB_CACHE) end)
+    if okc then Lib = try(cached) end
+    if not Lib then
+        for _, u in ipairs(LIB_URLS) do
+            local okh, body = pcall(function() return game:HttpGet(u) end)
+            if okh then
+                local got = try(body)
+                if got then
+                    Lib = got
+                    pcall(function() writefile(LIB_CACHE, body) end)
+                    break
+                end
+            end
+        end
+    end
+    if not Lib then
+        warn("[Steal An Egg] no working UI library from cache or any mirror - menu cannot load")
+        return
+    end
+end
+
+local function svcPlayers()
+    local ok, p = pcall(function() return game:GetService("Players") end)
+    return ok and p or nil
+end
+local function localPlayer()
+    local P = svcPlayers()
+    if not P then return nil end
+    local ok, lp = pcall(function() return P.LocalPlayer end)
+    return ok and lp or nil
+end
+local function myCharacter()
+    local lp = localPlayer()
+    if lp then
+        local ok, ch = pcall(function() return lp.Character end)
+        if ok and ch then return ch end
+    end
+    local okc, cam = pcall(function() return workspace.CurrentCamera end)
+    if okc and cam then
+        local oks, subj = pcall(function() return cam.CameraSubject end)
+        if oks and subj then
+            local okp, par = pcall(function() return subj.Parent end)
+            if okp and par then return par end
+        end
+    end
+    return nil
+end
+_G.SEHUB_CHAR = myCharacter
+
+local function myRoot()
+    local ch = myCharacter()
+    if not ch then return nil end
+    local okr, r = pcall(function()
+        return ch:FindFirstChild("HumanoidRootPart") or ch:FindFirstChild("Torso")
+    end)
+    return okr and r or nil
+end
+local function heldEggTool()
+    local ch = myCharacter()
+    if not ch then return nil end
+    local okk, kids = pcall(function() return ch:GetChildren() end)
+    if not okk or not kids then return nil end
+    for _, c in ipairs(kids) do
+        local okcl, cl = pcall(function() return c.ClassName end)
+        if okcl and cl == "Tool" then
+            local okn, n = pcall(function() return c.Name end)
+            if okn and type(n) == "string" and string.find(string.lower(n), "egg", 1, true) then
+                return c, n
+            end
+        end
+    end
+    return nil
+end
+_G.SEHUB_HELDEGG = heldEggTool
+
+local function stowHeldEgg()
+    local tool = heldEggTool()
+    if not tool then return true end
+    local okp, par = pcall(function() return tool.Parent end)
+    if not okp or par == nil then return true end
+    local lp = localPlayer()
+    local bp = lp and lp:FindFirstChild("Backpack")
+    if not bp then return false end
+    pcall(function() tool.Parent = bp end)
+    return heldEggTool() == nil
+end
+_G.SEHUB_STOW = stowHeldEgg
+
+local TRAP_CACHE, TRAP_AT = {}, 0
+local function trapPositions()
+    if (tick() - TRAP_AT) < 0.2 then return TRAP_CACHE end
+    local out = {}
+    local deb = workspace:FindFirstChild("__DEBRIS")
+    if deb then
+        local okd, kids = pcall(function() return deb:GetDescendants() end)
+        if okd and kids then
+            for _, d in ipairs(kids) do
+                local okn, n = pcall(function() return d.Name end)
+                if okn and type(n) == "string" and string.find(n, "PlayerTrap", 1, true) then
+                    local okp, p = pcall(function() return d.Position end)
+                    if okp and p then
+                        out[#out + 1] = p
+                    else
+                        local okc, sub = pcall(function() return d:GetChildren() end)
+                        if okc and sub then
+                            for _, c in ipairs(sub) do
+                                local ok2, p2 = pcall(function() return c.Position end)
+                                if ok2 and p2 then out[#out + 1] = p2 break end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local rift = workspace:FindFirstChild("BossArenaTeleport")
+    local hb = rift and rift:FindFirstChild("Hitbox")
+    if hb then
+        local okc, cf = pcall(function() return hb.CFrame end)
+        local oks, sz = pcall(function() return hb.Size end)
+        if okc and cf and oks and sz then
+            local c = cf.Position
+            if c.X > 0 and math.abs(c.Y - 72) < 60 then
+                local axis = (sz.X >= sz.Z) and cf.RightVector or cf.LookVector
+                local half = math.max(sz.X, sz.Z) * 0.5 - 1
+                local base = Vector3.new(c.X, c.Y - 5, c.Z)
+                out[#out + 1] = base
+                out[#out + 1] = base + Vector3.new(axis.X, 0, axis.Z) * half
+                out[#out + 1] = base - Vector3.new(axis.X, 0, axis.Z) * half
+            end
+        end
+    end
+    TRAP_CACHE, TRAP_AT = out, tick()
+    return out
+end
+_G.SEHUB_TRAPS = trapPositions
+
+local steerAround, drive
+do
+    local CLEAR = 8
+    local LOOK_S = 1.2
+
+    local function onLine(traps, y, ax, az, bx, bz, clear)
+        local dx, dz = bx - ax, bz - az
+        local len2 = dx * dx + dz * dz
+        for _, t in ipairs(traps) do
+            if math.abs(t.Y - y) < 12 then
+                local s = 0
+                if len2 > 0.01 then
+                    s = ((t.X - ax) * dx + (t.Z - az) * dz) / len2
+                    if s < 0 then s = 0 elseif s > 1 then s = 1 end
+                end
+                local cx, cz = ax + dx * s - t.X, az + dz * s - t.Z
+                if (cx * cx + cz * cz) < clear * clear then return true end
+            end
+        end
+        return false
+    end
+
+    local PL_CACHE, PL_AT = {}, 0
+    local function playerSpots()
+        if (tick() - PL_AT) < 0.2 then return PL_CACHE end
+        local out = {}
+        local okp, P = pcall(function() return game:GetService("Players") end)
+        if okp and P then
+            local okm, myName = pcall(function() return P.LocalPlayer.Name end)
+            local okl, list = pcall(function() return P:GetPlayers() end)
+            if okl and list then
+                for _, pl in ipairs(list) do
+                    local okn, nm = pcall(function() return pl.Name end)
+                    if okn and not (okm and nm == myName) then
+                        local okr, pos = pcall(function()
+                            local c = pl.Character
+                            local r = c and c:FindFirstChild("HumanoidRootPart")
+                            return r and r.Position
+                        end)
+                        if okr and pos then out[#out + 1] = pos end
+                    end
+                end
+            end
+        end
+        PL_CACHE, PL_AT = out, tick()
+        return out
+    end
+
+    function steerAround(me, tx, tz, speed)
+        local dx, dz = tx - me.X, tz - me.Z
+        local dist = math.sqrt(dx * dx + dz * dz)
+        if dist < 0.01 then return 0, 0 end
+        local ux, uz = dx / dist, dz / dist
+        local traps = trapPositions()
+        local FMg = _G.FARM
+        if FMg and FMg.AvoidPlayers then
+            local merged = {}
+            for _, t in ipairs(traps) do merged[#merged + 1] = t end
+            for _, p in ipairs(playerSpots()) do
+                if ((p.X - tx) ^ 2 + (p.Z - tz) ^ 2) > 144 then merged[#merged + 1] = p end
+            end
+            traps = merged
+        end
+        if #traps == 0 then return ux, uz end
+        for _, t in ipairs(traps) do
+            local ox, oz = me.X - t.X, me.Z - t.Z
+            local o2 = ox * ox + oz * oz
+            if math.abs(t.Y - me.Y) < 12 and o2 > 0.01 and o2 < (CLEAR * 0.5) ^ 2 then
+                local o = math.sqrt(o2)
+                return ox / o, oz / o
+            end
+        end
+        local look = math.min(dist, math.max(40, (speed or 300) * LOOK_S))
+        if not onLine(traps, me.Y, me.X, me.Z, me.X + ux * look, me.Z + uz * look, CLEAR) then
+            return ux, uz
+        end
+        local near, nearAlong
+        for _, t in ipairs(traps) do
+            if math.abs(t.Y - me.Y) < 12 then
+                local rx, rz = t.X - me.X, t.Z - me.Z
+                local along = rx * ux + rz * uz
+                local side = rz * ux - rx * uz
+                if along > -CLEAR and along < look and math.abs(side) < CLEAR
+                   and (not nearAlong or along < nearAlong) then
+                    near, nearAlong = t, along
+                end
+            end
+        end
+        if not near then return ux, uz end
+        local nx, nz = -uz, ux
+        local side = (near.X - me.X) * nx + (near.Z - me.Z) * nz
+        local first = (side > 0) and -1 or 1
+        for k = 1, 6 do
+            for _, sgn in ipairs({ first, -first }) do
+                local off = CLEAR * (0.6 + 0.6 * k)
+                local wx, wz = near.X + nx * sgn * off, near.Z + nz * sgn * off
+                if not onLine(traps, me.Y, me.X, me.Z, wx, wz, CLEAR * 0.9) then
+                    local ex, ez = wx - me.X, wz - me.Z
+                    local e = math.sqrt(ex * ex + ez * ez)
+                    if e > 0.01 then return ex / e, ez / e end
+                end
+            end
+        end
+        return ux, uz
+    end
+
+    function drive(root, vx, vz, vy)
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.new(vx, vy, vz)
+        end)
+    end
+end
+_G.SEHUB_STEER, _G.SEHUB_DRIVE = steerAround, drive
+
+local TOAST = {
+    list = {}, pad = 12, gap = 9, margin = 20, lineGap = 4,
+    minW = 240, maxW = 420, titleSize = 15, bodySize = 13, bar = 3,
+}
+local TOAST_KIND = {
+    info = { 96, 165, 250 },
+    good = { 74, 222, 128 },
+    warn = { 250, 204, 21 },
+    bad  = { 248, 113, 113 },
+}
+
+local function viewportSize()
+    local ok, cam = pcall(function() return workspace.CurrentCamera end)
+    if ok and cam then
+        local okv, v = pcall(function() return cam.ViewportSize end)
+        if okv and v and v.X and v.X > 100 then return v end
+    end
+    local okp, pg = pcall(function()
+        return game:GetService("Players").LocalPlayer:FindFirstChild("PlayerGui")
+    end)
+    if okp and pg then
+        local best
+        local okd, desc = pcall(function() return pg:GetDescendants() end)
+        if okd and desc then
+            for _, d in ipairs(desc) do
+                local oks, s = pcall(function() return d.AbsoluteSize end)
+                if oks and s and s.X and s.X > 100 then
+                    if not best or (s.X * s.Y) > (best.X * best.Y) then best = s end
+                end
+            end
+        end
+        if best then return best end
+    end
+    return Vector2.new(1920, 1080)
+end
+
+local function rgb(r, g, b)
+    local ok, c = pcall(function() return Color3.fromRGB(r, g, b) end)
+    if ok and c then return c end
+    local ok2, c2 = pcall(function() return Color3.new(r / 255, g / 255, b / 255) end)
+    if ok2 and c2 then return c2 end
+    return nil
+end
+local function setp(obj, key, value)
+    if value == nil then return end
+    pcall(function() obj[key] = value end)
+end
+
+local function measure(txt, size)
+    if not TOAST.ruler then
+        TOAST.ruler = newDrawing("Text")
+        if TOAST.ruler then setp(TOAST.ruler, "Visible", false) end
+    end
+    local r = TOAST.ruler
+    if not r then return #tostring(txt) * size * 0.55 end
+    setp(r, "Font", 2); setp(r, "Size", size); setp(r, "Text", tostring(txt))
+    local ok, b = pcall(function() return r.TextBounds end)
+    if ok and b and b.X and b.X > 0 then return b.X end
+    return #tostring(txt) * size * 0.55
+end
+
+local function wrapText(txt, size, maxW)
+    local lines, cur = {}, ""
+    for word in string.gmatch(tostring(txt), "%S+") do
+        local try = (cur == "") and word or (cur .. " " .. word)
+        if cur ~= "" and measure(try, size) > maxW then
+            lines[#lines + 1] = cur
+            cur = word
+        else
+            cur = try
+        end
+    end
+    if cur ~= "" then lines[#lines + 1] = cur end
+    if #lines == 0 then lines[1] = "" end
+    return lines
+end
+
+local function toastPush(title, msg, dur, kind)
+    if not Drawing then return false end
+    local accent = TOAST_KIND[kind or "info"] or TOAST_KIND.info
+
+    local innerMax = TOAST.maxW - TOAST.pad * 2 - TOAST.bar
+    local titleW = measure(title, TOAST.titleSize)
+    local body = wrapText(msg, TOAST.bodySize, innerMax)
+    local widest = titleW
+    for _, l in ipairs(body) do
+        local w = measure(l, TOAST.bodySize)
+        if w > widest then widest = w end
+    end
+    local cardW = math.max(TOAST.minW, math.min(TOAST.maxW, widest + TOAST.pad * 2 + TOAST.bar + 6))
+    local lineH = TOAST.bodySize + TOAST.lineGap
+    local cardH = TOAST.pad * 2 + TOAST.titleSize + 5 + (#body * lineH) - TOAST.lineGap
+
+    local t = {
+        born = tick(), until_ = tick() + (dur or 3),
+        w = cardW, h = cardH, body = body, parts = {},
+    }
+
+    local h1 = newDrawing("Text")
+    if not h1 then return false end
+    setp(h1, "Font", 2); setp(h1, "Size", TOAST.titleSize)
+    setp(h1, "Color", rgb(accent[1], accent[2], accent[3]))
+    setp(h1, "Outline", true); setp(h1, "Text", tostring(title)); setp(h1, "Visible", true)
+    setp(h1, "ZIndex", 12)
+    t.parts.h1 = h1
+
+    t.lines = {}
+    for i, l in ipairs(body) do
+        local tl = newDrawing("Text")
+        if tl then
+            setp(tl, "Font", 2); setp(tl, "Size", TOAST.bodySize)
+            setp(tl, "Color", rgb(226, 232, 240))
+            setp(tl, "Outline", true); setp(tl, "Text", l); setp(tl, "Visible", true)
+            setp(tl, "ZIndex", 12)
+            t.lines[i] = tl
+        end
+    end
+
+    local shadow = newDrawing("Square")
+    if shadow then
+        setp(shadow, "Filled", true); setp(shadow, "Color", rgb(0, 0, 0))
+        setp(shadow, "Size", Vector2.new(cardW + 4, cardH + 4)); setp(shadow, "ZIndex", 9)
+        setp(shadow, "Visible", true)
+        t.parts.shadow = shadow
+    end
+    local bg = newDrawing("Square")
+    if bg then
+        setp(bg, "Filled", true); setp(bg, "Color", rgb(17, 21, 30))
+        setp(bg, "Size", Vector2.new(cardW, cardH)); setp(bg, "ZIndex", 10)
+        setp(bg, "Visible", true)
+        t.parts.bg = bg
+    end
+    local bar = newDrawing("Square")
+    if bar then
+        setp(bar, "Filled", true); setp(bar, "Color", rgb(accent[1], accent[2], accent[3]))
+        setp(bar, "Size", Vector2.new(TOAST.bar, cardH)); setp(bar, "ZIndex", 11)
+        setp(bar, "Visible", true)
+        t.parts.bar = bar
+    end
+
+    table.insert(TOAST.list, 1, t)
+    while #TOAST.list > 5 do
+        local old = table.remove(TOAST.list)
+        for _, p in pairs(old.parts) do dropDrawing(p) end
+        for _, p in ipairs(old.lines or {}) do dropDrawing(p) end
+    end
+    return true
+end
+
+local function toastLayout()
+    local okv, vp = pcall(viewportSize)
+    if not okv or not vp then return end
+    local now = tick()
+    for i = #TOAST.list, 1, -1 do
+        local t = TOAST.list[i]
+        if now > t.until_ then
+            for _, p in pairs(t.parts) do dropDrawing(p) end
+            for _, p in ipairs(t.lines or {}) do dropDrawing(p) end
+            table.remove(TOAST.list, i)
+        end
+    end
+
+    local yCursor = vp.Y - TOAST.margin
+    for _, t in ipairs(TOAST.list) do
+        local inA  = math.min(1, (now - t.born) / 0.18)
+        local outA = math.min(1, math.max(0, (t.until_ - now) / 0.35))
+        local a = math.min(inA, outA)
+        local slide = (1 - inA) * 40
+
+        local x = vp.X - t.w - TOAST.margin + slide
+        local y = yCursor - t.h
+        yCursor = y - TOAST.gap
+
+        if t.parts.shadow then
+            setp(t.parts.shadow, "Position", Vector2.new(x - 2, y - 2))
+            setp(t.parts.shadow, "Transparency", 0.35 * a)
+        end
+        if t.parts.bg then
+            setp(t.parts.bg, "Position", Vector2.new(x, y))
+            setp(t.parts.bg, "Transparency", 0.93 * a)
+        end
+        if t.parts.bar then
+            setp(t.parts.bar, "Position", Vector2.new(x, y))
+            setp(t.parts.bar, "Transparency", a)
+        end
+        local tx = x + TOAST.bar + TOAST.pad
+        setp(t.parts.h1, "Position", Vector2.new(tx, y + TOAST.pad - 2))
+        setp(t.parts.h1, "Transparency", a)
+        local ly = y + TOAST.pad + TOAST.titleSize + 3
+        for i, tl in ipairs(t.lines or {}) do
+            setp(tl, "Position", Vector2.new(tx, ly + (i - 1) * (TOAST.bodySize + TOAST.lineGap)))
+            setp(tl, "Transparency", a)
+        end
+    end
+end
+
+local NOTIFY_LAST = {}
+local function notify(title, msg, dur, kind)
+    local key = tostring(title) .. "\0" .. tostring(msg)
+    local now = tick()
+    if NOTIFY_LAST[key] and (now - NOTIFY_LAST[key]) < 8 then return end
+    NOTIFY_LAST[key] = now
+    if not NOTIFY_LAST.__n then NOTIFY_LAST.__n = 0 end
+    NOTIFY_LAST.__n = NOTIFY_LAST.__n + 1
+    if NOTIFY_LAST.__n > 60 then
+        for k, t in pairs(NOTIFY_LAST) do
+            if type(t) == "number" and k ~= "__n" and (now - t) > 30 then NOTIFY_LAST[k] = nil end
+        end
+        NOTIFY_LAST.__n = 0
+    end
+
+    if not kind then
+        local m = string.lower(tostring(msg))
+        if string.find(m, "unreadable") or string.find(m, "stale") or string.find(m, "no safe zone")
+           or string.find(m, "cannot") or string.find(m, "failed") then kind = "warn"
+        elseif string.find(m, "complete") or string.find(m, "collected") or string.find(m, "owned")
+           or string.find(m, "saved") or string.find(m, "restored") then kind = "good"
+        end
+    end
+    if not toastPush(title, msg, dur or 3, kind) then
+        if Lib and Lib.Notify then pcall(function() Lib.Notify(title, msg, dur or 2) end) end
+    end
+end
+_G.SEHUB_NOTIFY = function(a, b, c, d) return notify(a, b, c, d) end
+_G.SEHUB_TOASTLAYOUT = toastLayout
+_G.SEHUB_TOASTINFO = function()
+    local out = {}
+    for i, t in ipairs(TOAST.list) do
+        local nparts = 0
+        for _ in pairs(t.parts) do nparts = nparts + 1 end
+        out[i] = string.format("w=%d h=%d lines=%d parts=%d left=%.1fs",
+            t.w or -1, t.h or -1, #(t.lines or {}), nparts, (t.until_ or 0) - tick())
+    end
+    return out
+end
+
+SESPAWN("toasts", function()
+    while _G.SEHUB_GEN == GEN do
+        toastLayout()
+        task.wait(0.1)
+    end
+    for _, t in ipairs(TOAST.list) do
+        for _, p in pairs(t.parts) do dropDrawing(p) end
+    end
+    TOAST.list = {}
+end)
+local function getCamera()
+    local ok, c = pcall(function() return workspace.CurrentCamera end)
+    if ok and c then return c end
+    local ok2, c2 = pcall(function() return workspace:FindFirstChildOfClass("Camera") end)
+    return ok2 and c2 or nil
+end
+
+local function keyCodeValue(name)
+    if not name then return nil end
+    local ok, v = pcall(function() return Enum.KeyCode[name].Value end)
+    if ok and type(v) == "number" then return v end
+    return nil
+end
+
+local function keyMatches(input, letter)
+    if not input or not letter then return false end
+    local ok, kc = pcall(function() return input.KeyCode end)
+    if not ok or kc == nil then return false end
+    local want = keyCodeValue(letter)
+
+    if type(kc) == "number" then
+        if want and kc == want then return true end
+        if #letter == 1 then
+            return kc == string.byte(string.lower(letter))
+                or kc == string.byte(string.upper(letter))
+        end
+        return false
+    end
+
+    local okv, v = pcall(function() return kc.Value end)
+    if okv and want and v == want then return true end
+    local okn, n = pcall(function() return kc.Name end)
+    if okn and type(n) == "string" then
+        local N, L = string.upper(n), string.upper(letter)
+        if N == L then return true end
+        if string.match(N, "%.([%w_]+)$") == L then return true end
+    end
+    return false
+end
+local VK = {
+    F1 = 0x70, F2 = 0x71, F3 = 0x72, F4 = 0x73, F5 = 0x74, F6 = 0x75,
+    F7 = 0x76, F8 = 0x77, F9 = 0x78, F10 = 0x79, F11 = 0x7A, F12 = 0x7B,
+    SPACE = 0x20, LSHIFT = 0xA0, RSHIFT = 0xA1, LCONTROL = 0xA2, RCONTROL = 0xA3,
+    TAB = 0x09, LALT = 0xA4, RALT = 0xA5, BACKSPACE = 0x08, ENTER = 0x0D,
+}
+local function keyDown(letter)
+    if not iskeypressed or not letter then return false end
+    local up = string.upper(tostring(letter))
+    local code = VK[up] or (#up == 1 and string.byte(up) or nil)
+    if not code then return false end
+    local ok, d = pcall(function() return iskeypressed(code) end)
+    return (ok and d) and true or false
+end
+
+_G.SEHUB_HEALTH = 1.0
+SESPAWN("health", function()
+    local last = tick()
+    while _G.SEHUB_GEN == GEN do
+        task.wait(0.05)
+        local now = tick()
+        local dt = now - last
+        last = now
+        local lateMs = (dt - 0.05) * 1000
+        local L = _G.SEHUB_SLOW["scheduler stall"]
+        if not L then
+            L = { n = 0, total = 0, max = 0, over50 = 0, over150 = 0, maxState = "-" }
+            _G.SEHUB_SLOW["scheduler stall"] = L
+        end
+        L.n, L.total = L.n + 1, L.total + lateMs
+        if lateMs > L.max then
+            L.max = lateMs
+            L.maxState = tostring((_G.FARM or {}).State)
+        end
+        if lateMs > 50 then L.over50 = L.over50 + 1 end
+        if lateMs > 150 then L.over150 = L.over150 + 1 end
+
+        local score = 0.05 / math.max(dt, 0.0001)
+        if score > 1 then score = 1 end
+        local blend = (score < _G.SEHUB_HEALTH) and 0.6 or 0.1
+        _G.SEHUB_HEALTH = _G.SEHUB_HEALTH * (1 - blend) + score * blend
+        if _G.SEHUB_HEALTH < 0.05 then _G.SEHUB_HEALTH = 0.05 end
+    end
+end)
+
+local win = Lib:CreateWindow({ title = "Steal An Egg Hub", size = Vector2.new(680, 600) })
+_G.SEHUB_WIN = win
+
+_G.STEAL = _G.STEAL or {}
+local ST = _G.STEAL
+ST.On         = true
+ST.Hold       = 0.0
+ST.Dist       = 15.0
+ST.OFF_HOLD   = 0x120
+ST.OFF_DIST   = 0x128
+ST.OFF_LOS    = 0x135
+ST.NoLOS      = false
+ST.orig       = ST.orig or {}
+ST.origLOS    = ST.origLOS or {}
+ST.doneAt     = ST.doneAt or {}
+ST.suppressed = ST.suppressed or {}
+ST.SUPPRESS_TTL = 1.0
+ST.REPATCH    = 3.0
+ST.sweepN     = 0
+ST.offsetsOk  = true
+ST.patched    = 0
+ST.State      = "Off"
+
+local function promptsNear(pos, radius)
+    local out = {}
+    local r = radius or math.huge
+    local okc, kids = pcall(function() return workspace:GetChildren() end)
+    if okc and kids then
+        for _, c in ipairs(kids) do
+            local okn, nm = pcall(function() return c.Name end)
+            if okn and nm == "SmartPromptPart" then
+                local okp, p = pcall(function() return c.Position end)
+                local d = (okp and p and pos) and (p - pos).Magnitude or 0
+                if not pos or (okp and p and d <= r) then
+                    local okg, sub = pcall(function() return c:GetChildren() end)
+                    if okg and sub then
+                        for _, pr in ipairs(sub) do
+                            local okn, nm2 = pcall(function() return pr.Name end)
+                            if okn and (nm2 == "CarryAreaEgg" or ST.AnyPrompt) then
+                                out[#out + 1] = { p = pr, d = d }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    local folder = workspace:FindFirstChild("AreaEggSlotsClient")
+    if folder then
+        local oks, slots = pcall(function() return folder:GetChildren() end)
+        if oks and slots then
+            for _, m in ipairs(slots) do
+                local hb = m:FindFirstChild("Hitbox")
+                local okp, p = pcall(function() return hb and hb.Position end)
+                local d = (okp and p and pos) and (p - pos).Magnitude or 0
+                if not pos or (okp and p and d <= r) then
+                    local okd, desc = pcall(function() return m:GetDescendants() end)
+                    if okd and desc then
+                        for _, pr in ipairs(desc) do
+                            local okn, nm2 = pcall(function() return pr.Name end)
+                            if okn and (nm2 == "CarryAreaEgg" or ST.AnyPrompt) then
+                                out[#out + 1] = { p = pr, d = d }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    return out
+end
+
+local function promptList()
+    local out = {}
+    local root = myRoot()
+    local pos
+    if root then
+        local okp, p = pcall(function() return root.Position end)
+        if okp then pos = p end
+    end
+    for _, e in ipairs(promptsNear(pos, pos and 400 or nil)) do out[#out + 1] = e.p end
+    return out
+end
+
+local function addrOf(p)
+    local okpar, par = pcall(function() return p.Parent end)
+    if not okpar or par == nil then return nil end
+    local ok, a = pcall(function() return p.Address end)
+    if ok and type(a) == "number" and a > 0x10000 then return a end
+    return nil
+end
+
+local function promptWritable(a)
+    if not a then return false end
+    local okk, k = pcall(function() return memory_read("int", a + 0x124) end)
+    if not okk or k ~= 101 then return false end
+    local ok, h = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
+    if not ok or type(h) ~= "number" then return false end
+    if h ~= h then return false end
+    return h >= 0 and h <= 5.0
+end
+
+local function patchPrompts()
+    if not memory_write or not memory_read then
+        ST.State = "Not supported"
+        return
+    end
+    if not ST.offsetsOk then return end
+    local n = 0
+    ST.sweepN = (ST.sweepN or 0) + 1
+    local verify = (ST.sweepN <= 3) or (ST.sweepN % 20 == 0)
+    local now = tick()
+    for _, p in ipairs(promptList()) do
+        local a = addrOf(p)
+        if a and (now - (ST.doneAt[a] or 0)) < ST.REPATCH then
+            n = n + 1
+            a = nil
+        end
+        if a and not promptWritable(a) then
+            ST.Rejected = (ST.Rejected or 0) + 1
+            a = nil
+        end
+        if a and ST.suppressed[a] and (now - ST.suppressed[a]) < (ST.SUPPRESS_TTL or 1.0) then
+            a = nil
+        end
+        if a then
+            ST.doneAt[a] = now
+            if not ST.orig[a] then
+                local okh, h = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
+                local okd, d = pcall(function() return memory_read("float", a + ST.OFF_DIST) end)
+                if okh and okd then ST.orig[a] = { hold = h, dist = d } end
+            end
+            pcall(function()
+                memory_write("float", a + ST.OFF_HOLD, ST.Hold)
+                memory_write("float", a + ST.OFF_DIST, ST.Dist)
+            end)
+            if ST.NoLOS then
+                if ST.origLOS[a] == nil then
+                    local okl, l = pcall(function() return memory_read("byte", a + ST.OFF_LOS) end)
+                    if okl and type(l) == "number" then ST.origLOS[a] = l end
+                end
+                pcall(function() memory_write("byte", a + ST.OFF_LOS, 0) end)
+            end
+            local okv, h2, okv2, d2 = false, nil, false, nil
+            if verify then
+                okv, h2 = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
+                okv2, d2 = pcall(function() return memory_read("float", a + ST.OFF_DIST) end)
+            end
+            if okv and okv2 and h2 and d2 then
+                if math.abs(h2 - ST.Hold) > 0.01 or math.abs(d2 - ST.Dist) > 0.01 then
+                    ST.offsetsOk = false
+                    ST.State = "Stopped - game updated"
+                    warn("[Steal An Egg] prompt offsets no longer hold their value.")
+                    warn("[Steal An Egg] Roblox has probably reshuffled ProximityPrompt.")
+                    warn(string.format("[Steal An Egg] wrote hold=%.2f dist=%.2f, read back %.2f / %.2f",
+                        ST.Hold, ST.Dist, h2, d2))
+                    warn("[Steal An Egg] Instant Steal disabled rather than writing blind.")
+                    return
+                end
+            end
+            n = n + 1
+        end
+    end
+    if ST.sweepN % 20 == 0 then
+        for addr, at in pairs(ST.doneAt) do
+            if (now - at) > 30 then ST.doneAt[addr] = nil end
+        end
+    end
+    ST.patched = n
+    ST.State = string.format("On - %d prompts", n)
+end
+
+local function nearFrom(shared, pos, radius)
+    if not shared then return promptsNear(pos, radius) end
+    local out = {}
+    for _, e in ipairs(shared) do
+        if e.d <= radius then out[#out + 1] = e end
+    end
+    return out
+end
+
+local function patchNear(pos, radius, shared)
+    if not memory_write or not pos then return 0 end
+    if not ST.On or not ST.offsetsOk then return 0 end
+    local n = 0
+    for _, e in ipairs(nearFrom(shared, pos, radius or 30)) do
+        local a = addrOf(e.p)
+        if a and not promptWritable(a) then
+            ST.Rejected = (ST.Rejected or 0) + 1
+            a = nil
+        end
+        if a and ST.suppressed[a] and (tick() - ST.suppressed[a]) < (ST.SUPPRESS_TTL or 1.0) then
+            a = nil
+        end
+        if a then
+            if not ST.orig[a] then
+                local okh, h = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
+                local okd, dd = pcall(function() return memory_read("float", a + ST.OFF_DIST) end)
+                if okh and okd then ST.orig[a] = { hold = h, dist = dd } end
+            end
+            pcall(function()
+                memory_write("float", a + ST.OFF_HOLD, ST.Hold)
+                memory_write("float", a + ST.OFF_DIST, ST.Dist)
+            end)
+            if ST.NoLOS then
+                if ST.origLOS[a] == nil then
+                    local okl, l = pcall(function() return memory_read("byte", a + ST.OFF_LOS) end)
+                    if okl and type(l) == "number" then ST.origLOS[a] = l end
+                end
+                pcall(function() memory_write("byte", a + ST.OFF_LOS, 0) end)
+            end
+            n = n + 1
+        end
+    end
+    return n
+end
+_G.SEHUB_PATCHNEAR = patchNear
+
+local function suppressOthers(pos, radius, keepPrompt, shared)
+    if not memory_write or not pos then return 0 end
+    if not ST.On or not ST.offsetsOk then return 0 end
+    local list = nearFrom(shared, pos, radius or 25)
+    local keep, keepD = keepPrompt, nil
+    if not keep then
+        for _, e in ipairs(list) do
+            if not keepD or e.d < keepD then keepD, keep = e.d, e.p end
+        end
+    end
+    local n = 0
+    for _, e in ipairs(list) do
+        if e.p ~= keep then
+            local a = addrOf(e.p)
+            if a and not promptWritable(a) then
+                ST.Rejected = (ST.Rejected or 0) + 1
+                a = nil
+            end
+            if a then
+                if not ST.orig[a] then
+                    local okh, h = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
+                    local okd, dd = pcall(function() return memory_read("float", a + ST.OFF_DIST) end)
+                    if okh and okd then ST.orig[a] = { hold = h, dist = dd } end
+                end
+                pcall(function() memory_write("float", a + ST.OFF_DIST, 0.5) end)
+                ST.doneAt[a] = nil
+                ST.suppressed[a] = tick()
+                n = n + 1
+            end
+        end
+    end
+    ST.Suppressed = (ST.Suppressed or 0) + n
+    return n
+end
+_G.SEHUB_SUPPRESS = suppressOthers
+
+local function holdTimeNear(pos, radius, shared)
+    if not memory_read or not pos then return nil end
+    local bestD, bestPrompt
+    for _, e in ipairs(nearFrom(shared, pos, radius or 20)) do
+        if not bestD or e.d < bestD then bestD, bestPrompt = e.d, e.p end
+    end
+    if not bestPrompt then return nil end
+    local okpar, par = pcall(function() return bestPrompt.Parent end)
+    if not okpar or par == nil then return nil end
+    local oka, a = pcall(function() return bestPrompt.Address end)
+    if not oka or type(a) ~= "number" or a <= 0x10000 then return nil end
+    local okh, h = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
+    if okh and type(h) == "number" then return h end
+    return nil
+end
+_G.SEHUB_HOLDTIME = holdTimeNear
+
+local function restorePrompts()
+    if not memory_write then return end
+    local n = 0
+    for _, p in ipairs(promptList()) do
+        local a = addrOf(p)
+        if a and not promptWritable(a) then a = nil end
+        local o = a and ST.orig[a]
+        if a and o then
+            pcall(function()
+                memory_write("float", a + ST.OFF_HOLD, o.hold)
+                memory_write("float", a + ST.OFF_DIST, o.dist)
+            end)
+            n = n + 1
+        end
+        if a and ST.origLOS[a] ~= nil then
+            pcall(function() memory_write("byte", a + ST.OFF_LOS, ST.origLOS[a]) end)
+        end
+    end
+    ST.State = "Off"
+    return n
+end
+_G.SEHUB_RESTORE = restorePrompts
+
+local farm = win:Tab("Auto Farm", "target")
+local main = win:Tab("Others", "home")
+local stealSec = main:Section("Instant Steal", "Full")
+stealSec:Label("Grab eggs without holding E.")
+local stealToggle
+stealToggle = stealSec:Toggle("Instant Steal", true, function(v)
+    ST.On = v
+    if v then
+        ST.offsetsOk = true
+        ST.doneAt = {}
+        patchPrompts()
+    else
+        restorePrompts()
+        ST.doneAt = {}
+    end
+end, "Grab eggs instantly. Also stops nearby eggs stealing the grab.")
+ST.ui = stealSec:Label("Off")
+
+local STboot = { Hold = 0, Dist = 5, On = true, NoLOS = true }
+for k, want in pairs(STboot) do
+    if ST[k] ~= want then
+        warn(string.format("[Steal An Egg] menu returned ST.%s=%s - starting at %s",
+            k, tostring(ST[k]), tostring(want)))
+        ST[k] = want
+    end
+end
+if stealToggle then pcall(function() stealToggle:Set(ST.On) end) end
+if ST.On then pcall(patchPrompts) end
+
+SESPAWN("prompt patch", function()
+    while _G.SEHUB_GEN == GEN do
+        local t0 = tick()
+        local F = _G.FARM
+        if ST.On and ST.offsetsOk and not (F and F.On and F.hasEgg) then patchPrompts() end
+        PROFTICK("prompt patch", t0)
+        task.wait(0.75)
+    end
+end)
+
+_G.MOVE = _G.MOVE or {}
+local MV = _G.MOVE
+MV.Fly      = false
+MV.State    = "off"
+
+_G.ABOSS = _G.ABOSS or {}
+local AB = _G.ABOSS
+AB.Zone   = CFrame.new(537.9755, 70.5763, -371.0225)
+AB.Count  = 1
+AB.RetryGap = 0
+AB.Teleports = 1
+AB.Hold   = 0.35
+AB.Delay  = 0.005
+AB.HoldFor = 6
+AB.Key    = "F1"
+AB.State  = AB.Zone and "Ready" or "No safe zone set"
+
+local ESC_MAXHOP = 100
+
+local PLAY_FALLBACK = { minx = 591, maxx = 4805, minz = -413, maxz = -311 }
+local PLAY_CACHE, PLAY_AT = nil, 0
+local function playBounds()
+    if PLAY_CACHE and (tick() - PLAY_AT) < 30 then return PLAY_CACHE end
+    local b, n = { minx = 1e9, maxx = -1e9, minz = 1e9, maxz = -1e9 }, 0
+    local okS, slots = pcall(function() return _G.SEHUB_SLOTS and _G.SEHUB_SLOTS() or {} end)
+    if okS and slots then
+        for _, e in ipairs(slots) do
+            local p = e.pos
+            if p then
+                n = n + 1
+                if p.X < b.minx then b.minx = p.X end
+                if p.X > b.maxx then b.maxx = p.X end
+                if p.Z < b.minz then b.minz = p.Z end
+                if p.Z > b.maxz then b.maxz = p.Z end
+            end
+        end
+    end
+    if n < 8 then b = PLAY_FALLBACK end
+    PLAY_CACHE = { minx = b.minx + 10, maxx = b.maxx - 10,
+                   minz = b.minz + 10, maxz = b.maxz - 10 }
+    PLAY_AT = tick()
+    return PLAY_CACHE
+end
+_G.SEHUB_PLAYBOUNDS = function() return playBounds() end
+
+_G.SEHUB_HIST = _G.SEHUB_HIST or {}
+local function histPush(p)
+    local H = _G.SEHUB_HIST
+    H[#H+1] = { t = tick(), x = p.X, z = p.Z }
+    while #H > 40 and (tick() - H[1].t) > 1.2 do table.remove(H, 1) end
+end
+_G.SEHUB_HISTPUSH = histPush
+local function movedWithin(secs)
+    local H = _G.SEHUB_HIST
+    local newest = H[#H]
+    if not newest then return 0, 0 end
+    local now = tick()
+    local oldest = H[1]
+    for i = #H, 1, -1 do
+        if (now - H[i].t) >= secs then oldest = H[i] break end
+    end
+    local span = newest.t - oldest.t
+    if span <= 0.01 then return 0, 0 end
+    return math.sqrt((newest.x-oldest.x)^2 + (newest.z-oldest.z)^2), span
+end
+_G.SEHUB_MOVEDIN = movedWithin
+
+local lastHopAt = 0
+local HOP_RETRY = { 0.70, 0.45, 0.25 }
+local function hopToward(tx, tz, why)
+    if (tick() - lastHopAt) < (AB.HopGap or 1.0) then return false end
+    local root = myRoot()
+    if not root then return false end
+    local okp, me = pcall(function() return root.Position end)
+    if not okp or not me then return false end
+    local dx, dz = tx - me.X, tz - me.Z
+    local m = math.sqrt(dx*dx + dz*dz)
+    if m < 30 then return false end
+    local B = playBounds()
+    local F = _G.FARM or {}
+    local full = math.min(ESC_MAXHOP, m)
+    local function aim(dist)
+        local nx, nz = me.X + (dx/m)*dist, me.Z + (dz/m)*dist
+        if nx < B.minx then nx = B.minx elseif nx > B.maxx then nx = B.maxx end
+        if nz < B.minz then nz = B.minz elseif nz > B.maxz then nz = B.maxz end
+        return nx, nz
+    end
+    local used, span = movedWithin(0.6)
+    if span > 0.05 then
+        local allowance = (290 * span) - used - 25
+        if allowance < full then full = allowance end
+        if full < 25 then
+            F.HopSkipped = (F.HopSkipped or 0) + 1
+            F.LastHopSkip = string.format("%s: only %.0f studs of budget (used %.0f in %.2fs)",
+                tostring(why), allowance, used, span)
+            return false
+        end
+    end
+    local nx, nz = aim(full)
+    if math.sqrt((nx-me.X)^2 + (nz-me.Z)^2) < 20 then return false end
+
+    lastHopAt = tick()
+    F.HopTried = (F.HopTried or 0) + 1
+    F.LastHeadstart = why
+    F.HopUsedBefore = used
+    local target = CFrame.new(nx, me.Y, nz)
+    pcall(function()
+        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        root.CFrame = target
+    end)
+
+    task.spawn(function()
+        for _ = 1, 2 do
+            local r = myRoot()
+            if r then
+                pcall(function()
+                    r.CFrame = target
+                    r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                end)
+            end
+            task.wait(AB.Delay or 0.005)
+        end
+        local landed, firstTry = false, false
+        for attempt = 0, #HOP_RETRY do
+            task.wait(0.03)
+            local r = myRoot()
+            if not r then return end
+            local okq, p = pcall(function() return r.Position end)
+            if not okq or not p then return end
+            if math.sqrt((p.X-me.X)^2 + (p.Z-me.Z)^2) > 8 then
+                landed, firstTry = true, (attempt == 0)
+                target = CFrame.new(p.X, p.Y, p.Z)
+                break
+            end
+            local f = HOP_RETRY[attempt + 1]
+            if not f then break end
+            local sx, sz = aim(full * f)
+            target = CFrame.new(sx, me.Y, sz)
+            pcall(function()
+                r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                r.CFrame = target
+            end)
+        end
+        F.HopLanded  = (F.HopLanded  or 0) + (landed and 1 or 0)
+        F.HopFirst   = (F.HopFirst   or 0) + (firstTry and 1 or 0)
+        F.HopBlocked = (F.HopBlocked or 0) + (landed and 0 or 1)
+        if landed then
+            for _ = 1, math.max((AB.Count or 5) - 1, 1) do
+                local r = myRoot()
+                if r then
+                    pcall(function() r.CFrame = target end)
+                    pcall(function() r.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+                end
+                task.wait(AB.Delay or 0.005)
+            end
+            task.wait(0.55)
+            local r2 = myRoot()
+            local okp2, p2 = pcall(function() return r2 and r2.Position end)
+            if okp2 and p2 then
+                local still = math.sqrt((p2.X-me.X)^2 + (p2.Z-me.Z)^2)
+                if still > 8 then
+                    F.HopHeld = (F.HopHeld or 0) + 1
+                    F.Headstarts = (F.Headstarts or 0) + 1
+                else
+                    F.HopReverted = (F.HopReverted or 0) + 1
+                    F.LastHopRevert = string.format("%s: hopped %.0f, back to %.0f after 0.6s (used %.0f before)",
+                        tostring(why), full, still, F.HopUsedBefore or -1)
+                end
+            end
+        end
+    end)
+    return true
+end
+_G.SEHUB_HOP = function(tx, tz, why) return hopToward(tx, tz, why) end
+
+local function nearestGuardPos(me)
+    local bx, bz, bd = nil, nil, 1e9
+    for _, g in ipairs((_G.GUARDS or {}).list or {}) do
+        local okm, mdl = pcall(function() return g.model end)
+        if okm and mdl then
+            local okp, par = pcall(function() return mdl.Parent end)
+            if okp and par then
+                local okr, r = pcall(function() return mdl:FindFirstChild("HumanoidRootPart") end)
+                local okq, p = pcall(function() return r and r.Position end)
+                if okq and p then
+                    local d = math.sqrt((p.X - me.X)^2 + (p.Z - me.Z)^2)
+                    if d < bd then bd, bx, bz = d, p.X, p.Z end
+                end
+            end
+        end
+    end
+    return bx, bz, bd
+end
+
+local function teleportTo(cf, quiet)
+    if not cf then return end
+    local root = myRoot()
+    if root then
+        local okf, from = pcall(function() return root.Position end)
+        AB.hopFrom, AB.hopTo = okf and from or nil, cf.Position
+        pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+        pcall(function() root.CFrame = cf end)
+    end
+    task.spawn(function()
+        for _ = 1, math.max((AB.Count or 5) - 1, 1) do
+            local r = myRoot()
+            if r then
+                pcall(function() r.CFrame = cf end)
+                pcall(function() r.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+            end
+            task.wait(AB.Delay)
+        end
+    end)
+    AB.lastEscape = tick()
+end
+_G.SEHUB_TELEPORT = teleportTo
+
+do
+    local RS = game:GetService("RunService")
+    if _G.SEHUB_PINCONN then
+        for _, c in ipairs(_G.SEHUB_PINCONN) do pcall(function() c:Disconnect() end) end
+    end
+    local conns = {}
+    local function pinStep(countFrame)
+        if (AB.pinLive or 0) <= tick() or not AB.Zone then return end
+        local r = myRoot()
+        if not r then return end
+        if countFrame then
+            local okq, p = pcall(function() return r.Position end)
+            if okq and p and math.sqrt((p.X - AB.Zone.X) ^ 2 + (p.Z - AB.Zone.Z) ^ 2) < 25 then
+                AB.pinFrames = (AB.pinFrames or 0) + 1
+            end
+        end
+        pcall(function()
+            r.CFrame = AB.Zone
+            r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        end)
+        AB.pinWrites = (AB.pinWrites or 0) + 1
+    end
+    pcall(function()
+        conns[#conns + 1] = RS.Stepped:Connect(function()
+            if _G.SEHUB_GEN == GEN then pinStep(true) end
+        end)
+    end)
+    pcall(function()
+        conns[#conns + 1] = RS.Heartbeat:Connect(function()
+            if _G.SEHUB_GEN == GEN then pinStep(false) end
+        end)
+    end)
+    _G.SEHUB_PINCONN = conns
+end
+
+local function gotoZone(quiet)
+    if not AB.Zone then
+        if not quiet then notify("Anti-Boss", "Set a safe zone first", 2) end
+        AB.State = "No safe zone set"
+        return
+    end
+    local root = myRoot()
+    if not root then return end
+    local okp, me = pcall(function() return root.Position end)
+    if not okp or not me then return end
+    local dHome = math.sqrt((AB.Zone.X - me.X)^2 + (AB.Zone.Z - me.Z)^2)
+    AB.hopFrom, AB.hopTo = me, AB.Zone.Position
+
+    pcall(function()
+        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+        root.CFrame = AB.Zone
+    end)
+    AB.Hops = (AB.Hops or 0) + 1
+    AB.pinning, AB.pinAt = true, tick()
+    local nTel = math.max(AB.Teleports or 1, 1)
+    local hold = math.max(AB.Hold or 0.03, 0.03)
+    local gap = AB.RetryGap or 0
+    AB.pinUntil = tick() + nTel * (hold + gap + 0.05) + 1
+
+    task.spawn(function()
+        local frames0, writes0 = AB.pinFrames or 0, AB.pinWrites or 0
+        local hooked = #(_G.SEHUB_PINCONN or {}) > 0
+        local done = 0
+        for i = 1, nTel do
+            local tEnd = tick() + hold
+            AB.pinLive = tEnd
+            repeat
+                if not hooked then
+                    local r = myRoot()
+                    if r then
+                        pcall(function()
+                            r.CFrame = AB.Zone
+                            r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                        end)
+                    end
+                end
+                task.wait(0.03)
+            until tick() >= tEnd
+            done = i
+            if i < nTel and gap > 0 then
+                AB.pinLive = 0
+                task.wait(math.max(gap, 0.03))
+            end
+        end
+        AB.pinLive = 0
+        local frames = (AB.pinFrames or 0) - frames0
+        local writes = (AB.pinWrites or 0) - writes0
+        local reached = frames >= ((dHome <= ESC_MAXHOP) and 3 or 2)
+        AB.ExtraDone = math.max(0, done - 1)
+        AB.pinning = false
+        AB.Touches = (AB.Touches or 0) + (reached and 1 or 0)
+        AB.Missed  = (AB.Missed  or 0) + (reached and 0 or 1)
+        AB.Tries   = (AB.Tries   or 0) + done
+        AB.LastTouch = string.format("%s: %d teleports, %d writes, %d frames at the zone (from %.0f studs)",
+            reached and "TOUCHED" or "MISSED", done, writes, frames, dHome)
+    end)
+    AB.lastEscape = tick()
+    lastHopAt = tick()
+    AB.LastHow = "Escaped"
+    AB.State = AB.LastHow
+    if not quiet then notify("Anti-Boss", "Escaped", 2, "good") end
+end
+
+_G.SEHUB_ESCAPE = function(quiet) return gotoZone(quiet) end
+
+local bossSec = main:Section("Anti-Boss", "Full")
+bossSec:Label("Shake off a boss by touching the safe zone.")
+bossSec:Button("Set Safe Zone", function()
+    local root = myRoot()
+    if not root then
+        notify("Anti-Boss", "Character not found", 2)
+        return
+    end
+    local ok, cf = pcall(function() return root.CFrame end)
+    if ok and cf then
+        AB.Zone = cf
+        local p = cf.Position
+        AB.State = "Safe zone saved"
+        notify("Anti-Boss", "Safe zone saved", 2)
+    else
+        notify("Anti-Boss", "Couldn't read your position", 2, "warn")
+    end
+end, "Save where you're standing as the safe zone.")
+AB.ui = bossSec:Label("Ready")
+AB.keyUi = bossSec:Keybind("Escape Key", "F1", function(k) AB.Key = k end,
+    "Escape to the safe zone.")
+
+do
+    local ok, UIS = pcall(function() return game:GetService("UserInputService") end)
+    if ok and UIS then
+        pcall(function()
+            local conn = UIS.InputBegan:Connect(function(input)
+                if _G.SEHUB_GEN ~= GEN then return end
+                pcall(function()
+                    if keyMatches(input, tostring(AB.Key or "F1")) then gotoZone() end
+                    local kc = input and input.KeyCode
+                    if (kc == 101 or tostring(kc) == "Enum.KeyCode.E") and _G.SEHUB_EPRESS then
+                        _G.SEHUB_EPRESS()
+                    end
+                end)
+            end)
+            _G.SEHUB_CONN = conn
+        end)
+    end
+end
+SESPAWN("escape key", function()
+    local wasDown = false
+    while _G.SEHUB_GEN == GEN do
+        local down = keyDown(tostring(AB.Key or "F1"))
+        if down and not wasDown and AB.Zone then gotoZone() end
+        wasDown = down
+        task.wait(0.05)
+    end
+end)
+
+SESPAWN("move history", function()
+    while _G.SEHUB_GEN == GEN do
+        local r = myRoot()
+        if r then
+            local okp, p = pcall(function() return r.Position end)
+            if okp and p then _G.SEHUB_HISTPUSH(p) end
+        end
+        task.wait(0.05)
+    end
+end)
+
+_G.FARM = _G.FARM or {}
+local FM = _G.FARM
+FM.On        = false
+FM.AvoidPlayers = false
+FM.deliveredTool, FM.pendingSlot, FM.stowPending, FM.ePress = nil, nil, nil, nil
+FM.Speed     = 300
+FM.Stick     = 18
+FM.Reach     = 1.5
+FM.GrabHold  = 1.3
+FM.Fallbacks = 0
+FM.Brake     = 30
+FM.Snap      = 12
+FM.SnapOn    = true
+FM.Snaps     = 0
+FM.Headstart, FM.Headstarts, FM.outboundHop = nil, nil, nil
+FM.Suppress      = true
+FM.BigWidth      = 6
+FM.BigCarrySpeed = 260
+FM.RandomPick    = nil
+FM.carryW        = 1
+FM.AfterSteal = 0.4
+FM.RallyReach = 14
+FM.ZoneReach = 12
+FM.HomeSpread = 8
+FM.SpotReach  = 4
+FM.DepositWait = 20
+FM.BossDist  = -1
+FM.BossSpeed = 0
+FM.depositAt = nil
+FM.Home      = nil
+FM.BossRange   = 300
+FM.BossRangeByArea = { ["Light Dark"] = 800, ["Titan Temple"] = 350 }
+FM.FlingLift   = 75
+FM.needRally = false
+FM.slotCount = nil
+FM.Reloads   = 0
+FM.Cooldown  = 6
+FM.RecoverWait = 0.5
+FM.RetryWindow = 10
+FM.RetryHoldDist = 45
+FM.RetryRange  = 300
+FM.RetryMax    = 0
+FM.EscapesPerWake = 1
+FM.ReEscapeGap    = 0.2
+FM.GrabEscapeDelay = 0.55
+FM.WakeEscape      = false
+FM.RarePri   = false
+FM.randomKey  = nil
+FM.randomArea = nil
+FM.RareWeight = 10000
+FM.SizePri    = false
+FM.SizeWeight = 5000
+FM.rareSet   = {}
+FM.RareCount = 0
+FM.fails     = {}
+FM.banned    = {}
+FM.eggTried  = {}
+FM.eggTriedAt = {}
+
+FM.RiftTargets = {
+    { name = "Cosmic Gecko", area = "Cosmic",      egg = "Galaxy Gecko",
+      rarity = "Legendary", have = 0, need = 1, alts = { "cosmic gecko" } },
+    { name = "Whale Shark",  area = "Abyss Ocean", egg = "Whale Shark",
+      rarity = "Cosmic",    have = 0, need = 1, alts = { "whale shark" } },
+    { name = "Centapede",    area = "Cosmic",      egg = "Centapede",
+      rarity = "Epic",      have = 0, need = 1, alts = { "centapede", "centipede" } },
+}
+FM.RiftRotate = nil
+
+FM.RiftEggAreas = {
+    { name = "Riftborn",       areas = { "Jungle", "Snow", "Volcano", "Abyss Ocean" } },
+    { name = "Riftbeasts",     areas = { "Volcano", "Abyss Ocean", "Prehistoric", "Cosmic" } },
+    { name = "Shattered Rift", areas = { "Prehistoric", "Cosmic", "Cherry Blossom", "Titan Temple" } },
+}
+FM.RiftPick  = {}
+FM.RiftPrio  = true
+FM.RiftBanner = nil
+
+FM.eggName   = {}
+FM.EggIdent  = 0
+FM.EggOdd    = {}
+FM.Rift      = false
+FM.RiftHave  = {}
+FM.RiftState = "Off"
+FM.AutoBoss  = false
+FM.Areas     = {}
+FM.State     = "Off"
+FM.Taken     = 0
+FM.Confirmed = 0
+FM.Misses    = 0
+FM.DeliverSettle = 2.5
+FM.PostDeliver   = 0
+FM.HighlightColour = false
+FM.EscapeCooldown = 0
+FM.ChargeSpeed    = 60
+FM.WakeDelay  = 0
+FM.AreaDelay  = {
+    ["Titan Temple"] = 0.05,
+}
+FM.grabEscaped = false
+FM.visited   = {}
+
+local AREA_GAP = 100
+local AREA_BOUNDS = {
+    { name = "Forest",         minX =  553, maxX =  647 },
+    { name = "Lake",           minX =  653, maxX =  794 },
+    { name = "Desert",         minX =  796, maxX = 1005 },
+    { name = "Jungle",         minX = 1008, maxX = 1240 },
+    { name = "Snow",           minX = 1244, maxX = 1564 },
+    { name = "Volcano",        minX = 1568, maxX = 1950 },
+    { name = "Abyss Ocean",    minX = 1953, maxX = 2379 },
+    { name = "Prehistoric",    minX = 2383, maxX = 2884 },
+    { name = "Cosmic",         minX = 2888, maxX = 3524 },
+    { name = "Cherry Blossom", minX = 3528, maxX = 4264 },
+    { name = "Titan Temple",   minX = 4268, maxX = 5123 },
+    { name = "Angels & Demons", minX = 5127, maxX = 99999 },
+}
+local function nameForX(x)
+    for _, b in ipairs(AREA_BOUNDS) do
+        if x >= b.minX and x <= b.maxX then return b.name end
+    end
+    local best, bd
+    for _, b in ipairs(AREA_BOUNDS) do
+        local mid = (b.minX + b.maxX) / 2
+        local d = math.abs(x - mid)
+        if not bd or d < bd then bd, best = d, b.name end
+    end
+    return best or "Other"
+end
+
+local EGG_CACHE, EGG_CACHE_AT = nil, 0
+local function eggSlots(maxAge)
+    local age = maxAge or 0.25
+    if EGG_CACHE and (tick() - EGG_CACHE_AT) < age then return EGG_CACHE end
+    local out = {}
+    local folder = workspace:FindFirstChild("AreaEggSlotsClient")
+    if not folder then return out end
+    local okc, kids = pcall(function() return folder:GetChildren() end)
+    if not okc or not kids then return out end
+    for _, m in ipairs(kids) do
+        local hb = m:FindFirstChild("Hitbox")
+        local okp, p = pcall(function() return hb and hb.Position end)
+        if okp and p then
+            local w = 1
+            local oks, s = pcall(function() return hb.Size end)
+            if oks and s then w = math.max(s.X, s.Z) end
+            out[#out + 1] = { pos = p, model = m, w = w }
+        end
+    end
+    EGG_CACHE, EGG_CACHE_AT = out, tick()
+    return out
+end
+local function eggSlotsInvalidate() EGG_CACHE, EGG_CACHE_AT = nil, 0 end
+_G.SEHUB_SLOTS = eggSlots
+_G.SEHUB_SLOTSINV = eggSlotsInvalidate
+
+local function slotAt(pos)
+    local folder = workspace:FindFirstChild("AreaEggSlotsClient")
+    if not folder or not pos then return nil end
+    local okc, kids = pcall(function() return folder:GetChildren() end)
+    if not okc or not kids then return nil end
+    for _, m in ipairs(kids) do
+        local hb = m:FindFirstChild("Hitbox")
+        local okp, p = pcall(function() return hb and hb.Position end)
+        if okp and p and (p - pos).Magnitude < 1 then return m end
+    end
+    return nil
+end
+
+local function slotStillAt(pos)
+    if not pos then return true end
+    for _, sl in ipairs(eggSlots(0.05)) do
+        if math.abs(sl.pos.X - pos.X) < 2 and math.abs(sl.pos.Z - pos.Z) < 2 then return true end
+    end
+    return false
+end
+
+local function slotNameStill(name)
+    if not name then return nil end
+    local folder = workspace:FindFirstChild("AreaEggSlotsClient")
+    local okc, kids = pcall(function() return folder and folder:GetChildren() end)
+    if not okc or not kids then return nil end
+    for _, m in ipairs(kids) do
+        local okn, n = pcall(function() return m.Name end)
+        if okn and n == name then return true end
+    end
+    return false
+end
+
+local function grabStillThere()
+    local FMx = _G.FARM
+    local byName = slotNameStill(FMx.pendingSlotName)
+    if byName ~= nil then return byName end
+    return slotStillAt(FMx.carryPos)
+end
+
+local function isNewSlot(sl, before)
+    for _, b in ipairs(before or {}) do
+        if math.abs(sl.pos.X - b.pos.X) < 1 and math.abs(sl.pos.Z - b.pos.Z) < 1 then return false end
+    end
+    return true
+end
+
+local function slotGone(m)
+    if not m then return false end
+    local ok, parent = pcall(function() return m.Parent end)
+    if not ok then return true end
+    if parent == nil then return true end
+    return m:FindFirstChild("Hitbox") == nil
+end
+
+local function buildAreas()
+    local pts = {}
+    for _, e in ipairs(eggSlots()) do pts[#pts + 1] = e.pos end
+    if #pts == 0 then return {} end
+    table.sort(pts, function(a, b) return a.X < b.X end)
+    local groups, cur = {}, { pts[1] }
+    for i = 2, #pts do
+        if (pts[i].X - pts[i - 1].X) > AREA_GAP then
+            groups[#groups + 1] = cur
+            cur = {}
+        end
+        cur[#cur + 1] = pts[i]
+    end
+    groups[#groups + 1] = cur
+    local out = {}
+    for _, g in ipairs(groups) do
+        local sum = Vector3.new(0, 0, 0)
+        for _, p in ipairs(g) do sum = sum + p end
+        local centre = sum / #g
+        out[#out + 1] = { centre = centre, n = #g, name = nameForX(centre.X) }
+    end
+    return out
+end
+
+_G.FARM = _G.FARM or {}
+_G.FARM.areaList = buildAreas()
+
+local function homePos()
+    local z = _G.ABOSS and _G.ABOSS.Zone
+    local ok, p = pcall(function() return z and z.Position end)
+    return (ok and p) or nil
+end
+
+local pickHomeSpot
+do
+    local lastSpot
+    function pickHomeSpot()
+        local h = homePos()
+        if not h then return nil end
+        local spread = FM.HomeSpread or 8
+        local traps = trapPositions()
+        for _ = 1, 12 do
+            local ang = math.random() * math.pi * 2
+            local r = 2 + math.random() * math.max(0, spread - 2)
+            local x, z = h.X + math.cos(ang) * r, h.Z + math.sin(ang) * r
+            local ok = not (lastSpot and ((lastSpot.X - x) ^ 2 + (lastSpot.Z - z) ^ 2) < 9)
+            if ok then
+                for _, t in ipairs(traps) do
+                    if ((t.X - x) ^ 2 + (t.Z - z) ^ 2) < 64 then ok = false break end
+                end
+            end
+            if ok then
+                lastSpot = Vector3.new(x, h.Y, z)
+                return lastSpot
+            end
+        end
+        return h
+    end
+end
+_G.SEHUB_HOMESPOT = pickHomeSpot
+
+local function areaOf(pos)
+    return nameForX(pos.X)
+end
+
+local lastJumpAt = 0
+local function isRagdolled()
+    local root = myRoot()
+    if not root then return false end
+    local ok, v = pcall(function() return root.AssemblyLinearVelocity end)
+    if not ok or not v then return false end
+    if _G.MOVE and _G.MOVE.Fly then return false end
+    if iskeypressed then
+        local okk, down = pcall(function() return iskeypressed(0x20) end)
+        if okk and down then lastJumpAt = tick() end
+    end
+    if (tick() - lastJumpAt) < 1.0 then return false end
+    return v.Y > (_G.FARM.FlingLift or 75)
+end
+
+_G.GUARDS = _G.GUARDS or { list = {}, at = 0 }
+local GU = _G.GUARDS
+
+local function refreshGuards()
+    local obj = workspace:FindFirstChild("__OBJECTS")
+    local areas = obj and obj:FindFirstChild("Areas")
+    local ga = areas and areas:FindFirstChild("GuardAreas")
+    if not ga then return end
+    local okc, kids = pcall(function() return ga:GetChildren() end)
+    if not okc or not kids then return end
+    local out = {}
+    for _, areaModel in ipairs(kids) do
+        local g = areaModel:FindFirstChild("Guard")
+        if g then
+            out[#out + 1] = { model = g, area = tostring(areaModel.Name) }
+        end
+    end
+    if #out > 0 then GU.list = out end
+end
+
+local function guardAlive(g)
+    if not g or not g.model then return false end
+    local ok, par = pcall(function() return g.model.Parent end)
+    return ok and par ~= nil
+end
+
+local function wakingGuardNear(me)
+    local bestD, bestArea, bestP
+    for _, g in ipairs(GU.list or {}) do
+        if guardAlive(g) then
+            local okr, r = pcall(function() return g.model:FindFirstChild("HumanoidRootPart") end)
+            local okp, p = pcall(function() return r and r.Position end)
+            if okp and p then
+                local dist = (p - me).Magnitude
+                local range = (FM.BossRangeByArea and FM.BossRangeByArea[g.area]) or FM.BossRange or 300
+                if dist < range * 2 then
+                    local okh, hl = pcall(function()
+                        return g.model:FindFirstChild("GuardWakeHighlight")
+                    end)
+                    if okh and hl then
+                        if dist < range then
+                            if not bestD or dist < bestD then bestD, bestArea, bestP = dist, g.area, p end
+                        else
+                            FM.WakeOutOfRange = string.format("%s woke %.0f studs away (range %d)",
+                                tostring(g.area), dist, range)
+                            FM.WakeOutOfRangeAt = tick()
+                            FM.WakeMissByArea = FM.WakeMissByArea or {}
+                            local prev = FM.WakeMissByArea[g.area]
+                            if not prev or dist > prev.dist then
+                                FM.WakeMissByArea[g.area] = { dist = dist, range = range, at = tick() }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    if bestD then return true, bestArea, bestD, bestP end
+    return false
+end
+
+local function guardLikelyMine(guardPos, mePos)
+    if not guardPos or not mePos then return true end
+    local mine = (guardPos - mePos).Magnitude
+    local okp, plrs = pcall(function()
+        local P = game:GetService("Players")
+        return P and P:GetPlayers()
+    end)
+    if not okp or not plrs then return true end
+    local lp = localPlayer()
+    for _, pl in ipairs(plrs) do
+        if pl ~= lp then
+            local okc, p = pcall(function()
+                local ch = pl.Character
+                local r = ch and ch:FindFirstChild("HumanoidRootPart")
+                return r and r.Position
+            end)
+            if okc and p and (guardPos - p).Magnitude < (mine - 15) then return false end
+        end
+    end
+    return true
+end
+
+local function guardRootPos(areaName)
+    if not areaName then return nil end
+    local ws = workspace or game:GetService("Workspace")
+    local o = ws and ws:FindFirstChild("__OBJECTS")
+    local a = o and o:FindFirstChild("Areas")
+    local ga = a and a:FindFirstChild("GuardAreas")
+    local am = ga and ga:FindFirstChild(areaName)
+    local g = am and am:FindFirstChild("Guard")
+    if not g then return nil end
+    local okp, par = pcall(function() return g.Parent end)
+    if not okp or par == nil then return nil end
+    local okr, p = pcall(function()
+        local r = g:FindFirstChild("HumanoidRootPart")
+        return r and r.Position
+    end)
+    return (okr and p) or nil
+end
+
+local MOTION_WAKE_AREAS = { ["Light Dark"] = true }
+local MOTION_STATE = {}
+local MOTION_SLOW = 30
+local function motionWakeNear(me)
+    local now = tick()
+    for area in pairs(MOTION_WAKE_AREAS) do
+        local st = MOTION_STATE[area] or {}
+        MOTION_STATE[area] = st
+        local gp = guardRootPos(area)
+        if not gp then
+            st.pos = nil
+        else
+            if st.pos and st.t and now > st.t then
+                local dt = now - st.t
+                local vx, vz = (gp.X - st.pos.X) / dt, (gp.Z - st.pos.Z) / dt
+                local sp = math.sqrt(vx * vx + vz * vz)
+                if sp > 400 then
+                    st.slowStart, st.lastSlow = nil, nil
+                elseif sp < MOTION_SLOW then
+                    if not st.lastSlow or (now - st.lastSlow) > 0.75 then st.slowStart = now end
+                    st.lastSlow = now
+                    st.fired = false
+                elseif not st.fired and st.slowStart and st.lastSlow
+                       and (st.lastSlow - st.slowStart) >= 1.0 and (now - st.lastSlow) <= 1.0 then
+                    local dist = (gp - me).Magnitude
+                    local range = (FM.BossRangeByArea and FM.BossRangeByArea[area]) or FM.BossRange or 300
+                    local tx, tz = me.X - gp.X, me.Z - gp.Z
+                    local tl = math.sqrt(tx * tx + tz * tz)
+                    local toward = tl > 0.01 and (vx * tx + vz * tz) / tl or 0
+                    if sp >= (FM.ChargeSpeed or 60) and toward >= 0.6 * sp and dist < range then
+                        st.fired = true
+                        st.pos, st.t = gp, now
+                        return true, area, dist, gp, toward
+                    end
+                end
+            end
+            st.pos, st.t = gp, now
+        end
+    end
+    return false
+end
+
+local function carryingEgg() return false end
+
+local function farmTargets()
+    local out = {}
+    for _, e in ipairs(eggSlots()) do
+        out[#out + 1] = { pos = e.pos, area = areaOf(e.pos), model = e.model, w = e.w }
+    end
+    return out
+end
+
+local RARITY_RANK = {
+    common = 1, uncommon = 2, rare = 3, epic = 4, legendary = 5,
+    mythic = 6, mythical = 6, cosmic = 7, secret = 8, eternal = 9, divine = 10,
+}
+
+local AREA_TIER = {
+    ["Forest"]         = { "Common", "Common", "Uncommon", "Rare", "Rare", "Epic", "Epic", "Legendary" },
+    ["Lake"]           = { "Common", "Common", "Uncommon", "Rare", "Epic", "Epic", "Legendary", "Cosmic" },
+    ["Desert"]         = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic", "Mythic", "Cosmic" },
+    ["Jungle"]         = { "Rare", "Rare", "Epic", "Legendary", "Legendary", "Mythic", "Mythic", "Secret" },
+    ["Snow"]           = { "Rare", "Epic", "Legendary", "Mythic", "Mythic", "Cosmic", "Secret", "Eternal" },
+    ["Volcano"]        = { "Rare", "Epic", "Legendary", "Legendary", "Mythic", "Secret", "Eternal", "Eternal" },
+    ["Abyss Ocean"]    = { "Rare", "Epic", "Legendary", "Mythic", "Cosmic", "Cosmic", "Secret", "Eternal" },
+    ["Prehistoric"]    = { "Rare", "Legendary", "Mythic", "Cosmic", "Cosmic", "Secret", "Secret", "Eternal" },
+    ["Cosmic"]         = { "Epic", "Legendary", "Mythic", "Cosmic", "Secret", "Secret", "Eternal", "Divine" },
+    ["Cherry Blossom"] = { "Epic", "Legendary", "Mythic", "Cosmic", "Cosmic", "Secret", "Eternal", "Divine" },
+    ["Titan Temple"]   = { "Legendary", "Legendary", "Mythic", "Cosmic", "Cosmic", "Secret", "Eternal", "Divine" },
+    ["Angels & Demons"] = { "Legendary", "Mythic", "Cosmic", "Cosmic", "Secret", "Secret", "Eternal", "Divine" },
+}
+
+local EGG_RARITY = {
+    ["Chicken"] = "Common", ["Dog"] = "Common", ["Burrowing Owl"] = "Rare",
+    ["Raccoon"] = "Rare", ["Bear"] = "Epic", ["Mire Fox"] = "Epic",
+    ["Brr Brr Patapim"] = "Legendary",
+    ["Frog"] = "Common", ["Duckling"] = "Common", ["Catfish"] = "Uncommon",
+    ["Turtle"] = "Rare", ["Trulimero Trulicina"] = "Epic", ["Swan"] = "Epic",
+    ["Dream Axolotl"] = "Legendary",
+    ["Jerboa"] = "Common", ["FennecFox"] = "Uncommon", ["Camel"] = "Rare",
+    ["Tob Tobi Tob Tob"] = "Epic", ["Rattlesnake"] = "Legendary",
+    ["Sand Spider"] = "Mythic", ["DeathstalkerScorpion"] = "Mythic",
+    ["Chimpanzee"] = "Rare", ["Toucan"] = "Rare", ["Crocodile"] = "Epic",
+    ["Gorilla"] = "Legendary", ["Orangutini Ananassini"] = "Legendary",
+    ["Spider"] = "Mythic", ["Tiger"] = "Mythic",
+    ["Penguin"] = "Rare", ["Walrus"] = "Epic", ["Polar Bear"] = "Legendary",
+    ["Sabertooth Tiger"] = "Mythic", ["Mammoth"] = "Mythic",
+    ["Colossal Mammoth"] = "Cosmic", ["Yeti"] = "Secret", ["Ice Dragon"] = "Eternal",
+    ["Ash Gecko"] = "Rare", ["Lava frog"] = "Epic", ["Flaming Bull"] = "Legendary",
+    ["Lava Iguana"] = "Legendary", ["Chillin Chilli"] = "Mythic", ["Cerberus"] = "Secret",
+    ["Ascended Vermilion Phoenix"] = "Eternal",
+    ["Parrotfish"] = "Rare", ["Swordfish"] = "Epic", ["Shark"] = "Legendary",
+    ["Orca"] = "Mythic", ["Whale Shark"] = "Cosmic", ["Belula Beluga"] = "Cosmic",
+    ["Kraken"] = "Secret", ["El Maja"] = "Eternal",
+    ["Dodo"] = "Rare", ["Pterodactyl"] = "Legendary", ["Ankylosaurus"] = "Mythic",
+    ["Triceratops"] = "Cosmic", ["Bronto"] = "Cosmic", ["TyrannosaurusRex"] = "Secret",
+    ["Tralaledon"] = "Secret", ["Mosasaurus"] = "Eternal",
+    ["Centapede"] = "Epic", ["Galaxy Gecko"] = "Legendary", ["Cyclops Gorilla"] = "Mythic",
+    ["La Vacca Saturno Saturnita"] = "Cosmic", ["Alien Skeleton Boss"] = "Secret",
+    ["Eternal Lunar Dragon"] = "Eternal", ["Unicorn"] = "Divine",
+    ["Crane"] = "Epic", ["Salamander"] = "Legendary", ["Red Panda"] = "Mythic",
+    ["Snowy Owl"] = "Cosmic", ["Koi"] = "Cosmic", ["Stag"] = "Secret",
+    ["Oni Tiger"] = "Eternal", ["Kitsune"] = "Divine",
+    ["Dove"] = "Legendary", ["Lamb"] = "Mythic",
+    ["Moth"] = "Cosmic", ["Peacock"] = "Cosmic",
+    ["Jellyfish"] = "Secret", ["Centaur"] = "Secret",
+    ["Pegasus"] = "Eternal", ["ArchAngel"] = "Divine",
+    ["Flame Sprite"] = "Legendary", ["Toro"] = "Mythic",
+    ["Imp"] = "Cosmic", ["Demon Hound"] = "Cosmic",
+    ["Gargoyle"] = "Secret", ["RazorFang"] = "Secret",
+    ["Skeleton Horse"] = "Eternal", ["World Burner"] = "Divine",
+    ["Kaiju Spider"] = "Legendary", ["Crab"] = "Legendary",
+    ["Blade Head"] = "Mythic", ["Mantis"] = "Cosmic",
+    ["Rhino"] = "Cosmic",
+}
+
+local INDEX_FILE = "sehub_petindex.lua"
+_G.SEHUB_INDEXSLOT = _G.SEHUB_INDEXSLOT or {}
+local INDEX_SLOT = _G.SEHUB_INDEXSLOT
+
+if not next(INDEX_SLOT) and readfile then
+    local ok, src = pcall(readfile, INDEX_FILE)
+    if ok and type(src) == "string" and #src > 0 then
+        local okc, chunk = pcall(loadstring, src)
+        if okc and chunk then
+            local okr, tbl = pcall(chunk)
+            if okr and type(tbl) == "table" then
+                for area, slots in pairs(tbl) do
+                    if type(slots) == "table" then INDEX_SLOT[area] = slots end
+                end
+            end
+        end
+    end
+end
+
+local function saveIndexSlots()
+    if not writefile then return end
+    local parts = { "return {" }
+    for area, slots in pairs(INDEX_SLOT) do
+        parts[#parts + 1] = string.format("[%q]={", area)
+        for tmpl, slot in pairs(slots) do
+            parts[#parts + 1] = string.format("[%q]=%d,", tmpl, slot)
+        end
+        parts[#parts + 1] = "},"
+    end
+    parts[#parts + 1] = "}"
+    pcall(writefile, INDEX_FILE, table.concat(parts))
+end
+
+local function rarityRank(eggName, area)
+    if not eggName then return 0 end
+    local tier = EGG_RARITY[eggName]
+    if not tier then
+        local rest = eggName
+        while not tier do
+            local cut = string.match(rest, "^%S+%s+(.+)$")
+            if not cut then break end
+            rest = cut
+            tier = EGG_RARITY[rest]
+        end
+    end
+    if not tier then
+        local byArea = area and INDEX_SLOT[area]
+        local slot = byArea and byArea[eggName]
+        local tiers = area and AREA_TIER[area]
+        if slot and tiers then tier = tiers[slot] end
+    end
+    if not tier then return 0 end
+    return RARITY_RANK[string.lower(tier)] or 0
+end
+
+local function learnRarity(template, tier)
+    if not template or not tier then return end
+    if not RARITY_RANK[string.lower(tier)] then return end
+    if EGG_RARITY[template] == tier then return end
+    EGG_RARITY[template] = tier
+    _G.FARM.RarityLearned = (_G.FARM.RarityLearned or 0) + 1
+end
+_G.SEHUB_RARITY = function() return EGG_RARITY, RARITY_RANK end
+_G.SEHUB_NOTIER = function()
+    local out = {}
+    for nm in pairs(_G.FARM.NoTier or {}) do out[#out + 1] = nm end
+    table.sort(out)
+    return out
+end
+
+local function alwaysTier(eggName, area)
+    if not eggName then return nil end
+    local tier = EGG_RARITY[eggName]
+    if not tier then
+        local rest = eggName
+        while not tier do
+            local cut = string.match(rest, "^%S+%s+(.+)$")
+            if not cut then break end
+            rest = cut
+            tier = EGG_RARITY[rest]
+        end
+    end
+    if not tier then
+        local byArea = area and INDEX_SLOT[area]
+        local slot = byArea and byArea[eggName]
+        local tiers = area and AREA_TIER[area]
+        if slot and tiers then tier = tiers[slot] end
+    end
+    return tier and string.lower(tier) or nil
+end
+
+local function looksRare(t)
+    if not t or not t.pos then return false end
+    local key = string.format("%d_%d", t.pos.X, t.pos.Z)
+    return (_G.FARM.rareSet or {})[key] == true
+end
+
+local HL_COLOR_OFF = 0xD4
+local function highlightTier(hl)
+    if not hl or not memory_read then return nil end
+    local okp, par = pcall(function() return hl.Parent end)
+    if not okp or par == nil then return nil end
+    local oka, a = pcall(function() return hl.Address end)
+    if not oka or type(a) ~= "number" or a <= 0x10000 then return nil end
+    local okr, r = pcall(function() return memory_read("float", a + HL_COLOR_OFF) end)
+    local okg, g = pcall(function() return memory_read("float", a + HL_COLOR_OFF + 4) end)
+    local okb, b = pcall(function() return memory_read("float", a + HL_COLOR_OFF + 8) end)
+    if not (okr and okg and okb) then return nil end
+    local function unit(v) return type(v) == "number" and v == v and v >= -0.001 and v <= 1.001 end
+    if not (unit(r) and unit(g) and unit(b)) then return nil end
+    if r < 0.35 and g < 0.35 and b < 0.35 then return "secret" end
+    if r > 0.7 and b > 0.6 and g < 0.5 then return "eternal" end
+    if r > 0.7 and g > 0.6 and b < 0.4 then return "divine" end
+    return nil
+end
+_G.SEHUB_HLTIER = highlightTier
+local HL_TIER_CACHE = {}
+
+_G.SEHUB_EGGFP = _G.SEHUB_EGGFP or { fp = nil, at = 0, done = false, stall = 0 }
+local EGG_FP_C = _G.SEHUB_EGGFP
+local EGG_FP = EGG_FP_C.fp
+local EGG_FP_AT, EGG_FP_DONE, EGG_FP_STALL = EGG_FP_C.at, EGG_FP_C.done, EGG_FP_C.stall
+
+local function eggFingerprint(m)
+    if not m then return nil end
+    local okp, par = pcall(function() return m.Parent end)
+    if not okp or par == nil then return nil end
+    local parts = {}
+    local okd, kids = pcall(function() return m:GetDescendants() end)
+    if not okd or not kids then return nil end
+    for _, c in ipairs(kids) do
+        local okn, n = pcall(function() return c.Name end)
+        if okn and n ~= "Hitbox" and n ~= "CustomBoundingBox" then
+            local oks, s = pcall(function() return c.Size end)
+            if oks and s and typeof(s) == "Vector3" and s.X > 0 and s.Y > 0 and s.Z > 0 then
+                parts[#parts + 1] = s
+            end
+        end
+    end
+    if #parts == 0 then return nil end
+    table.sort(parts, function(a, b) return a.X * a.Y * a.Z > b.X * b.Y * b.Z end)
+    local big = parts[1]
+    local k = (big.X * big.Y * big.Z) ^ (1 / 3)
+    if k <= 0 then return nil end
+    local out = {}
+    for i, s in ipairs(parts) do out[i] = { s.X / k, s.Y / k, s.Z / k } end
+    return out
+end
+
+local function eggScore(a, b)
+    if #a ~= #b then return nil end
+    local sum = 0
+    for i = 1, #a do
+        sum = sum + math.abs(a[i][1] - b[i][1])
+              + math.abs(a[i][2] - b[i][2])
+              + math.abs(a[i][3] - b[i][3])
+    end
+    return sum / #a
+end
+
+local function buildEggFingerprints()
+    local nowT = tick()
+    if EGG_FP and EGG_FP_DONE then return EGG_FP end
+    if EGG_FP and (nowT - (EGG_FP_AT or 0)) < 10 then return EGG_FP end
+    local okRS, RS = pcall(function() return game:GetService("ReplicatedStorage") end)
+    if not okRS or not RS then return EGG_FP or {} end
+    local ok, folder = pcall(function()
+        return RS.Assets and RS.Assets.Models and RS.Assets.Models:FindFirstChild("Eggs")
+    end)
+    if not ok or not folder then return EGG_FP or {} end
+    local okc, kids = pcall(function() return folder:GetChildren() end)
+    if not okc or not kids then return EGG_FP or {} end
+    EGG_FP_AT = nowT
+    local built = {}
+    for _, m in ipairs(kids) do
+        local r = eggFingerprint(m)
+        if r then built[#built + 1] = { name = tostring(m.Name), r = r } end
+    end
+    local before = EGG_FP and #EGG_FP or 0
+    if not EGG_FP or #built > #EGG_FP then EGG_FP = built end
+    if #EGG_FP > before then
+        EGG_FP_STALL = 0
+    else
+        EGG_FP_STALL = (EGG_FP_STALL or 0) + 1
+    end
+    EGG_FP_DONE = (#EGG_FP >= #kids) or (EGG_FP_STALL >= 2)
+    EGG_FP_C.fp, EGG_FP_C.at = EGG_FP, EGG_FP_AT
+    EGG_FP_C.done, EGG_FP_C.stall = EGG_FP_DONE, EGG_FP_STALL
+    _G.FARM.EggFP = string.format("%d of %d templates%s", #EGG_FP, #kids,
+        EGG_FP_DONE and "" or " (still loading)")
+    return EGG_FP
+end
+
+local AREA_EGGS = {
+    Cosmic = { "Centapede", "Galaxy Gecko", "Cyclops Gorilla",
+               "La Vacca Saturno Saturnita", "Alien Skeleton Boss",
+               "Eternal Lunar Dragon", "Unicorn" },
+    Volcano = { "Ash Gecko", "Lava frog", "Flaming Bull", "Lava Iguana",
+                "Chillin Chilli", "Cerberus", "Ascended Vermilion Phoenix" },
+    ["Abyss Ocean"] = { "Parrotfish", "Swordfish", "Shark", "Orca", "Whale Shark",
+                        "Belula Beluga", "Kraken" },
+}
+
+local EGG_MAXERR, EGG_MARGIN = 0.01, 0.002
+local function eggNameFor(model, area)
+    local list = buildEggFingerprints()
+    local r = eggFingerprint(model)
+    if not r or #list == 0 then return nil end
+    local fits = {}
+    for _, t in ipairs(list) do
+        local s = eggScore(r, t.r)
+        if s and s <= EGG_MAXERR then fits[#fits + 1] = { name = t.name, s = s } end
+    end
+    if #fits == 0 then return nil end
+    table.sort(fits, function(a, b) return a.s < b.s end)
+    local allow = area and AREA_EGGS[area]
+
+    if #fits == 1 or (fits[2].s - fits[1].s) >= EGG_MARGIN then
+        if allow then
+            local ok = false
+            for _, want in ipairs(allow) do
+                if fits[1].name == want then ok = true break end
+            end
+            if not ok then
+                _G.FARM.EggOdd = _G.FARM.EggOdd or {}
+                _G.FARM.EggOdd[area .. ": " .. fits[1].name] = true
+            end
+        end
+        return fits[1].name
+    end
+
+    if allow then
+        for _, want in ipairs(allow) do
+            for _, c in ipairs(fits) do
+                if c.name == want then return c.name end
+            end
+        end
+    end
+    return nil
+end
+_G.SEHUB_NAMEFOR = function(model, area) return eggNameFor(model, area) end
+_G.SEHUB_FPCOUNT = function() return #buildEggFingerprints() end
+
+local RIFT_GUI = { "RiftTradeIn", "RiftTradeInMain", "SacrificeInputs" }
+
+local RIFT_EGG_ALIAS = {
+    ["cosmic gecko"]        = "Galaxy Gecko",
+    ["lava gecko"]          = "Ash Gecko",
+    ["cosmic gorilla"]      = "Cyclops Gorilla",
+    ["cosmic skeleton"]     = "Alien Skeleton Boss",
+    ["cosmic skeleton boss"] = "Alien Skeleton Boss",
+    ["king mammoth"]        = "Colossal Mammoth",
+    ["beluga whale"]        = "Belula Beluga",
+    ["phoenix"]             = "Ascended Vermilion Phoenix",
+    ["spideron"]            = "Kaiju Spider",
+    ["crustacia"]           = "Crab",
+    ["bladehide"]           = "Blade Head",
+    ["mantaris"]            = "Mantis",
+    ["rhinotaur"]           = "Rhino",
+    ["fox"]                 = "Mire Fox",
+    ["fennec"]              = "FennecFox",
+    ["snake"]               = "Rattlesnake",
+    ["scorpion"]            = "DeathstalkerScorpion",
+    ["axolotl"]             = "Dream Axolotl",
+    ["t-rex"]               = "TyrannosaurusRex",
+    ["trex"]                = "TyrannosaurusRex",
+    ["light dove"]          = "Dove",
+    ["winged lamb"]         = "Lamb",
+    ["sacred moth"]         = "Moth",
+    ["holy peacock"]        = "Peacock",
+    ["pure jellyfish"]      = "Jellyfish",
+    ["lava dragon"]         = "Dragon",
+}
+
+local AREA_DISPLAY = {
+    ["Forest"]         = { "Chicken", "Dog", "Bird", "Burrowing Owl", "Raccoon", "Fox", "Bear", "Brr Brr Patapim" },
+    ["Lake"]           = { "Frog", "Duckling", "Catfish", "Turtle", "Trulimero Trulicina", "Swan", "Axolotl", "Leviathan" },
+    ["Desert"]         = { "Jerboa", "Fennec", "Camel", "Tob Tobi Tob Tob", "Snake", "Sand Spider", "Scorpion", "Royal Sphinx" },
+    ["Jungle"]         = { "Chimpanzee", "Toucan", "Crocodile", "Gorilla", "Orangutini Ananassini", "Spider", "Tiger", "King Snake" },
+    ["Snow"]           = { "Penguin", "Walrus", "Polar Bear", "Sabertooth Tiger", "Mammoth", "King Mammoth", "Yeti", "Ice Dragon" },
+    ["Volcano"]        = { "Lava Gecko", "Lava Frog", "Flaming Bull", "Lava Iguana", "Chillin Chilli", "Cerberus", "Phoenix", "Lava Dragon" },
+    ["Abyss Ocean"]    = { "Parrotfish", "Swordfish", "Shark", "Orca", "Whale Shark", "Beluga Whale", "Kraken", "El Maja" },
+    ["Prehistoric"]    = { "Dodo", "Pterodactyl", "Ankylosaurus", "Triceratops", "Bronto", "T-Rex", "Tralaledon", "Mosasaurus" },
+    ["Cosmic"]         = { "Centapede", "Cosmic Gecko", "Cosmic Gorilla", "La Vacca Saturno Saturnita", "Cosmic Skeleton Boss", "Cosmic Dragon", "Eternal Lunar Dragon", "Unicorn" },
+    ["Cherry Blossom"] = { "Crane", "Salamander", "Red Panda", "Snowy Owl", "Koi", "Stag", "Oni Tiger", "Kitsune" },
+    ["Titan Temple"]   = { "Spideron", "Crustacia", "Bladehide", "Mantaris", "Rhinotaur", "Mutant Shark", "Gorilla King", "Nightflame" },
+    ["Angels & Demons"] = { "Light Dove", "Flame Sprite", "Winged Lamb", "Toro",
+                            "Sacred Moth", "Holy Peacock", "Imp", "Demon Hound",
+                            "Pure Jellyfish", "Centaur", "Gargoyle", "RazorFang",
+                            "Pegasus", "Skeleton Horse", "ArchAngel", "World Burner" },
+}
+
+local function resolveEggTemplate(name, area)
+    if not name then return nil end
+    local alias = RIFT_EGG_ALIAS[string.lower(name)]
+    if alias then name = alias end
+    local RS = game:GetService("ReplicatedStorage")
+    local ok, folder = pcall(function()
+        return RS.Assets and RS.Assets.Models and RS.Assets.Models:FindFirstChild("Eggs")
+    end)
+    if not ok or not folder then return name end
+    local oke, exact = pcall(function() return folder:FindFirstChild(name) end)
+    if oke and exact then return name end
+    local okc, kids = pcall(function() return folder:GetChildren() end)
+    if okc and kids then
+        local want = string.lower(name)
+        for _, t in ipairs(kids) do
+            if string.lower(tostring(t.Name)) == want then return tostring(t.Name) end
+        end
+    end
+
+    local FMx = _G.FARM
+    FMx.EggUnmapped = FMx.EggUnmapped or {}
+    FMx.EggUnmapped[tostring(name) .. (area and (" [" .. area .. "]") or "")] = true
+    return name
+end
+
+local function harvestPetIndex()
+    local lp = localPlayer()
+    local pg = lp and lp:FindFirstChild("PlayerGui")
+    local idx = pg and pg:FindFirstChild("Index")
+    local node = idx
+    for _, step in ipairs({ "Frame", "List", "ScrollingFrame" }) do
+        if not node then return 0 end
+        local ok, nxt = pcall(function() return node:FindFirstChild(step) end)
+        if not ok or not nxt then return 0 end
+        node = nxt
+    end
+    local learned = 0
+    for _, b in ipairs(AREA_BOUNDS) do
+        local area = b.name
+        local f = node:FindFirstChild(area)
+        local pets = f and f:FindFirstChild("Pets")
+        if pets then
+            local slots, order = {}, {}
+            for i = 1, 8 do
+                local e = pets:FindFirstChild("IndexEntry" .. i)
+                local lbl = e and e:FindFirstChild("TextLabel")
+                local ok, t = pcall(function() return lbl and lbl.Text end)
+                if ok and type(t) == "string" and #t > 0 and t ~= "???" then
+                    local tmpl = resolveEggTemplate(t, area)
+                    local RS = game:GetService("ReplicatedStorage")
+                    local okf, folder = pcall(function()
+                        return RS and RS.Assets and RS.Assets.Models
+                               and RS.Assets.Models:FindFirstChild("Eggs")
+                    end)
+                    local real = okf and folder and tmpl and folder:FindFirstChild(tmpl)
+                    if real then
+                        slots[tmpl] = i
+                        order[#order + 1] = tmpl
+                        learned = learned + 1
+                    end
+                end
+            end
+            if next(slots) then
+                INDEX_SLOT[area] = slots
+                AREA_EGGS[area] = order
+            end
+        end
+    end
+    if learned > 0 then saveIndexSlots() end
+    _G.FARM.IndexPets = learned
+    return learned
+end
+_G.SEHUB_INDEX = harvestPetIndex
+
+local function areaEggsFromIndex()
+    local n = 0
+    for area, slots in pairs(INDEX_SLOT) do
+        local order = {}
+        for tmpl, slot in pairs(slots) do order[#order + 1] = { t = tmpl, s = slot } end
+        if #order > 0 then
+            table.sort(order, function(a, b) return a.s < b.s end)
+            local list = {}
+            for _, e in ipairs(order) do list[#list + 1] = e.t end
+            AREA_EGGS[area] = list
+            n = n + #list
+        end
+    end
+    return n
+end
+_G.SEHUB_AREAEGGS = areaEggsFromIndex
+
+local RARE_BY_AREA = {
+    ["Jungle"]          = { secret = { "King Snake" } },
+    ["Snow"]            = { secret = { "Yeti" }, eternal = { "Ice Dragon" } },
+    ["Volcano"]         = { secret = { "Cerberus" }, eternal = { "Phoenix", "Lava Dragon" } },
+    ["Abyss Ocean"]     = { secret = { "Kraken" }, eternal = { "El Maja" } },
+    ["Prehistoric"]     = { secret = { "T-Rex", "Tralaledon" }, eternal = { "Mosasaurus" } },
+    ["Cosmic"]          = { secret = { "Cosmic Skeleton Boss", "Cosmic Dragon" },
+                            eternal = { "Eternal Lunar Dragon" }, divine = { "Unicorn" } },
+    ["Cherry Blossom"]  = { secret = { "Stag" }, eternal = { "Oni Tiger" }, divine = { "Kitsune" } },
+    ["Titan Temple"]    = { secret = { "Mutant Shark" }, eternal = { "Gorilla King" }, divine = { "Nightflame" } },
+    ["Angels & Demons"] = { secret = { "Gargoyle", "RazorFang", "Pure Jellyfish", "Centaur" },
+                            eternal = { "Skeleton Horse", "Pegasus" }, divine = { "World Burner", "ArchAngel" } },
+}
+
+local RARE_SHAPE_PICK = {
+    ["Volcano"] = { eternal = { ["Dragon"] = "Lava Dragon" } },
+    ["Cosmic"]  = { secret  = { ["Dragon"] = "Cosmic Dragon" } },
+}
+
+local RARE_RESOLVED = {}
+local function rareResolve(disp, area)
+    if RARE_RESOLVED[disp] == nil then
+        local ok, t = pcall(resolveEggTemplate, disp, area)
+        RARE_RESOLVED[disp] = (ok and t) or disp
+    end
+    return RARE_RESOLVED[disp]
+end
+local function rareNameByTier(area, tier, shapeName)
+    local row = area and RARE_BY_AREA[area]
+    local names = row and tier and row[tier]
+    if not names then return nil end
+    if #names == 1 then return rareResolve(names[1], area) end
+    local pick = shapeName and RARE_SHAPE_PICK[area] and RARE_SHAPE_PICK[area][tier]
+    local disp = pick and pick[shapeName]
+    if disp then return rareResolve(disp, area) end
+    return nil
+end
+_G.SEHUB_RARENAME = rareNameByTier
+
+local function seedAreaEggs()
+    local kept, dropped = 0, {}
+    for area, names in pairs(AREA_DISPLAY) do
+        local list = {}
+        for _, disp in ipairs(names) do
+            local tmpl = resolveEggTemplate(disp, area)
+            local RS = game:GetService("ReplicatedStorage")
+            local okf, folder = pcall(function()
+                return RS and RS.Assets and RS.Assets.Models
+                       and RS.Assets.Models:FindFirstChild("Eggs")
+            end)
+            if okf and folder and tmpl and folder:FindFirstChild(tmpl) then
+                list[#list + 1] = tmpl
+                kept = kept + 1
+            else
+                dropped[#dropped + 1] = disp
+            end
+        end
+        if #list > 0 then AREA_EGGS[area] = list end
+    end
+    _G.FARM.AreaEggsKept = kept
+    _G.FARM.AreaEggsDropped = dropped
+    return kept
+end
+_G.SEHUB_SEEDAREAS = seedAreaEggs
+seedAreaEggs()
+
+areaEggsFromIndex()
+
+local function riftLabel(parent, ...)
+    local node = parent
+    for _, step in ipairs({ ... }) do
+        if not node then return nil end
+        local ok, nxt = pcall(function() return node:FindFirstChild(step) end)
+        if not ok then return nil end
+        node = nxt
+    end
+    if not node then return nil end
+    local ok, t = pcall(function() return node.Text end)
+    if ok and type(t) == "string" and #t > 0 then return t end
+    return nil
+end
+
+local function readRiftUI()
+    local lp = localPlayer()
+    local node = lp and lp:FindFirstChild("PlayerGui")
+    for _, step in ipairs(RIFT_GUI) do
+        if not node then return nil end
+        local ok, nxt = pcall(function() return node:FindFirstChild(step) end)
+        if not ok or not nxt then return nil end
+        node = nxt
+    end
+    _G.FARM.RiftPanelAt = tick()
+    local out = {}
+    for i = 1, 3 do
+        local ok, inp = pcall(function() return node:FindFirstChild("Input" .. i) end)
+        if ok and inp then
+            local nm = riftLabel(inp, "Empty", "Name")
+            if nm and nm ~= "Pet Name" then
+                local area = riftLabel(inp, "FoundInWorld")
+                if area then area = area:match("%[(.-)%]") end
+                local amt  = riftLabel(inp, "Empty", "Amount")
+                local have, need
+                if amt then have, need = amt:match("^%s*(%d+)%s*/%s*(%d+)") end
+                local tmpl = resolveEggTemplate(nm, area)
+                local known = false
+                do
+                    local RS = game:GetService("ReplicatedStorage")
+                    local okf, folder = pcall(function()
+                        return RS and RS.Assets and RS.Assets.Models
+                               and RS.Assets.Models:FindFirstChild("Eggs")
+                    end)
+                    if okf and folder and tmpl then
+                        known = folder:FindFirstChild(tmpl) ~= nil
+                    end
+                end
+                local tier = riftLabel(inp, "Empty", "Rarity")
+                learnRarity(tmpl, tier)
+                out[#out + 1] = {
+                    name  = nm,
+                    area  = area,
+                    egg   = tmpl,
+                    known = known,
+                    rarity = tier,
+                    have  = tonumber(have) or 0,
+                    need  = tonumber(need) or 1,
+                    alts  = { string.lower(nm) },
+                }
+            end
+        end
+    end
+    if #out == 0 then return nil end
+    return out, (#out == 3)
+end
+_G.SEHUB_RIFTUI = readRiftUI
+
+local function readRiftUIStable()
+    local live, complete = readRiftUI()
+    if not live then return nil end
+    _G.FARM.RiftComplete = complete
+    if complete then return live end
+    local prev = _G.FARM.RiftTargets
+    if prev and #prev >= #live then return nil end
+    return live
+end
+
+local function readRiftBanner()
+    local lp = localPlayer()
+    local t = riftLabel(lp and lp:FindFirstChild("PlayerGui"),
+        "RiftTradeIn", "RiftTradeInMain", "CurrentEggInfoHolder", "EggName")
+    if not t then return nil end
+    t = t:gsub("%s*Banner%s*$", ""):gsub("%s*%(Now%)%s*$", "")
+    if #t == 0 then return nil end
+    return t
+end
+
+local function inferBannerAreas()
+    local FMx = _G.FARM
+    local areas = {}
+    for _, t in ipairs(FMx.RiftTargets or {}) do
+        if t.area then areas[t.area] = true end
+    end
+    if next(areas) == nil then return nil, nil end
+    local fits = {}
+    for _, r in ipairs(FMx.RiftEggAreas or {}) do
+        local set = {}
+        for _, a in ipairs(r.areas) do set[a] = true end
+        local ok = true
+        for a in pairs(areas) do
+            if not set[a] then ok = false break end
+        end
+        if ok then fits[#fits + 1] = r end
+    end
+    if #fits == 0 then return nil, nil end
+    local union, names = {}, {}
+    for _, r in ipairs(fits) do
+        names[#names + 1] = r.name
+        for _, a in ipairs(r.areas) do union[a] = true end
+    end
+    return union, table.concat(names, " or ")
+end
+
+local function riftAreaSet()
+    local FMx = _G.FARM
+    local picked, any = {}, false
+    for _, r in ipairs(FMx.RiftEggAreas or {}) do
+        if FMx.RiftPick[r.name] then
+            any = true
+            for _, a in ipairs(r.areas) do picked[a] = true end
+        end
+    end
+    if any then return picked, "selected" end
+
+    local live = FMx.RiftBanner
+    if live then
+        for _, r in ipairs(FMx.RiftEggAreas or {}) do
+            if r.name:lower() == live:lower() then
+                for _, a in ipairs(r.areas) do picked[a] = true end
+                return picked, "live banner (" .. r.name .. ")"
+            end
+        end
+    end
+
+    local guessed, names = inferBannerAreas()
+    if guessed then
+        FMx.RiftBannerGuess = names
+        return guessed, "banner inferred (" .. names .. ")"
+    end
+    return picked, nil
+end
+
+local function refreshRiftTargets()
+    local live = readRiftUIStable()
+    local lp = localPlayer()
+    _G.FARM.RiftBanner = readRiftBanner() or _G.FARM.RiftBanner
+    _G.FARM.RiftRotate = riftLabel(lp and lp:FindFirstChild("PlayerGui"),
+        "RiftTradeIn", "RiftTradeInMain", "CurrentEggInfoHolder", "RotateTimer")
+    if not live then return false end
+    _G.FARM.RiftTargets = live
+    _G.FARM.RiftReadAt = tick()
+    return true
+end
+
+local function applyRiftAreas()
+    local FMx = _G.FARM
+    if not FMx.Rift then return end
+    local set, source = riftAreaSet()
+    local n = 0
+    for _ in pairs(set) do n = n + 1 end
+    if n == 0 then
+        local all = {}
+        for _, b in ipairs(AREA_BOUNDS) do all[b.name] = true end
+        FMx.Areas = all
+        FMx.RiftAreaNote = "No rift found - farming all areas"
+        return
+    end
+    FMx.Areas = set
+    local list = {}
+    for a in pairs(set) do list[#list + 1] = a end
+    table.sort(list)
+    FMx.RiftAreaNote = tostring(source or "areas") .. ": " .. table.concat(list, ", ")
+end
+_G.SEHUB_RIFTAREAS = applyRiftAreas
+_G.SEHUB_RIFTREFRESH = refreshRiftTargets
+
+local OWNED_CACHE, OWNED_AT = nil, 0
+local function ownedNames()
+    if OWNED_CACHE and (tick() - OWNED_AT) < 1.0 then return OWNED_CACHE end
+    local out = {}
+    local lp = localPlayer()
+    for _, where in ipairs({ lp and lp:FindFirstChild("Backpack"), myCharacter() }) do
+        if where then
+            local okk, kids = pcall(function() return where:GetChildren() end)
+            if okk and kids then
+                for _, c in ipairs(kids) do
+                    local okcl, cl = pcall(function() return c.ClassName end)
+                    if okcl and cl == "Tool" then
+                        local okn, n = pcall(function() return c.Name end)
+                        if okn and type(n) == "string" then
+                            out[#out + 1] = string.lower(n)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    OWNED_CACHE, OWNED_AT = out, tick()
+    return out
+end
+
+local function ownsPet(name)
+    if not name then return false end
+    local want = string.lower(name)
+    for _, n in ipairs(ownedNames()) do
+        if string.find(n, want, 1, true) then return true end
+    end
+    return false
+end
+_G.SEHUB_OWNS = ownsPet
+
+local function riftProgress()
+    local live = readRiftUIStable()
+    if live then
+        _G.FARM.RiftTargets = live
+        _G.FARM.RiftFromUI = true
+    elseif _G.FARM.RiftFromUI then
+        live = _G.FARM.RiftTargets
+    end
+    if live then
+        local have, total, held = 0, 0, {}
+        for _, want in ipairs(live) do
+            total = total + 1
+            local got = (want.have >= want.need) or ownsPet(want.name)
+            held[want.name] = got
+            if got then have = have + 1 end
+        end
+        return have, total, held
+    end
+
+    local lp = localPlayer()
+    local okb, bp = pcall(function() return lp and lp:FindFirstChild("Backpack") end)
+    local held, names = {}, {}
+    if okb and bp then
+        local okc, kids = pcall(function() return bp:GetChildren() end)
+        if okc and kids then
+            for _, d in ipairs(kids) do
+                local okn, nm = pcall(function() return d.Name end)
+                if okn and nm then names[#names + 1] = string.lower(tostring(nm)) end
+            end
+        end
+    end
+    local have, total = 0, 0
+    for _, want in ipairs(_G.FARM.RiftTargets or {}) do
+        total = total + 1
+        local got = false
+        for _, alt in ipairs(want.alts or { string.lower(want.name) }) do
+            for _, nm in ipairs(names) do
+                if string.find(nm, alt, 1, true) then got = true break end
+            end
+            if got then break end
+        end
+        held[want.name] = got
+        if got then have = have + 1 end
+    end
+    return have, total, held
+end
+_G.SEHUB_RIFT = riftProgress
+
+local function sweepEggNames()
+    local prev = _G.FARM.eggName or {}
+    local tried = _G.FARM.eggTried or {}
+    local triedAt = _G.FARM.eggTriedAt or {}
+    local TRY_WINDOW, TRY_SPACING = 25, 2.0
+    local names, seen, ident, fresh = {}, {}, 0, 0
+    for _, e in ipairs(eggSlots()) do
+        local p = e.pos
+        local key = string.format("%d_%d", p.X, p.Z)
+        seen[key] = true
+        local firstSeen = tried[key]
+        if type(firstSeen) ~= "number" then firstSeen = nil end
+        local lastTry = triedAt[key]
+        if type(lastTry) ~= "number" then lastTry = 0 end
+
+        local nm = prev[key]
+        local nowT = tick()
+        local withinWindow = (firstSeen == nil) or ((nowT - firstSeen) < TRY_WINDOW)
+        local spacedOut = (nowT - lastTry) >= TRY_SPACING
+        if nm == nil and withinWindow and spacedOut then
+            local okp, par = pcall(function() return e.model.Parent end)
+            if okp and par ~= nil then
+                fresh = fresh + 1
+                tried[key] = firstSeen or nowT
+                triedAt[key] = nowT
+                nm = eggNameFor(e.model, areaOf(p))
+            end
+        end
+        if nm then
+            names[key] = nm
+            ident = ident + 1
+        end
+    end
+    for key in pairs(tried) do
+        if not seen[key] then tried[key] = nil; triedAt[key] = nil end
+    end
+    if (tick() - (_G.FARM.blockedAt or 0)) > 2.0 then
+        _G.FARM.blockedAt = tick()
+        local slots = eggSlots()
+        local blocked, nblocked = {}, 0
+        for i = 1, #slots do
+            local a = slots[i]
+            local aw = a.w or 1
+            local ax, az = a.pos.X, a.pos.Z
+            for j = 1, #slots do
+                if i ~= j then
+                    local b = slots[j]
+                    local bw = b.w or 1
+                    if bw > aw * 2 then
+                        local reach = bw * 0.5 + 1.5
+                        local dx, dz = ax - b.pos.X, az - b.pos.Z
+                        if (dx * dx + dz * dz) < (reach * reach) then
+                            blocked[string.format("%d_%d", a.pos.X, a.pos.Z)] = true
+                            nblocked = nblocked + 1
+                            break
+                        end
+                    end
+                end
+            end
+        end
+        _G.FARM.eggBlocked, _G.FARM.BlockedNow = blocked, nblocked
+    end
+
+    _G.FARM.eggName, _G.FARM.eggTried, _G.FARM.eggTriedAt = names, tried, triedAt
+    _G.FARM.EggIdent, _G.FARM.EggFresh = ident, fresh
+    return ident
+end
+_G.SEHUB_SWEEP = sweepEggNames
+
+local function notifyRiftSpawns(title)
+    local FMx = _G.FARM
+    local seen = {}
+    for _, nm in pairs(FMx.eggName or {}) do seen[nm] = (seen[nm] or 0) + 1 end
+    local hits, missing = {}, 0
+    for _, t in ipairs(FMx.RiftTargets or {}) do
+        if not (FMx.RiftHave or {})[t.name] then
+            local c = seen[t.egg] or 0
+            if c > 0 then
+                hits[#hits + 1] = string.format("%s x%d", t.name, c)
+            else
+                missing = missing + 1
+            end
+        end
+    end
+    if #hits > 0 then
+        local msg = table.concat(hits, ", ")
+        if missing > 0 then msg = msg .. "  (" .. missing .. " not spawned)" end
+        notify(title or "Rift Farm", msg, 6)
+    else
+        notify(title or "Rift Farm", "No wanted pets spawned yet", 5)
+    end
+end
+
+local function pressE(dur)
+    if not keypress then return end
+    pcall(function()
+        keypress(0x45)
+        task.wait(dur or 0.08)
+        keyrelease(0x45)
+    end)
+end
+
+local farmSec = farm:Section("Farm", "Full")
+farmSec:Label("Runs to eggs and carries them home.")
+local function skipRally()
+    FM.needRally, FM.rallySpot = false, nil
+    if FM.hasEgg and FM.carryPos then
+        local cp = FM.carryPos
+        for _, sl in ipairs(eggSlots()) do
+            if math.sqrt((sl.pos.X - cp.X) ^ 2 + (sl.pos.Z - cp.Z) ^ 2) <= 5 then
+                FM.hasEgg, FM.depositAt, FM.grabbedAt, FM.carryKey, FM.carrySlotGone = false, nil, nil, nil, false
+                break
+            end
+        end
+    end
+    if FM.retryKey and FM.retryPos and not FM.retryUntil then
+        local r = myRoot()
+        local okp, p = pcall(function() return r and r.Position end)
+        local far = (okp and p) and (Vector3.new(FM.retryPos.X, p.Y, FM.retryPos.Z) - p).Magnitude or 0
+        FM.retryUntil = tick() + (FM.RetryWindow or 15) + far / math.max(50, FM.Speed or 290)
+    end
+end
+local farmToggle
+farmToggle = farmSec:Toggle("Auto Farm", false, function(v)
+    FM.On = v
+    if v then
+        skipRally()
+        if not AB.Zone then
+            notify("Auto Farm", "No safe zone set", 4, "warn")
+        end
+        local any = false
+        for _ in pairs(FM.Areas or {}) do any = true break end
+        if not any and not FM.Rift then
+            notify("Auto Farm", "Pick an area first", 4, "warn")
+        end
+    else
+        FM.State = "Off"
+    end
+end, "Farms eggs until you turn it off.")
+farmSec:Toggle("Auto Anti-Boss", false, function(v) FM.AutoBoss = v end,
+    "Escapes a boss that chases you while you carry an egg.")
+farmSec:Toggle("Avoid Players", false, function(v) FM.AvoidPlayers = v end,
+    "Steers around other players, like traps and the boss rift.")
+FM.TreadmillFarm = false
+farmSec:Toggle("Auto Treadmill Farm", false, function(v) FM.TreadmillFarm = v end,
+    "Trains on your treadmill whenever there are no eggs to farm.")
+local rareToggle, sizeToggle
+rareToggle = farmSec:Toggle("Rare Priority", false, function(v)
+    FM.RarePri = v
+    if v and sizeToggle then pcall(function() sizeToggle:Set(false) end) end
+end,
+    "Rarest eggs first. Turns off Size Priority.")
+sizeToggle = farmSec:Toggle("Size Priority", false, function(v)
+    FM.SizePri = v
+    if v and rareToggle then pcall(function() rareToggle:Set(false) end) end
+end,
+    "Biggest eggs first. Turns off Rare Priority.")
+
+local prevAlways = FM.Always
+local RARITY_CHOICES = { "Secret", "Eternal", "Divine" }
+local alwaysDrop = farmSec:Dropdown("Always Target", { "Secret", "Eternal", "Divine" }, RARITY_CHOICES, true, function(sel)
+    local set, n = {}, 0
+    for _, nm in ipairs(sel or {}) do set[string.lower(nm)] = true n = n + 1 end
+    FM.Always, FM.AlwaysN = set, n
+end, "Always go for these rarities first, in any area.")
+do
+    local startSel, set, n = {}, {}, 0
+    for _, nm in ipairs(RARITY_CHOICES) do
+        if not prevAlways or prevAlways[string.lower(nm)] then
+            startSel[#startSel + 1] = nm
+            set[string.lower(nm)] = true
+            n = n + 1
+        end
+    end
+    pcall(function() alwaysDrop:Set(startSel) end)
+    FM.Always, FM.AlwaysN = set, n
+end
+FM.alwaysDrop = alwaysDrop
+
+local ALL_AREAS = "All"
+local areaNames = { ALL_AREAS }
+for _, b in ipairs(AREA_BOUNDS) do areaNames[#areaNames + 1] = b.name end
+local areaDrop = farmSec:Dropdown("Areas", {}, areaNames, true, function(sel)
+    local set, all = {}, false
+    for _, nm in ipairs(sel or {}) do
+        if nm == ALL_AREAS then all = true else set[nm] = true end
+    end
+    if all then
+        set = {}
+        for _, b in ipairs(AREA_BOUNDS) do set[b.name] = true end
+    end
+    FM.Areas, FM.AllAreas = set, all
+end, "Areas to farm. Pick All for the whole map.")
+pcall(function() areaDrop:Set({}) end)
+FM.Areas, FM.AllAreas = {}, false
+FM.areaDrop = areaDrop
+farmSec:Divider()
+farmSec:Slider("Run Speed", 300, 10, 40, 300, " studs/s", function(v) FM.Speed = v end,
+    "How fast you run. 300 is the max.")
+farmSec:Slider("Big Egg Carry Speed", 260, 10, 40, 300, " studs/s", function(v) FM.BigCarrySpeed = v end,
+    "Speed while carrying a big egg. Lower it if you rubber-band.")
+farmSec:Slider("Boss Reset Wait", 0, 0.5, 0, 10, " s", function(v) FM.PostDeliver = v end,
+    "Wait at the safe zone after delivering.")
+farmSec:Slider("Grab Escape Delay", 0.55, 0.05, 0, 1.5, " s", function(v) FM.GrabEscapeDelay = v end,
+    "Escape this long after grabbing an egg. 0 = as soon as the grab registers.")
+FM.ui = farmSec:Label("Off")
+
+for k, want in pairs({ GrabHold = 1.3 }) do
+    if FM[k] ~= want then
+        warn(string.format("[Steal An Egg] menu returned %s=%s - starting at %s",
+            k, tostring(FM[k]), tostring(want)))
+        FM[k] = want
+    end
+end
+
+local riftSec = farm:Section("Auto Rift-Farm", "Full")
+riftSec:Label("Farms the pets your selected rifts need.")
+riftSec:Label("Uses the Auto Farm settings.")
+local riftToggle
+riftToggle = riftSec:Toggle("Auto Rift-Farm", false, function(v)
+    FM.Rift = v
+    if v then
+        refreshRiftTargets()
+        FM.riftPrevAreas = FM.Areas
+        FM.riftStartedFarm = false
+
+        applyRiftAreas()
+        if not FM.On then
+            skipRally()
+            FM.On = true
+            FM.riftStartedFarm = true
+        end
+        FM.RiftState = tostring(FM.RiftAreaNote or "farming")
+        notify("Rift Farm", tostring(FM.RiftAreaNote or "farming"), 4)
+        task.spawn(function()
+            sweepEggNames()
+            notifyRiftSpawns("Rift Farm")
+        end)
+    else
+        local weStarted = FM.riftStartedFarm
+        FM.Areas = FM.riftPrevAreas or {}
+        if weStarted then
+            FM.On = false
+            FM.State = "Off"
+        end
+        FM.riftStartedFarm = false
+        FM.eggName, FM.EggIdent = {}, 0
+        FM.RiftState = "Off"
+        notify("Rift Farm", "Off", 3)
+    end
+end, "Farms the pets the rift needs and starts the farm.")
+
+for _, r in ipairs(FM.RiftEggAreas) do
+    local areas = table.concat(r.areas, ", ")
+    riftSec:Toggle(r.name, false, function(v)
+        FM.RiftPick[r.name] = v or nil
+        applyRiftAreas()
+        if FM.Rift then FM.RiftState = tostring(FM.RiftAreaNote or "farming") end
+    end, "Farm " .. r.name .. " areas: " .. areas .. ". Leave all off to follow the live rift.")
+end
+
+riftSec:Toggle("Prioritize Current Eggs", true, function(v)
+    FM.RiftPrio = v
+end, "Go for the 3 pets the rift wants first. Skips ones you own.")
+
+FM.riftUi = riftSec:Label("Off")
+
+_G.SEHUB_WATCH = { ticks = 0, ragSeen = 0, escapes = 0, blocked = 0, lastRag = "never" }
+local function eggPromptSpots(p, r)
+    local out = {}
+    local okc, kids = pcall(function() return workspace:GetChildren() end)
+    if not okc or not kids then return out end
+    for _, c in ipairs(kids) do
+        local okn, nm = pcall(function() return c.Name end)
+        if okn and nm == "SmartPromptPart" then
+            local okp2, cp = pcall(function() return c.Position end)
+            if okp2 and cp and (not p or math.sqrt((cp.X - p.X) ^ 2 + (cp.Z - p.Z) ^ 2) < r)
+               and c:FindFirstChild("CarryAreaEgg") then
+                out[#out + 1] = cp
+            end
+        end
+    end
+    return out
+end
+
+local function notePress()
+    if FM.ePress and (tick() - FM.ePress.at) < 0.3 then return end
+    local r = myRoot()
+    local okp, p = pcall(function() return r and r.Position end)
+    if not okp or not p then return end
+    local near = {}
+    for _, sl in ipairs(eggSlots(0.05)) do
+        if math.sqrt((sl.pos.X - p.X) ^ 2 + (sl.pos.Z - p.Z) ^ 2) < 10 then near[#near + 1] = sl.pos end
+    end
+    local prompts = eggPromptSpots(p, 10)
+    if #near > 0 or #prompts > 0 then FM.ePress = { at = tick(), near = near, prompts = prompts } end
+end
+_G.SEHUB_EPRESS = notePress
+
+SESPAWN("boss chase watch", function()
+    local hist = {}
+    local ePrevDown = false
+    while _G.SEHUB_GEN == GEN do
+        local __t0 = tick()
+        if (tick() - (GU.at or 0)) > 1.0 then GU.at = tick(); refreshGuards() end
+        local root = myRoot()
+        local pos
+        if root then
+            local okp, p = pcall(function() return root.Position end)
+            if okp then pos = p end
+        end
+        if pos then
+
+            if iskeypressed then
+                local okk, down = pcall(function() return iskeypressed(0x45) end)
+                down = okk and down or false
+                if down and not ePrevDown then notePress() end
+                ePrevDown = down
+            end
+            local EP = FM.ePress
+            if EP and not EP.confirmed then
+                local ageP = tick() - EP.at
+                if ageP > 1.5 then
+                    FM.ePress = nil
+                elseif ageP > 0.03 then
+                    if EP.prompts and #EP.prompts > 0 then
+                        local nowPrompts = eggPromptSpots(nil)
+                        if #nowPrompts > 10 then
+                            for _, pp in ipairs(EP.prompts) do
+                                local still = false
+                                for _, cp in ipairs(nowPrompts) do
+                                    if math.abs(cp.X - pp.X) < 1 and math.abs(cp.Z - pp.Z) < 1 then
+                                        still = true
+                                        break
+                                    end
+                                end
+                                if not still then
+                                    EP.confirmed = true
+                                    FM.grabSeenAt, FM.grabSeenPos = EP.at, pp
+                                    break
+                                end
+                            end
+                        end
+                    end
+                    local nowSlots = eggSlots(0.05)
+                    if not EP.confirmed and #nowSlots > 20 then
+                        for _, np in ipairs(EP.near) do
+                            local still = false
+                            for _, sl in ipairs(nowSlots) do
+                                if math.abs(sl.pos.X - np.X) < 2 and math.abs(sl.pos.Z - np.Z) < 2 then
+                                    still = true
+                                    break
+                                end
+                            end
+                            if not still then
+                                EP.confirmed = true
+                                FM.grabSeenAt, FM.grabSeenPos = EP.at, np
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+            local grabT, grabNest = 0, nil
+            if FM.grabSeenAt then grabT, grabNest = FM.grabSeenAt, FM.grabSeenPos end
+            if FM.On and FM.hasEgg and FM.grabbedAt and FM.grabbedAt > grabT then
+                grabT, grabNest = FM.grabbedAt, FM.carryPos
+            end
+            local preDelay = FM.GrabEscapeDelay or 0
+            if FM.AutoBoss and AB.Zone and grabT > 0
+               and (tick() - grabT) >= preDelay and (tick() - grabT) < preDelay + 1.5
+               and FM.grabEscFor ~= grabT
+               and (AB.lastEscape or 0) < grabT
+               and not (AB.pinning and tick() < (AB.pinUntil or 0)) then
+                FM.grabEscFor, FM.grabEscAt = grabT, tick()
+                gotoZone(true)
+                FM.State = "Escaped on grab"
+                FM.LastEscape = string.format("on grab, %.2fs after pressing", tick() - grabT)
+                FM.LastEscapeAt = tick()
+                FM.grabEscapes = (FM.grabEscapes or 0) + 1
+                FM.wakeAt, FM.wakeArea, FM.BossHunting = nil, nil, nil
+            end
+            local holdForGrab = false
+            if FM.AutoBoss then
+                local t0 = grabT
+                if FM.ePress and FM.ePress.at > t0 then t0 = FM.ePress.at end
+                if t0 > 0 and (tick() - t0) < preDelay + 1.5 and FM.grabEscFor ~= t0
+                   and (AB.lastEscape or 0) < t0 then
+                    holdForGrab = true
+                end
+            end
+            local afterGrabEsc = (tick() - (FM.grabEscAt or 0))
+                < (((FM.EscapesPerWake or 1) > 1) and (FM.ReEscapeGap or 1.0) or 4)
+
+            local waking, area, d, gpos = false, nil, nil, nil
+            local mWake, mArea, mDist, mPos, mToward = false, nil, nil, nil, nil
+            if FM.WakeEscape then
+                waking, area, d, gpos = wakingGuardNear(pos)
+                mWake, mArea, mDist, mPos, mToward = motionWakeNear(pos)
+            elseif FM.wakeAt then
+                FM.wakeAt, FM.wakeArea, FM.BossHunting = nil, nil, nil
+            end
+            local motionToward = nil
+            if not waking and mWake then
+                waking, area, d, gpos = true, mArea, mDist, mPos
+                motionToward = mToward
+                FM.motionWakes = (FM.motionWakes or 0) + 1
+                FM.LastMotionWake = string.format("%s boss charged at %.0f/s from %.0f studs - no glow",
+                    tostring(mArea), mToward or -1, mDist or -1)
+            end
+            if waking and FM.On and not FM.hasEgg then waking = false end
+            if waking and not guardLikelyMine(gpos, pos) then
+                FM.wakeOtherCloser = (FM.wakeOtherCloser or 0) + 1
+            end
+            local cooldown = FM.EscapeCooldown or 0
+            local sinceEsc = tick() - (AB.lastEscape or 0)
+            local justEscaped = sinceEsc < cooldown
+            if waking and not FM.wakeAt and justEscaped and (tick() - (FM.lastBlockedAt or 0)) > 1.0 then
+                FM.lastBlockedAt = tick()
+                FM.escapeBlocked = (FM.escapeBlocked or 0) + 1
+                FM.LastBlocked = string.format("%s guard woke %.1fs after the last escape - held back (window %.1fs)",
+                    tostring(area), sinceEsc, cooldown)
+            end
+            if waking and not FM.wakeAt and not justEscaped then
+                FM.wakeAt = tick()
+                FM.wakeArea = tostring(area)
+                FM.BossDist = d or -1
+                FM.BossHunting = FM.wakeArea
+                FM.chasePrev, FM.chasePrevT, FM.chaseHits, FM.BossToward = nil, nil, 0, nil
+                FM.wakeEscapes = 0
+                if grabT > 0 and (tick() - grabT) < 3 and grabNest and gpos and (AB.lastEscape or 0) < grabT
+                   and math.sqrt((gpos.X - grabNest.X) ^ 2 + (gpos.Z - grabNest.Z) ^ 2) < 300 then
+                    FM.chaseHits = 1
+                    FM.fastWakes = (FM.fastWakes or 0) + 1
+                end
+                if motionToward then FM.chaseHits, FM.BossToward = 1, motionToward end
+            end
+            if FM.wakeAt and FM.On and not FM.hasEgg then
+                FM.wakeAt, FM.wakeArea, FM.BossHunting = nil, nil, nil
+            end
+            if FM.wakeAt then
+                local gp = guardRootPos(FM.wakeArea)
+                local now = tick()
+                if gp and FM.chasePrev and FM.chasePrevT and (now - FM.chasePrevT) >= 0.09 then
+                    local dt = now - FM.chasePrevT
+                    local vx = (gp.X - FM.chasePrev.X) / dt
+                    local vz = (gp.Z - FM.chasePrev.Z) / dt
+                    local tx, tz = pos.X - gp.X, pos.Z - gp.Z
+                    local tl = math.sqrt(tx * tx + tz * tz)
+                    if math.sqrt(vx * vx + vz * vz) > 400 then
+                        FM.chaseHits = 0
+                    elseif tl > 0.01 then
+                        local toward = (vx * tx + vz * tz) / tl
+                        FM.BossToward = toward
+                        if toward >= (FM.ChaseSpeed or 15) then
+                            FM.chaseHits = (FM.chaseHits or 0) + 1
+                        else
+                            FM.chaseHits = 0
+                        end
+                    end
+                end
+                if gp and (not FM.chasePrevT or (now - FM.chasePrevT) >= 0.09) then
+                    FM.chasePrev, FM.chasePrevT = gp, now
+                end
+                if (now - FM.wakeAt) > (FM.ChaseWindow or 4.0) and (FM.chaseHits or 0) < 1 then
+                    FM.wakeNotChasing = (FM.wakeNotChasing or 0) + 1
+                    FM.LastChaseSkip = string.format("%s guard woke but never came for you",
+                        tostring(FM.wakeArea))
+                    FM.wakeAt, FM.wakeArea, FM.BossHunting = nil, nil, nil
+                end
+            end
+            if FM.wakeAt then
+                local waited = tick() - FM.wakeAt
+                local wakeDelay = FM.WakeDelay or 0
+                local areaOverride = FM.wakeArea and FM.AreaDelay[FM.wakeArea]
+                if areaOverride and areaOverride < wakeDelay then wakeDelay = areaOverride end
+                if waited >= wakeDelay and (FM.chaseHits or 0) >= 1
+                   and not holdForGrab and not afterGrabEsc
+                   and not (AB.pinning and tick() < (AB.pinUntil or 0)) then
+                    if FM.AutoBoss and AB.Zone then
+                        local W = _G.SEHUB_WATCH
+                        W.chaseEscapes = (W.chaseEscapes or 0) + 1
+                        gotoZone(true)
+                        FM.State = string.format("Escaped the %s boss", tostring(FM.wakeArea))
+                        FM.LastEscape = string.format("%s guard, %.0f studs, %.1fs after waking, charging at %.0f/s",
+                            tostring(FM.wakeArea), FM.BossDist or -1, waited, FM.BossToward or -1)
+                        FM.LastEscapeAt = tick()
+                    end
+                    FM.wakeEscapes = (FM.wakeEscapes or 0) + 1
+                    if FM.wakeEscapes < (FM.EscapesPerWake or 1) then
+                        FM.wakeAt = tick()
+                        FM.chasePrev, FM.chasePrevT, FM.chaseHits = nil, nil, 0
+                    else
+                        FM.wakeAt, FM.wakeArea = nil, nil
+                        FM.BossHunting = nil
+                    end
+                    task.wait(FM.ReEscapeGap or 1.0)
+                end
+            end
+        end
+        PROFTICK("boss chase watch", __t0)
+        local EPw = FM.ePress
+        if EPw and FM.grabEscFor ~= EPw.at and (tick() - EPw.at) < 2 then
+            task.wait(0.03)
+        else
+            task.wait(0.05)
+        end
+    end
+end)
+
+SESPAWN("anti-boss watch", function()
+    local wasDown = false
+    while _G.SEHUB_GEN == GEN do
+        local W = _G.SEHUB_WATCH
+        W.ticks = W.ticks + 1
+        local down = isRagdolled()
+        if down then
+            if not W.ragDown then
+                local r = myRoot()
+                local okp, p = pcall(function() return r and r.Position end)
+                W.ragPos = okp and p or nil
+            end
+            W.ragSeen = W.ragSeen + 1
+            W.lastRag = string.format("%.1fs ago", 0)
+            W.lastRagAt = tick()
+        end
+        W.ragDown = down
+        do
+            local r = myRoot()
+            local okp, p = pcall(function() return r and r.Position end)
+            local t = tick()
+            if okp and p then
+                local lp, lt = W.lastPos, W.lastPosAt
+                local jumped, hardJump = false, false
+                if lp and lt and (t - lt) < 0.5 then
+                    local jump = math.sqrt((p.X - lp.X) ^ 2 + (p.Z - lp.Z) ^ 2)
+                    local dt = math.max(t - lt, 0.001)
+                    if jump > 120 or math.abs(p.Y - lp.Y) > 40 or (jump > 20 and jump / dt > 500) then
+                        jumped = true
+                    end
+                    if jump > 120 or math.abs(p.Y - lp.Y) > 40 then hardJump = true end
+                end
+                local zone = AB.Zone and AB.Zone.Position
+                local offLevel = zone and not (_G.MOVE and _G.MOVE.Fly)
+                    and (p.Y > zone.Y + 40 or p.Y < zone.Y - 25)
+                local offMap = false
+                if FM.On and FM.hasEgg and zone then
+                    local b = playBounds()
+                    offMap = p.Z < b.minz - 50 or p.Z > b.maxz + 50 or p.X < zone.X - 100 or p.X > b.maxx + 100
+                end
+                if jumped or offLevel or offMap then
+                    local function near(a, rad)
+                        return a and math.sqrt((p.X - a.X) ^ 2 + (p.Z - a.Z) ^ 2) < rad
+                    end
+                    local ours = AB.lastEscape and (t - AB.lastEscape) < 4
+                        and (near(zone, 40) or near(AB.hopTo, 40) or near(AB.hopFrom, 120))
+                    if not ours then
+                        if not W.flingAt or (t - W.flingAt) > 1 then
+                            W.flingFrom = lp or p
+                            W.flings = (W.flings or 0) + 1
+                        end
+                        W.flingAt = t
+                        if hardJump or offLevel or offMap then W.flingHardAt = t end
+                    end
+                end
+                W.lastPos, W.lastPosAt = p, t
+            end
+        end
+        if FM.AutoBoss and AB.Zone then
+            if down and not wasDown then
+                W.escapes = W.escapes + 1
+                gotoZone(true)
+                FM.State = "Escaped"
+            end
+            wasDown = down
+        else
+            W.blocked = W.blocked + (down and 1 or 0)
+        end
+        task.wait(0.02)
+    end
+end)
+
+SESPAWN("server watch", function()
+    local okj, job0 = pcall(function() return game.JobId end)
+    job0 = (okj and type(job0) == "string" and job0 ~= "") and job0 or nil
+    local lostSince = nil
+    while _G.SEHUB_GEN == GEN do
+        local changed = false
+        if job0 then
+            local okn, j = pcall(function() return game.JobId end)
+            if okn and type(j) == "string" and j ~= "" and j ~= job0 then changed = true end
+        end
+        if localPlayer() then
+            lostSince = nil
+        else
+            lostSince = lostSince or tick()
+            if tick() - lostSince > 5 then changed = true end
+        end
+        if changed then
+            FM.On, FM.hasEgg, FM.Rift = false, false, false
+            AB.pinLive, AB.pinning = 0, false
+            FM.deliveredTool, FM.pendingSlot, FM.stowPending, FM.ePress = nil, nil, nil, nil
+            _G.SEHUB_GEN = GEN + 1
+            warn("[Steal An Egg] server changed or the game connection was lost - stopped. Re-run the script in the new server.")
+            return
+        end
+        task.wait(1)
+    end
+end)
+
+SESPAWN("death watch", function()
+    local lastChar, wasDead = nil, false
+    while _G.SEHUB_GEN == GEN do
+        local lp = localPlayer()
+        local okc, ch = pcall(function() return lp and lp.Character end)
+        if okc and ch then
+            if lastChar ~= nil and ch ~= lastChar then
+                FM.needRally = true
+                FM.Deaths = (FM.Deaths or 0) + 1
+                if FM.hasEgg and FM.carryKey and FM.carryPos then
+                    local W = _G.SEHUB_WATCH or {}
+                    local ragAt, flingAt = W.lastRagAt or 0, W.flingAt or 0
+                    local hit = nil
+                    if FM.grabbedAt and math.max(ragAt, flingAt) > FM.grabbedAt then
+                        hit = (flingAt >= ragAt) and W.flingFrom or W.ragPos
+                    end
+                    local nest = FM.carryPos
+                    local near = (not hit)
+                        or math.sqrt((hit.X - nest.X) ^ 2 + (hit.Z - nest.Z) ^ 2) <= (FM.RetryRange or 300)
+                    local key, t = FM.carryKey, tick()
+                    FM.retryTries = FM.retryTries or {}
+                    local rt = FM.retryTries[key]
+                    if not rt or (t - rt.at) > 60 then rt = { n = 0, at = t } end
+                    rt.n, rt.at = rt.n + 1, t
+                    FM.retryTries[key] = rt
+                    if near and rt.n <= (FM.RetryMax or 3) then
+                        FM.retryKey, FM.retryPos, FM.retryBackSeen = key, nest, false
+                        FM.visited[key] = nil
+                    end
+                    FM.EggsLost = (FM.EggsLost or 0) + 1
+                end
+                FM.hasEgg = false
+                FM.depositAt = nil
+                FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
+                FM.recovering, FM.retryUntil, FM.carryKey = false, nil, nil
+            end
+            lastChar = ch
+            local hum = ch:FindFirstChild("Humanoid")
+            local okh, h = pcall(function() return hum and hum.Health end)
+            local dead = (okh and type(h) == "number" and h <= 0)
+            if dead and not wasDead then
+                FM.needRally = true
+                FM.Deaths = (FM.Deaths or 0) + 1
+            end
+            wasDead = dead
+        end
+        task.wait(0.2)
+    end
+end)
+
+SESPAWN("night watch", function()
+    while _G.SEHUB_GEN == GEN do
+        local __t0 = tick()
+        local folder = workspace:FindFirstChild("AreaEggSlotsClient")
+        if folder then
+            local okc, kids = pcall(function() return folder:GetChildren() end)
+            if okc and kids then
+                local rare, rareN, rareTier, rareName = {}, 0, {}, {}
+                local seenHL = {}
+                for _, m in ipairs(kids) do
+                    local okh, hl = pcall(function()
+                        return m:FindFirstChild("RareAreaEggHighlight")
+                    end)
+                    if okh and hl then
+                        local hb = m:FindFirstChild("Hitbox")
+                        local okp, p = pcall(function() return hb and hb.Position end)
+                        if okp and p then
+                            local rk = string.format("%d_%d", p.X, p.Z)
+                            rare[rk] = true
+                            if FM.HighlightColour ~= false then
+                                local oka, addr = pcall(function() return hl.Address end)
+                                local ck = rk .. "|" .. tostring(oka and addr or "?")
+                                seenHL[ck] = true
+                                local cached = HL_TIER_CACHE[ck]
+                                if cached == nil then
+                                    cached = highlightTier(hl) or false
+                                    HL_TIER_CACHE[ck] = cached
+                                end
+                                rareTier[rk] = cached or nil
+                            end
+                            if rareTier[rk] then
+                                local okn, nm = pcall(rareNameByTier, areaOf(p), rareTier[rk], (FM.eggName or {})[rk])
+                                if okn and nm then rareName[rk] = nm end
+                            end
+                            rareN = rareN + 1
+                        end
+                    end
+                end
+                for ck in pairs(HL_TIER_CACHE) do
+                    if not seenHL[ck] then HL_TIER_CACHE[ck] = nil end
+                end
+                FM.rareSet, FM.RareCount, FM.rareTier, FM.rareName = rare, rareN, rareTier, rareName
+
+                if not (FM.On and FM.hasEgg) and (FM.Rift or FM.RarePri or (FM.AlwaysN or 0) > 0) then
+                    sweepEggNames()
+                    if _G.SEHUB_FPCOUNT() == 0 and (tick() - (FM.identWarnAt or 0)) > 30 then
+                        FM.identWarnAt = tick()
+                        notify("Eggs", "Can't identify eggs - reinject Matcha", 6, "warn")
+                    end
+                    local noTier = {}
+                    local nNoTier = 0
+                    for _, e in ipairs(eggSlots()) do
+                        local k2 = string.format("%d_%d", e.pos.X, e.pos.Z)
+                        local nm = (FM.eggName or {})[k2]
+                        if nm and not alwaysTier(nm, areaOf(e.pos)) then
+                            if not noTier[nm] then nNoTier = nNoTier + 1 end
+                            noTier[nm] = true
+                        end
+                    end
+                    FM.NoTier, FM.NoTierN = noTier, nNoTier
+                    if (FM.AlwaysN or 0) > 0 and nNoTier > 0
+                       and (tick() - (FM.tierWarnAt or 0)) > 60 then
+                        FM.tierWarnAt = tick()
+                        local list = {}
+                        for nm in pairs(noTier) do list[#list + 1] = nm end
+                        table.sort(list)
+                        notify("Always Target",
+                            "Unknown rarity: " .. table.concat(list, ", "):sub(1, 60), 8, "warn")
+                    end
+                end
+
+                if not (FM.On and FM.hasEgg) and (tick() - (FM.indexAt or 0)) > 30 then
+                    FM.indexAt = tick()
+                    pcall(harvestPetIndex)
+                end
+
+                if FM.Rift and not (FM.On and FM.hasEgg) then
+                    if (tick() - (FM.riftRefreshAt or 0)) > 10 then
+                        FM.riftRefreshAt = tick()
+                        pcall(refreshRiftTargets)
+                    end
+                    local have, total, held = riftProgress()
+                    FM.RiftHave = held
+                    local age = tick() - (FM.RiftPanelAt or FM.RiftReadAt or 0)
+                    if age > 30 then
+                        FM.RiftState = "Can't read the rift panel"
+                        if not FM.riftStaleWarned then
+                            FM.riftStaleWarned = true
+                            notify("Rift Farm", "Can't read the rift panel", 6, "warn")
+                            warn("[Steal An Egg] rift panel unreadable: PlayerGui is out of reach, " ..
+                                 "which happens when the executor loses its DataModel bindings. " ..
+                                 "Rejoin or re-inject to restore it.")
+                        end
+                    else
+                        FM.riftStaleWarned = false
+                    end
+                    if age <= 30 then
+                    if have >= total and total >= 3 and FM.RiftComplete then
+                        FM.RiftState = string.format("Complete (%d/%d)", have, total)
+                        if not FM.riftDoneNotified then
+                            FM.riftDoneNotified = true
+                            notify("Rift Farm", "All rift pets owned", 5, "good")
+                            print("[Steal An Egg] rift pets complete - all owned:")
+                            for _, t in ipairs(FM.RiftTargets or {}) do
+                                print("   " .. t.name .. " (" .. tostring(t.area) .. ")")
+                            end
+                        end
+                    else
+                        FM.riftDoneNotified = false
+                        local spawned = {}
+                        for _, nm in pairs(FM.eggName or {}) do
+                            spawned[nm] = (spawned[nm] or 0) + 1
+                        end
+                        local missing, onMap = {}, 0
+                        for _, t in ipairs(FM.RiftTargets or {}) do
+                            if not held[t.name] then
+                                local c = spawned[t.egg] or 0
+                                onMap = onMap + c
+                                missing[#missing + 1] = string.format("%s(%d)", t.name, c)
+                            end
+                        end
+                        FM.RiftState = string.format("%d/%d - need %s%s",
+                            have, total, table.concat(missing, ", "),
+                            (onMap == 0) and " (none spawned)" or "")
+                    end
+                    end
+                end
+
+                local n = #kids
+                if FM.slotCount and (n - FM.slotCount) >= 10 then
+                    FM.visited = {}
+                    eggSlotsInvalidate()
+                    FM.eggName, FM.eggTried = {}, {}
+                    FM.Reloads = (FM.Reloads or 0) + 1
+                    FM.State = "Eggs respawned"
+                    notify("Auto Farm", "Eggs respawned", 3)
+                    if FM.Rift then
+                        task.spawn(function()
+                            task.wait(5)
+                            if _G.SEHUB_GEN ~= GEN or not FM.Rift then return end
+                            sweepEggNames()
+                            notifyRiftSpawns("Eggs respawned")
+                        end)
+                    end
+                end
+                FM.slotCount = n
+            end
+        end
+        PROFTICK("night watch", __t0)
+        task.wait(1.0)
+    end
+end)
+
+local TREAD_POS, TREAD_AT, TREAD_SPAWN = nil, 0, nil
+local function myTreadmill()
+    if TREAD_POS and (tick() - TREAD_AT) < 10 then return TREAD_POS end
+    TREAD_POS = nil
+    local lp = localPlayer()
+    local okn, myName = pcall(function() return lp and lp.Name end)
+    local plots = workspace:FindFirstChild("Plots")
+    if not (okn and myName and plots) then return nil end
+    local okc, list = pcall(function() return plots:GetChildren() end)
+    for _, pl in ipairs(okc and list or {}) do
+        local sign = pl:FindFirstChild("PlotSign")
+        local okd, desc = pcall(function() return sign and sign:GetDescendants() or {} end)
+        for _, d in ipairs(okd and desc or {}) do
+            local okt, t = pcall(function() return d.Text end)
+            if okt and t == myName then
+                local tb = pl:FindFirstChild("TreadmillBottom")
+                local spn = pl:FindFirstChild("SpawnPoint")
+                local okp, p = pcall(function() return tb and tb.Position end)
+                local oks, s = pcall(function() return spn and spn.Position end)
+                if okp and p then
+                    TREAD_POS, TREAD_AT = p, tick()
+                    TREAD_SPAWN = (oks and s) or nil
+                    return p
+                end
+            end
+        end
+    end
+    return nil
+end
+_G.SEHUB_TREADMILL = myTreadmill
+
+local function farmStep()
+    local task = PROF_TASK
+    if not FM.On then task.wait(0.2) return end
+    local root = myRoot()
+    if not root then
+        FM.State = "Waiting for character"
+        task.wait(0.5)
+        return
+    end
+    local okp, me = pcall(function() return root.Position end)
+    if not okp or not me then task.wait(0.2) return end
+    if AB.pinning and tick() < (AB.pinUntil or 0) then
+        task.wait(0.03)
+        return
+    end
+    do
+        do
+            do
+                do
+                    local now = tick()
+
+                    local homeP = homePos()
+                    if FM.needRally and homeP then
+                        FM.rallySpot = FM.rallySpot or pickHomeSpot() or homeP
+                        local rp = FM.rallySpot
+                        local d = (Vector3.new(rp.X, me.Y, rp.Z) - me).Magnitude
+                        if d > (FM.SpotReach or 4) then
+                            local flat = Vector3.new(rp.X - me.X, 0, rp.Z - me.Z)
+                            local m = flat.Magnitude
+                            if m > 0.01 then
+                                local sp = FM.Speed
+                                if d < (FM.Brake or 60) then
+                                    sp = math.max(25, FM.Speed * (d / (FM.Brake or 60)))
+                                end
+                                local ux, uz = steerAround(me, rp.X, rp.Z, sp)
+                                drive(root, ux * sp, uz * sp, -(FM.Stick or 18))
+                            end
+                            FM.State = "Respawned - heading back"
+                            task.wait(0.03)
+                            return
+                        else
+                            FM.needRally = false
+                            FM.rallySpot = nil
+                            FM.State = "Resuming"
+                            if FM.retryKey and FM.retryPos and not FM.retryUntil then
+                                local far = (Vector3.new(FM.retryPos.X, me.Y, FM.retryPos.Z) - me).Magnitude
+                                FM.retryUntil = now + (FM.RetryWindow or 15) + far / math.max(50, FM.Speed or 290)
+                            end
+                        end
+                    end
+
+                    local RW = _G.SEHUB_WATCH or {}
+                    local hitAt = math.max(RW.lastRagAt or 0, RW.flingHardAt or 0)
+                    if FM.hasEgg and FM.carryKey and FM.grabbedAt and hitAt > FM.grabbedAt + 0.1
+                       and not FM.recovering then
+                        local lostKey = FM.carryKey
+                        FM.retryTries = FM.retryTries or {}
+                        local rt = FM.retryTries[lostKey]
+                        if not rt or (now - rt.at) > 60 then rt = { n = 0, at = now } end
+                        rt.n, rt.at = rt.n + 1, now
+                        FM.retryTries[lostKey] = rt
+                        FM.recovering, FM.recoverStart = (FM.RetryMax or 0) > 0, now
+                        local lostPos = FM.carryPos
+                        local hit = (((RW.flingAt or 0) >= (RW.lastRagAt or 0)) and RW.flingFrom or RW.ragPos) or me
+                        local nearNest = lostPos
+                            and math.sqrt((hit.X - lostPos.X) ^ 2 + (hit.Z - lostPos.Z) ^ 2) <= (FM.RetryRange or 300)
+                        FM.retryKey = (nearNest and rt.n <= (FM.RetryMax or 3)) and lostKey or nil
+                        FM.retryPos = FM.retryKey and lostPos or nil
+                        FM.retryUntil = nil
+                        FM.retryBackSeen = false
+                        FM.hasEgg, FM.depositAt, FM.eggIsTool, FM.grabbedAt = false, nil, false, nil
+                        FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
+                        FM.carryKey = nil
+                        FM.EggsLost = (FM.EggsLost or 0) + 1
+                    end
+                    if FM.recovering then
+                        local sinceRag = now - math.max(RW.lastRagAt or 0, RW.flingAt or 0, FM.recoverStart or 0)
+                        local bnd = playBounds()
+                        local settled = ((not homeP) or math.abs(me.Y - homeP.Y) < 25)
+                            and me.Z >= bnd.minz - 50 and me.Z <= bnd.maxz + 50
+                        if sinceRag >= (FM.RecoverWait or 2.5) and settled then
+                            FM.recovering = false
+                            if FM.retryKey then
+                                FM.retryUntil = now + (FM.RetryWindow or 15)
+                                FM.visited[FM.retryKey] = nil
+                            end
+                        elseif now - FM.recoverStart > 12 then
+                            FM.recovering, FM.retryKey, FM.retryUntil = false, nil, nil
+                        else
+                            FM.State = "Ragdolled - recovering"
+                            task.wait(0.1)
+                            return
+                        end
+                    end
+                    if FM.retryKey and FM.retryUntil then
+                        if now > FM.retryUntil then
+                            FM.retryKey, FM.retryUntil = nil, nil
+                        else
+                            local back = false
+                            local rp = FM.retryPos
+                            for _, sl in ipairs(eggSlots()) do
+                                local k = string.format("%d_%d", sl.pos.X, sl.pos.Z)
+                                if k == FM.retryKey
+                                   or (rp and math.sqrt((sl.pos.X - rp.X) ^ 2 + (sl.pos.Z - rp.Z) ^ 2) <= 10
+                                       and isNewSlot(sl, FM.carryNear)) then
+                                    back = true
+                                    FM.retryKey = k
+                                    break
+                                end
+                            end
+                            if back and not FM.retryBackSeen then
+                                FM.retryBackSeen = true
+                                FM.RetryReturns = (FM.RetryReturns or 0) + 1
+                            end
+                            if not back and not FM.hasEgg and rp then
+                                local dx, dz = rp.X - me.X, rp.Z - me.Z
+                                local dn = math.sqrt(dx * dx + dz * dz)
+                                local holdAt = FM.RetryHoldDist or 45
+                                if dn > holdAt + 5 then
+                                    local sp = FM.Speed
+                                    if (dn - holdAt) < (FM.Brake or 60) then
+                                        sp = math.max(25, FM.Speed * ((dn - holdAt) / (FM.Brake or 60)))
+                                    end
+                                    local ux, uz = steerAround(me, rp.X, rp.Z, sp)
+                                    drive(root, ux * sp, uz * sp, -(FM.Stick or 18))
+                                else
+                                    drive(root, 0, 0, -(FM.Stick or 18))
+                                end
+                                FM.State = string.format("Waiting for the egg to return (%.0fs)", FM.retryUntil - now)
+                                task.wait(0.05)
+                                return
+                            end
+                        end
+                    end
+
+                    local __s1 = tick()
+                    if FM.hasEgg and not FM.carrySlotGone and FM.carryPos and FM.grabReloads == FM.Reloads then
+                        local cp = FM.carryPos
+                        if math.sqrt((me.X - cp.X) ^ 2 + (me.Z - cp.Z) ^ 2) < 300 then
+                            local present = false
+                            for _, sl in ipairs(eggSlots()) do
+                                if math.sqrt((sl.pos.X - cp.X) ^ 2 + (sl.pos.Z - cp.Z) ^ 2) <= 5 then
+                                    present = true
+                                    break
+                                end
+                            end
+                            if not present then FM.carrySlotGone = true end
+                        end
+                    end
+
+                    if FM.hasEgg and FM.carrySlotGone and FM.carryPos and FM.grabbedAt
+                       and (now - FM.grabbedAt) > 1.5 and FM.grabReloads == FM.Reloads then
+                        local cp = FM.carryPos
+                        for _, sl in ipairs(eggSlots()) do
+                            if math.sqrt((sl.pos.X - cp.X) ^ 2 + (sl.pos.Z - cp.Z) ^ 2) <= 10
+                               and isNewSlot(sl, FM.carryNear) then
+                                local k = string.format("%d_%d", sl.pos.X, sl.pos.Z)
+                                local tk = FM.carryKey or k
+                                FM.retryTries = FM.retryTries or {}
+                                local rt = FM.retryTries[tk]
+                                if not rt or (now - rt.at) > 60 then rt = { n = 0, at = now } end
+                                rt.n, rt.at = rt.n + 1, now
+                                FM.retryTries[tk] = rt
+                                if rt.n <= (FM.RetryMax or 3) then
+                                    FM.retryKey, FM.retryPos, FM.retryBackSeen = k, cp, true
+                                    FM.retryUntil = now + (FM.RetryWindow or 15)
+                                    FM.visited[k] = nil
+                                end
+                                FM.hasEgg, FM.depositAt, FM.eggIsTool, FM.grabbedAt = false, nil, false, nil
+                                FM.carryKey, FM.carrySlotGone = nil, false
+                                FM.EggsLost = (FM.EggsLost or 0) + 1
+                                FM.EggBack = (FM.EggBack or 0) + 1
+                                break
+                            end
+                        end
+                    end
+
+                    PROFTICK("farm: egg checks", __s1)
+                    local __s2 = tick()
+                    local LM = FM.lastMiss
+                    if LM and (now - LM.at) < 3 and LM.key then
+                        local RWl = _G.SEHUB_WATCH or {}
+                        local lateAt = math.max(FM.wakeAt or 0, RWl.flingHardAt or 0, RWl.lastRagAt or 0)
+                        if lateAt > LM.pressAt and (FM.grabbedAt or 0) <= LM.pressAt and not FM.pendingKey then
+                            FM.lastMiss = nil
+                            local key, cp = LM.key, LM.pos
+                            FM.retryTries = FM.retryTries or {}
+                            local rt = FM.retryTries[key]
+                            if not rt or (now - rt.at) > 60 then rt = { n = 0, at = now } end
+                            rt.n, rt.at = rt.n + 1, now
+                            FM.retryTries[key] = rt
+                            if cp and rt.n <= (FM.RetryMax or 3) then
+                                local far = math.sqrt((cp.X - me.X) ^ 2 + (cp.Z - me.Z) ^ 2)
+                                FM.retryKey, FM.retryPos, FM.retryBackSeen = key, cp, false
+                                FM.retryUntil = now + (FM.RetryWindow or 15) + far / math.max(50, FM.Speed or 290)
+                                FM.visited[key] = nil
+                            end
+                            if FM.grabRetry then FM.grabRetry[key] = nil end
+                            FM.fails[key], FM.banned[key] = nil, nil
+                            FM.hasEgg, FM.depositAt, FM.eggIsTool, FM.grabbedAt = false, nil, false, nil
+                            FM.carryKey, FM.carrySlotGone = nil, false
+                            FM.EggsLost = (FM.EggsLost or 0) + 1
+                            FM.State = "Egg knocked back - retrying"
+                        end
+                    elseif LM then
+                        FM.lastMiss = nil
+                    end
+
+                    if FM.pendingSlot ~= nil and not FM.pendingHadEgg and heldEggTool() then
+                        FM.eggIsTool = true
+                        FM.Confirmed = (FM.Confirmed or 0) + 1
+                        if FM.grabRetry and FM.pendingKey then
+                            FM.grabRetry[FM.pendingKey] = nil
+                            FM.fails[FM.pendingKey] = nil
+                        end
+                        if FM.pendingKey and not slotGone(FM.pendingSlot) then
+                            FM.visited[FM.pendingKey] = tick()
+                            FM.WrongEgg = (FM.WrongEgg or 0) + 1
+                        end
+                        FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
+                    elseif FM.pendingSlot ~= nil then
+                        local took = nil
+                        if FM.pendingNear and #FM.pendingNear > 0 and not slotGone(FM.pendingSlot) then
+                            local slotsNow = eggSlots()
+                            for _, nb in ipairs(FM.pendingNear) do
+                                local still = false
+                                for _, sl in ipairs(slotsNow) do
+                                    if math.abs(sl.pos.X - nb.pos.X) < 1 and math.abs(sl.pos.Z - nb.pos.Z) < 1 then
+                                        still = true
+                                        break
+                                    end
+                                end
+                                if not still then
+                                    took = nb
+                                    break
+                                end
+                            end
+                        end
+                        if not took and FM.pendingPromptNear and #FM.pendingPromptNear > 0
+                           and not slotGone(FM.pendingSlot) then
+                            local nowPrompts = eggPromptSpots(nil)
+                            if #nowPrompts > 10 then
+                                for _, pp in ipairs(FM.pendingPromptNear) do
+                                    local still = false
+                                    for _, cp in ipairs(nowPrompts) do
+                                        if math.abs(cp.X - pp.X) < 1 and math.abs(cp.Z - pp.Z) < 1 then
+                                            still = true
+                                            break
+                                        end
+                                    end
+                                    if not still then
+                                        took = { pos = pp, w = (FM.BigWidth or 6) + 1 }
+                                        break
+                                    end
+                                end
+                            end
+                        end
+                        if slotGone(FM.pendingSlot) then
+                            FM.Confirmed = (FM.Confirmed or 0) + 1
+                            FM.carrySlotGone = true
+                            if FM.grabRetry and FM.pendingKey then
+                                FM.grabRetry[FM.pendingKey] = nil
+                                FM.fails[FM.pendingKey] = nil
+                            end
+                            FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
+                        elseif took then
+                            FM.Confirmed = (FM.Confirmed or 0) + 1
+                            FM.WrongEgg = (FM.WrongEgg or 0) + 1
+                            if FM.pendingKey then
+                                if FM.grabRetry then FM.grabRetry[FM.pendingKey] = nil end
+                                FM.fails[FM.pendingKey] = nil
+                            end
+                            local nearNow = { { pos = FM.carryPos } }
+                            for _, nb in ipairs(FM.pendingNear or {}) do
+                                if nb ~= took then nearNow[#nearNow + 1] = nb end
+                            end
+                            FM.carryNear = nearNow
+                            FM.carryKey = string.format("%d_%d", took.pos.X, took.pos.Z)
+                            FM.carryPos, FM.carrySlotGone = took.pos, true
+                            FM.carryW = took.w or FM.carryW
+                            FM.pendingSlot, FM.pendingKey, FM.pendingAt, FM.pendingNear = nil, nil, nil, nil
+                        elseif (tick() - (FM.pendingAt or 0)) > 1.5 and not grabStillThere() then
+                            FM.Confirmed = (FM.Confirmed or 0) + 1
+                            FM.carrySlotGone = true
+                            FM.ConfirmedByScan = (FM.ConfirmedByScan or 0) + 1
+                            if FM.grabRetry and FM.pendingKey then
+                                FM.grabRetry[FM.pendingKey] = nil
+                                FM.fails[FM.pendingKey] = nil
+                            end
+                            FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
+                        elseif (tick() - (FM.pendingAt or 0)) > 1.5 then
+                            local key = FM.pendingKey
+                            local pressAt = FM.pendingAt or 0
+                            FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
+                            local RWm = _G.SEHUB_WATCH or {}
+                            local reactedAt = math.max(FM.wakeAt or 0, RWm.flingHardAt or 0, RWm.lastRagAt or 0)
+                            if key and reactedAt > pressAt then
+                                FM.retryTries = FM.retryTries or {}
+                                local rt = FM.retryTries[key]
+                                if not rt or (now - rt.at) > 60 then rt = { n = 0, at = now } end
+                                rt.n, rt.at = rt.n + 1, now
+                                FM.retryTries[key] = rt
+                                local cp = FM.carryPos
+                                if cp and rt.n <= (FM.RetryMax or 3) then
+                                    local far = math.sqrt((cp.X - me.X) ^ 2 + (cp.Z - me.Z) ^ 2)
+                                    FM.retryKey, FM.retryPos, FM.retryBackSeen = key, cp, false
+                                    FM.retryUntil = now + (FM.RetryWindow or 15) + far / math.max(50, FM.Speed or 290)
+                                    FM.visited[key] = nil
+                                end
+                                if FM.grabRetry then FM.grabRetry[key] = nil end
+                                FM.fails[key], FM.banned[key] = nil, nil
+                                FM.hasEgg, FM.depositAt, FM.eggIsTool, FM.grabbedAt = false, nil, false, nil
+                                FM.carryKey, FM.carrySlotGone = nil, false
+                                FM.EggsLost = (FM.EggsLost or 0) + 1
+                                FM.State = "Egg knocked back - retrying"
+                                task.wait(0.05)
+                                return
+                            end
+                            FM.lastMiss = { key = key, pressAt = pressAt, at = tick(), pos = FM.carryPos }
+                            FM.grabRetry = FM.grabRetry or {}
+                            local tries = (FM.grabRetry[key or ""] or 0) + 1
+                            FM.grabRetry[key or ""] = tries
+                            if tries < 2 then
+                                FM.hasEgg = false
+                                if key then FM.visited[key] = nil end
+                                FM.State = "Grab missed - retrying"
+                                task.wait(0.05)
+                                return
+                            end
+                            FM.Misses = (FM.Misses or 0) + 1
+                            if key then
+                                FM.fails[key] = (FM.fails[key] or 0) + 1
+                                if FM.fails[key] >= 2 then
+                                    FM.banned[key] = tick() + 120
+                                    FM.Banned = (FM.Banned or 0) + 1
+                                    FM.State = "Egg blocked - skipping"
+                                end
+                            end
+                        end
+                    end
+
+                    PROFTICK("farm: grab confirm", __s2)
+                    local __s3 = tick()
+                    local homeNow = homePos()
+                    local farFromHome = true
+                    if homeNow then
+                        farFromHome = (Vector3.new(homeNow.X, me.Y, homeNow.Z) - me).Magnitude
+                                      > ((FM.ZoneReach or 12) + 8)
+                    end
+                    local heldNow = heldEggTool()
+                    if heldNow and heldNow == FM.deliveredTool then heldNow = nil end
+                    if heldNow and not FM.hasEgg and farFromHome
+                       and FM.lastPressAt and (tick() - FM.lastPressAt) < 3 then
+                        FM.hasEgg = true
+                        FM.eggIsTool = true
+                        FM.grabbedAt = FM.grabbedAt or tick()
+                        FM.depositAt = nil
+                    end
+
+                    if FM.hasEgg and FM.eggIsTool and FM.pendingSlot == nil and FM.grabbedAt
+                       and (tick() - FM.grabbedAt) > 1.5 and not heldEggTool() then
+                        FM.hasEgg = false
+                        FM.depositAt = nil
+                        FM.Dropped = (FM.Dropped or 0) + 1
+                        FM.State = "Egg lost - back to farming"
+                        task.wait(0.05)
+                        return
+                    end
+
+                    if not FM.hasEgg then FM.homeSpot = nil end
+                    if FM.hasEgg and homeP then
+                        FM.homeSpot = FM.homeSpot or pickHomeSpot() or homeP
+                        local zp = FM.homeSpot
+                        local d = (Vector3.new(zp.X, me.Y, zp.Z) - me).Magnitude
+                        if d > (FM.SpotReach or 4) and not (FM.depositAt and d <= (FM.ZoneReach or 12)) then
+                            FM.depositAt = nil
+                            FM.depositToolSeen = nil
+                            local flat = Vector3.new(zp.X - me.X, 0, zp.Z - me.Z)
+                            local m = flat.Magnitude
+                            if m > 0.01 then
+                                local sp = FM.Speed
+                                if (FM.carryW or 1) > (FM.BigWidth or 6) then
+                                    sp = math.min(sp, FM.BigCarrySpeed or 260)
+                                    FM.BigCarries = FM.BigCarries or 0
+                                end
+                                if d < (FM.Brake or 60) then
+                                    sp = math.max(40, sp * (d / (FM.Brake or 60)))
+                                end
+                                local ux, uz = steerAround(me, zp.X, zp.Z, sp)
+                                drive(root, ux * sp, uz * sp, -(FM.Stick or 18))
+                            end
+                            FM.State = string.format("Taking egg home (%.0f studs)", d)
+                            PROFTICK("farm: carry move", __s3)
+                        else
+                            pcall(function()
+                                root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0)
+                            end)
+                            FM.depositAt = FM.depositAt or tick()
+                            local held = tick() - FM.depositAt
+                            local toolNow = heldEggTool()
+                            if toolNow then FM.depositToolSeen = true end
+                            if (FM.eggIsTool or FM.depositToolSeen) and not toolNow then
+                                FM.depositToolSeen = nil
+                                FM.hasEgg = false
+                                FM.depositAt = nil
+                                FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
+                                local pause = FM.PostDeliver or 0
+                                if pause > 0 then
+                                    FM.State = string.format("Delivered - waiting %.1fs", pause)
+                                    local t0d = tick()
+                                    while (tick() - t0d) < pause and FM.On do
+                                        pcall(function()
+                                            root.AssemblyLinearVelocity =
+                                                Vector3.new(0, -(FM.Stick or 18), 0)
+                                        end)
+                                        task.wait(0.05)
+                                    end
+                                end
+                                FM.State = "Delivered"
+                                task.wait(0.05)
+                                return
+                            end
+                            if held > ((FM.depositToolSeen and 2.5) or (FM.DeliverSettle or 2.5)) then
+                                FM.depositToolSeen = nil
+                                FM.hasEgg = false
+                                FM.depositAt = nil
+                                FM.deliveredTool = heldEggTool()
+                                FM.stowPending = true
+                                FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
+                                local pause = FM.PostDeliver or 2.0
+                                if pause > 0 then
+                                    FM.State = string.format("Delivered - waiting %.1fs", pause)
+                                    local t0d = tick()
+                                    while (tick() - t0d) < pause and FM.On do
+                                        pcall(function()
+                                            root.AssemblyLinearVelocity =
+                                                Vector3.new(0, -(FM.Stick or 18), 0)
+                                        end)
+                                        task.wait(0.05)
+                                    end
+                                end
+                                FM.State = "Delivered"
+                                task.wait(0.05)
+                                return
+                            end
+                            if held > (FM.DepositWait or 20) then
+                                FM.depositToolSeen = nil
+                                FM.hasEgg = false
+                                FM.depositAt = nil
+                                FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
+                                FM.visited = {}
+                                FM.State = "Delivery didn't register"
+                                task.wait(0.3)
+                                return
+                            end
+                            FM.State = "Delivering..."
+                            task.wait(0.1)
+                        end
+                        task.wait(0.03)
+                        return
+                    end
+
+                    FM.depositAt = nil
+
+                    local heldEgg = (not FM.NoStow) and heldEggTool() or nil
+                    if not heldEgg then FM.stowGaveUp, FM.stowTries = nil, nil end
+                    if heldEgg and not FM.stowGaveUp then
+                        if keypress then
+                            pcall(function() keypress(0x31) end)
+                            task.wait(0.05)
+                            if keyrelease then pcall(function() keyrelease(0x31) end) end
+                        end
+                        task.wait(0.15)
+                        if heldEggTool() then
+                            FM.stowTries = (FM.stowTries or 0) + 1
+                            if FM.stowTries >= 3 then
+                                FM.StowFail = (FM.StowFail or 0) + 1
+                                FM.stowGaveUp = true
+                            end
+                        else
+                            FM.Stowed = (FM.Stowed or 0) + 1
+                            FM.stowTries = nil
+                        end
+                    end
+                    FM.stowPending = nil
+
+                    if FM.fromTreadmill and not FM.hasEgg then
+                        local h = homePos()
+                        local dh = h and (Vector3.new(h.X, me.Y, h.Z) - me).Magnitude or 0
+                        if h and dh > (FM.ZoneReach or 12) then
+                            local sp = FM.Speed
+                            if dh < (FM.Brake or 60) then
+                                sp = math.max(25, FM.Speed * (dh / (FM.Brake or 60)))
+                            end
+                            local ux, uz = steerAround(me, h.X, h.Z, sp)
+                            drive(root, ux * sp, uz * sp, -(FM.Stick or 18))
+                            FM.State = "Leaving the treadmill - heading to the safe zone"
+                            task.wait(0.03)
+                            return
+                        end
+                        FM.fromTreadmill = nil
+                    end
+                    local best, bestScore
+                    local anyAllowed = 0
+                    local cands, sawRandom = {}, false
+                    local tlist = farmTargets()
+                    local areaBonus = {}
+                    if FM.RarePri then
+                        local home = homePos()
+                        if home then
+                            local dist, names = {}, {}
+                            for _, t in ipairs(tlist) do
+                                local a = tostring(t.area)
+                                if dist[a] == nil then
+                                    dist[a] = math.sqrt((t.pos.X - home.X) ^ 2 + (t.pos.Z - home.Z) ^ 2)
+                                    names[#names + 1] = a
+                                end
+                            end
+                            table.sort(names, function(p, q) return dist[p] > dist[q] end)
+                            for i, a in ipairs(names) do areaBonus[a] = (#names - i) * 800 end
+                        end
+                    end
+                    for _, t in ipairs(tlist) do
+                        local allowed = (FM.Areas[t.area] == true)
+                        local key = string.format("%d_%d", t.pos.X, t.pos.Z)
+                        local always = false
+                        if (FM.AlwaysN or 0) > 0 then
+                            local ht = (FM.rareTier or {})[key]
+                            local en2 = FM.eggName[key]
+                            local tier = en2 and alwaysTier(en2, t.area) or nil
+                            if ht then
+                                always = FM.Always[ht] == true
+                            elseif tier == "secret" or tier == "eternal" or tier == "divine" then
+                                always = FM.Always[tier] == true
+                            elseif looksRare(t) then
+                                local row = RARE_BY_AREA[t.area]
+                                if row then
+                                    local anyWanted, allWanted = false, true
+                                    for tierName in pairs(row) do
+                                        if FM.Always[tierName] then anyWanted = true else allWanted = false end
+                                    end
+                                    always = anyWanted and allWanted
+                                else
+                                    always = (FM.AlwaysN or 0) >= 3
+                                end
+                            end
+                            if always then allowed = true end
+                        end
+                        local cool = (now - (FM.visited[key] or 0)) > FM.Cooldown
+                        if (FM.banned[key] or 0) > now then allowed = false end
+                        if FM.retryKey == key and FM.retryUntil and now < FM.retryUntil then
+                            allowed, cool = true, true
+                        end
+                        if allowed then anyAllowed = anyAllowed + 1 end
+
+                        if allowed and cool then
+                            local d = (Vector3.new(t.pos.X, me.Y, t.pos.Z) - me).Magnitude
+                            local en = (FM.rareName or {})[key] or FM.eggName[key]
+                            local pri = 0
+                            local wanted = false
+                            if always then pri = pri + 20000000 end
+                            if FM.retryKey == key and FM.retryUntil and now < FM.retryUntil then
+                                pri = pri + 25000000
+                            end
+                            local riftFresh = (tick() - (FM.RiftPanelAt or FM.RiftReadAt or 0)) < 30
+                            if FM.Rift and FM.RiftPrio and riftFresh then
+                                for _, want in ipairs(FM.RiftTargets or {}) do
+                                    if not (FM.RiftHave or {})[want.name] then
+                                        if en and want.egg == en then
+                                            wanted = true
+                                        elseif want.known == false and want.area == t.area then
+                                            wanted = true
+                                        end
+                                        if wanted then
+                                            pri = pri + 10000000
+                                            break
+                                        end
+                                    end
+                                end
+                            end
+                            if FM.RarePri then
+                                local W = FM.RareWeight or 400
+                                local rank = rarityRank(en, t.area)
+                                local ct = (FM.rareTier or {})[key]
+                                local cr = ct and RARITY_RANK[ct] or 0
+                                if cr > rank then rank = cr end
+                                if rank > 0 then
+                                    pri = pri + rank * W
+                                elseif looksRare(t) then
+                                    pri = pri + 5 * W
+                                end
+                            end
+                            if FM.SizePri then
+                                local sizeRank = math.floor(t.w or 0)
+                                if sizeRank > 0 then
+                                    pri = pri + sizeRank * (FM.SizeWeight or 5000)
+                                end
+                            end
+                            if (FM.eggBlocked or {})[key] then pri = pri - 4000 end
+                            if not FM.RarePri and not FM.SizePri then
+                                cands[#cands + 1] = { key = key, area = t.area }
+                                if key == FM.randomKey then
+                                    sawRandom = true
+                                    pri = pri + 5000000
+                                end
+                            end
+                            if FM.RarePri then
+                                pri = pri + (areaBonus[tostring(t.area)] or 0)
+                            end
+                            if key == FM.lockKey then pri = pri + (FM.LockWeight or 5000) end
+                            local score = d - pri
+                            if not bestScore or score < bestScore then
+                                best, bestScore = t, score
+                                best.key = key
+                                best.name = en
+                                best.rank = FM.RarePri and rarityRank(en, t.area) or 0
+                                best.w    = t.w
+                                best.always = always
+                            end
+                        end
+                    end
+                    if not FM.RarePri and not FM.SizePri and not sawRandom then
+                        if #cands > 0 then
+                            local byArea, areas = {}, {}
+                            for _, cd in ipairs(cands) do
+                                local a = tostring(cd.area)
+                                if not byArea[a] then byArea[a] = {} areas[#areas + 1] = a end
+                                local g = byArea[a]
+                                g[#g + 1] = cd.key
+                            end
+                            local pickArea = areas[math.random(1, #areas)]
+                            local pool = byArea[pickArea]
+                            FM.randomKey  = pool[math.random(1, #pool)]
+                            FM.randomArea = pickArea
+                            FM.Rerolls = (FM.Rerolls or 0) + 1
+                        else
+                            FM.randomKey, FM.randomArea = nil, nil
+                        end
+                    end
+                    FM.lockKey = best and best.key or nil
+                    if not best and anyAllowed == 0 then
+                        FM.idleSince = FM.idleSince or now
+                        local tread = FM.TreadmillFarm and (now - FM.idleSince) >= 1.5 and myTreadmill() or nil
+                        if tread then
+                            FM.idleSpot = nil
+                            FM.treadVisit = true
+                            local dt = (Vector3.new(tread.X, me.Y, tread.Z) - me).Magnitude
+                            local goal = tread
+                            if TREAD_SPAWN and not FM.treadViaSpawn and dt > 40 then
+                                if (Vector3.new(TREAD_SPAWN.X, me.Y, TREAD_SPAWN.Z) - me).Magnitude > 6 then
+                                    goal = TREAD_SPAWN
+                                else
+                                    FM.treadViaSpawn = true
+                                end
+                            end
+                            if dt > 4 then
+                                local flat = Vector3.new(goal.X - me.X, 0, goal.Z - me.Z)
+                                local m = flat.Magnitude
+                                if m > 0.01 then
+                                    local sp = FM.Speed
+                                    if goal == tread and dt < (FM.Brake or 60) then
+                                        sp = math.max(20, FM.Speed * (dt / (FM.Brake or 60)))
+                                    end
+                                    if goal == tread and dt < 30 then
+                                        sp = math.min(sp, 35)
+                                    end
+                                    local ux, uz = steerAround(me, goal.X, goal.Z, sp)
+                                    drive(root, ux * sp, uz * sp, -(FM.Stick or 18))
+                                end
+                                FM.State = "Going to the treadmill"
+                                task.wait(0.03)
+                            else
+                                if not FM.onTreadmill then
+                                    pcall(function()
+                                        root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0)
+                                    end)
+                                end
+                                FM.onTreadmill = true
+                                FM.State = "Training on the treadmill"
+                                task.wait(0.5)
+                            end
+                            return
+                        end
+                        local home = homePos()
+                        if home then
+                            FM.idleSpot = FM.idleSpot or pickHomeSpot() or home
+                            home = FM.idleSpot
+                        end
+                        local dh = home and (Vector3.new(home.X, me.Y, home.Z) - me).Magnitude or 0
+                        if home and dh > (FM.SpotReach or 4) then
+                            local flat = Vector3.new(home.X - me.X, 0, home.Z - me.Z)
+                            local m = flat.Magnitude
+                            if m > 0.01 then
+                                local sp = FM.Speed
+                                if dh < (FM.Brake or 60) then
+                                    sp = FM.Speed * (dh / (FM.Brake or 60))
+                                    if sp < 25 then sp = 25 end
+                                end
+                                local ux, uz = steerAround(me, home.X, home.Z, sp)
+                                drive(root, ux * sp, uz * sp, -(FM.Stick or 18))
+                            end
+                            FM.State = "No eggs left - going home"
+                            task.wait(0.03)
+                        else
+                            pcall(function()
+                                root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0)
+                            end)
+                            FM.State = "Waiting for eggs to respawn"
+                            task.wait(0.5)
+                        end
+                        return
+                    end
+                    FM.idleSince = nil
+                    FM.treadViaSpawn = nil
+                    if FM.treadVisit then
+                        local tread = myTreadmill()
+                        if tread and (Vector3.new(tread.X, me.Y, tread.Z) - me).Magnitude < 14 then
+                            FM.fromTreadmill = true
+                            local tx = best and best.pos.X or (tread.X + 20)
+                            local tz = best and best.pos.Z or tread.Z
+                            local dx, dz = tx - tread.X, tz - tread.Z
+                            local dm = math.sqrt(dx * dx + dz * dz)
+                            if dm < 0.01 then dx, dz, dm = 1, 0, 1 end
+                            dx, dz = dx / dm, dz / dm
+                            FM.State = "Leaving the treadmill"
+                            local freed = false
+                            for _ = 1, 4 do
+                                if keypress then pcall(function() keypress(0x20) end) end
+                                task.wait(0.2)
+                                if keyrelease then pcall(function() keyrelease(0x20) end) end
+                                task.wait(0.15)
+                                local okp0, p0 = pcall(function() return root.Position end)
+                                drive(root, dx * 60, dz * 60, -(FM.Stick or 18))
+                                task.wait(0.2)
+                                local okp1, p1 = pcall(function() return root.Position end)
+                                if okp0 and okp1 and p0 and p1
+                                   and (Vector3.new(p1.X, 0, p1.Z) - Vector3.new(p0.X, 0, p0.Z)).Magnitude > 2 then
+                                    freed = true
+                                    break
+                                end
+                            end
+                            if not freed then
+                                FM.State = "Stuck on the treadmill - click into Roblox"
+                                task.wait(0.3)
+                                return
+                            end
+                        end
+                        FM.treadVisit, FM.onTreadmill = nil, nil
+                        return
+                    end
+                    FM.idleSpot = nil
+                    if not best then
+                        FM.State = "Nothing to farm"
+                        task.wait(0.5)
+                    else
+                        local aim = best.pos
+                        local tries = (FM.grabRetry or {})[best.key or ""] or 0
+                        if tries > 0 then
+                            local ang = tries * 2.39
+                            aim = best.pos + Vector3.new(math.cos(ang) * 1.2, 0, math.sin(ang) * 1.2)
+                        end
+                        local d = (Vector3.new(aim.X, me.Y, aim.Z) - me).Magnitude
+                        if d > FM.Reach then
+                            local ax, az = aim.X, aim.Z
+                            if FM.SnapOn and d <= (FM.Snap or 12) then
+                                local sx, sz = aim.X - me.X, aim.Z - me.Z
+                                local sm = math.sqrt(sx*sx + sz*sz)
+                                if sm > 0.01 then
+                                    local back = math.min(0.9, sm)
+                                    local tx = aim.X - (sx/sm) * back
+                                    local tz = aim.Z - (sz/sm) * back
+                                    pcall(function()
+                                        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                                        root.CFrame = CFrame.new(tx, me.Y, tz,
+                                                                 aim.X, me.Y, aim.Z)
+                                    end)
+                                    FM.Snaps = (FM.Snaps or 0) + 1
+                                    FM.State = string.format("Grabbing in %s", best.area)
+                                end
+                                task.wait(0.03)
+                                return
+                            end
+                            local flat = Vector3.new(ax - me.X, 0, az - me.Z)
+                            local m = flat.Magnitude
+                            if m > 0.01 then
+                                local sp = FM.Speed
+                                local brakeAt = FM.Brake or 30
+                                if d < brakeAt then
+                                    sp = FM.Speed * (d / brakeAt)
+                                    if sp < 14 then sp = 14 end
+                                end
+                                local ux, uz = flat.X / m, flat.Z / m
+                                if d > 12 then ux, uz = steerAround(me, ax, az, sp) end
+                                drive(root, ux * sp, uz * sp, -(FM.Stick or 18))
+                            end
+                            local what = ""
+                            if best.name then what = " for " .. best.name end
+                            FM.State = string.format("Going to %s%s", best.area, what)
+                        else
+                            pcall(function()
+                                root.AssemblyLinearVelocity =
+                                    Vector3.new(0, -(FM.Stick or 18), 0)
+                            end)
+                            task.wait(0.03)
+                            local nearPrompts = promptsNear(best.pos, 30)
+                            if ST.On then _G.SEHUB_PATCHNEAR(best.pos, 30, nearPrompts) end
+                            local hd = _G.SEHUB_HOLDTIME(best.pos, 20, nearPrompts)
+                            local slot = best.model or slotAt(best.pos)
+                            if ST.On and hd ~= nil and hd >= 0 and hd < 0.05 then
+                                if ST.On and FM.Suppress then
+                                    FM.SuppressedNow = _G.SEHUB_SUPPRESS(best.pos, 14, nil, nearPrompts)
+                                end
+                                pressE(0.04)
+                            else
+                                local hold
+                                if hd and hd > 0 then
+                                    hold = hd + 0.3
+                                else
+                                    hold = 2.0
+                                end
+                                local cfg = FM.GrabHold or 1.3
+                                if cfg > hold then hold = cfg end
+                                if ST.On then FM.Fallbacks = (FM.Fallbacks or 0) + 1 end
+                                FM.State = string.format("Grabbing in %s", best.area)
+                                if ST.On and FM.Suppress then
+                                    FM.SuppressedNow = _G.SEHUB_SUPPRESS(best.pos, 14)
+                                end
+                                if keypress then pcall(function() keypress(0x45) end) end
+                                local t0h = tick()
+                                while (tick() - t0h) < hold do
+                                    pcall(function()
+                                        root.AssemblyLinearVelocity =
+                                            Vector3.new(0, -(FM.Stick or 18), 0)
+                                    end)
+                                    if slotGone(slot) then break end
+                                    task.wait(0.03)
+                                end
+                                if keyrelease then pcall(function() keyrelease(0x45) end) end
+                            end
+                            FM.visited[best.key] = now
+                            FM.Taken = FM.Taken + 1
+
+                            FM.pendingSlot = slot
+                            FM.pendingSlotName = nil
+                            pcall(function() FM.pendingSlotName = slot and slot.Name or nil end)
+                            FM.pendingKey  = best.key
+                            FM.pendingNear = {}
+                            for _, sl in ipairs(eggSlots()) do
+                                local ndx, ndz = sl.pos.X - best.pos.X, sl.pos.Z - best.pos.Z
+                                local nd2 = ndx * ndx + ndz * ndz
+                                if nd2 > 1 and nd2 < 400 then
+                                    FM.pendingNear[#FM.pendingNear + 1] = { pos = sl.pos, w = sl.w }
+                                end
+                            end
+                            FM.pendingPromptNear = {}
+                            local slotList = eggSlots()
+                            for _, sp in ipairs(eggPromptSpots(best.pos, 20)) do
+                                local dT = math.sqrt((sp.X - best.pos.X) ^ 2 + (sp.Z - best.pos.Z) ^ 2)
+                                local bySlot = false
+                                for _, sl in ipairs(slotList) do
+                                    if math.sqrt((sl.pos.X - sp.X) ^ 2 + (sl.pos.Z - sp.Z) ^ 2) < 4 then
+                                        bySlot = true
+                                        break
+                                    end
+                                end
+                                if dT > 4 and not bySlot then
+                                    FM.pendingPromptNear[#FM.pendingPromptNear + 1] = sp
+                                end
+                            end
+                            FM.carryNear = FM.pendingNear
+                            FM.carryKey    = best.key
+                            FM.carryPos    = best.pos
+                            FM.carrySlotGone = false
+                            FM.grabReloads = FM.Reloads
+                            FM.retryPos    = nil
+                            FM.retryKey, FM.retryUntil = nil, nil
+                            FM.pendingAt   = tick()
+                            FM.lastPressAt = tick()
+                            FM.pendingHadEgg = (heldEggTool() ~= nil)
+                            FM.eggIsTool = false
+                            FM.hasEgg = true
+                            FM.grabbedAt = tick()
+                            FM.grabArea = best.area
+                            FM.carryW = best.w or 1
+                            FM.State = "Got an egg - heading home"
+                            task.wait(FM.AfterGrab or 0.1)
+                            return
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+SESPAWN("auto farm", function()
+    while _G.SEHUB_GEN == GEN do
+        PROFRESET()
+        local t0 = tick()
+        farmStep()
+        PROFTICK("auto farm", t0, true)
+        task.wait(0.03)
+    end
+end)
+
+bossSec:Button("Panic", function()
+    ST.On = false
+    restorePrompts()
+    if MV then MV.Fly = false end
+    FM.On = false
+    FM.AutoBoss = false
+    if setrobloxinput then pcall(function() setrobloxinput(true) end) end
+    notify("Steal An Egg", "Everything off", 3, "good")
+end, "Turns everything off.")
+
+local lastLabel = {}
+local function setLabel(key, obj, text)
+    if not obj then return end
+    if lastLabel[key] == text then return end
+    lastLabel[key] = text
+    pcall(function() obj:SetText(text) end)
+end
+
+SESPAWN("ui refresh", function()
+    while _G.SEHUB_GEN == GEN do
+        local __t0 = tick()
+        setLabel("steal", ST.ui, tostring(ST.State))
+        setLabel("farm", FM.ui, tostring(FM.State))
+        setLabel("rift", FM.riftUi, tostring(FM.RiftState))
+        setLabel("boss", AB.ui, tostring(AB.State))
+        PROFTICK("ui refresh", __t0)
+        task.wait(0.3)
+    end
+end)
+
+FM.On = false
+FM.State = "Off"
+if farmToggle then pcall(function() farmToggle:Set(false) end) end
+if riftToggle then pcall(function() riftToggle:Set(false) end) end
+FM.Rift = false
+
+print(string.format("[Steal An Egg] loaded (generation %d)", GEN))
+notify("Steal An Egg", "Loaded", 3)
