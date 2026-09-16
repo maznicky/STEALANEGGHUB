@@ -1549,7 +1549,7 @@ FM.On        = false
 FM.AvoidPlayers = false
 FM.AvoidBosses = true
 FM.deliveredTool, FM.pendingSlot, FM.stowPending, FM.ePress = nil, nil, nil, nil
-FM.Speed     = 300
+FM.Speed     = 500
 FM.Stick     = 18
 FM.Reach     = 1.5
 FM.GrabHold  = 1.3
@@ -1561,10 +1561,12 @@ FM.Snaps     = 0
 FM.Headstart, FM.Headstarts, FM.outboundHop = nil, nil, nil
 FM.Suppress      = true
 FM.BigWidth      = 6
-FM.BigCarrySpeed = 260
+-- Big eggs used to be throttled to 260 by their own slider. That slider is gone, so
+-- match the carry cap and let them travel like any other egg.
+FM.BigCarrySpeed = 400
 FM.Ghost         = true
 FM.GhostSaved    = nil
-FM.SpeedSet      = 300
+FM.SpeedSet      = 500
 FM.StickSet      = 18
 FM.CarryCap      = 400
 FM.PostDeliver   = 0
@@ -2984,12 +2986,10 @@ pcall(function() areaDrop:Set({}) end)
 FM.Areas, FM.AllAreas = {}, false
 FM.areaDrop = areaDrop
 farmSec:Divider()
-farmSec:Slider("Run Speed", 300, 10, 40, 600, " studs/s", function(v)
+farmSec:Slider("Run Speed", 500, 10, 40, 600, " studs/s", function(v)
     FM.SpeedSet = v
     FM.Speed = math.min(v, 600)
 end, "How fast you run. Your character is moved into the Camera while farming, so the speed check has nothing left to read.")
-farmSec:Slider("Big Egg Carry Speed", 260, 10, 40, 300, " studs/s", function(v) FM.BigCarrySpeed = v end,
-    "Speed while carrying a big egg. Lower it if you rubber-band.")
 farmSec:Slider("Grab Escape Delay", 0.45, 0.05, 0, 1.5, " s", function(v) FM.GrabEscapeDelay = v end,
     "Escape this long after grabbing an egg. 0 = as soon as the grab registers.")
 FM.ui = farmSec:Label("Off")
@@ -3770,7 +3770,7 @@ do
         local saved = FM.GhostSaved
         FM.GhostSaved, FM.GhostSeen = nil, nil
         if not saved then return 0 end
-        local back = 0
+        local back, since = 0, 0
         for i = #saved, 1, -1 do
             local e = saved[i]
             if e.o and e.p then
@@ -3778,6 +3778,15 @@ do
                 if oko and cur ~= nil then
                     if pcall(function() e.o.Parent = e.p end) then back = back + 1 end
                 end
+            end
+            -- Reparenting all 281 objects inside one frame is what takes the client down:
+            -- it crashed mid-teleport, after a delivery, and again leaving the treadmill.
+            -- Spread them over frames instead. The whole thing still finishes in about a
+            -- fifth of a second, which is fast enough even for the respawn path.
+            since = since + 1
+            if since >= (FM.GhostChunk or 40) then
+                since = 0
+                pcall(function() task.wait() end)
             end
         end
         FM.GhostBack = back
