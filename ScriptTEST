@@ -2935,17 +2935,42 @@ FM.FriendDrop = false
 FM.DeathDrop = false
 farmSec:Toggle("Friend Drop", false, function(v) FM.DeathDrop = v end,
     "Dies at the wall with a far egg so it drops by your plot for a friend to pick up, then goes straight back to farming.")
-local rareToggle, sizeToggle
-rareToggle = farmSec:Toggle("Rare Priority", false, function(v)
-    FM.RarePri = v
-    if v and sizeToggle then pcall(function() sizeToggle:Set(false) end) end
-end,
-    "Rarest eggs first. Turns off Size Priority.")
-sizeToggle = farmSec:Toggle("Size Priority", false, function(v)
-    FM.SizePri = v
-    if v and rareToggle then pcall(function() rareToggle:Set(false) end) end
-end,
-    "Biggest eggs first. Turns off Rare Priority.")
+-- One box, one choice. Add future orderings to PRI_CHOICES and give them a branch in
+-- applyPriority - nothing else needs touching.
+local PRI_NONE = "Random"
+local PRI_CHOICES = { PRI_NONE, "Rarest", "Biggest", "Furthest", "Closest" }
+local priDrop, priBusy
+local function applyPriority(name)
+    FM.Priority = name
+    FM.RarePri = (name == "Rarest")
+    FM.SizePri = (name == "Biggest")
+    -- Measured from wherever you are when the next target is picked, which is the safe zone.
+    FM.DistPri = (name == "Furthest" and "far") or (name == "Closest" and "near") or nil
+end
+priDrop = farmSec:Dropdown("Priority", { PRI_NONE }, PRI_CHOICES, true, function(sel)
+    if priBusy then return end
+    sel = sel or {}
+    local prev = FM.Priority or PRI_NONE
+    -- The box is multi-select underneath, so collapse whatever came back to a single
+    -- choice: prefer the entry that was not already picked, which is the one just tapped.
+    local pick = PRI_NONE
+    for _, nm in ipairs(sel) do
+        if nm ~= prev then pick = nm break end
+    end
+    if pick == PRI_NONE and #sel == 1 then pick = sel[1] end
+    if #sel == 0 then pick = PRI_NONE end
+    applyPriority(pick)
+    if #sel ~= 1 or sel[1] ~= pick then
+        priBusy = true
+        pcall(function() priDrop:Set({ pick }) end)
+        priBusy = false
+    end
+end, "One ordering at a time. Random spreads picks across areas. Rarest and Biggest go by egg. Furthest and Closest are measured from the safe zone.")
+priBusy = true
+pcall(function() priDrop:Set({ PRI_NONE }) end)
+priBusy = false
+applyPriority(PRI_NONE)
+FM.priDrop = priDrop
 
 local prevAlways = FM.Always
 local RARITY_CHOICES = { "Secret", "Eternal", "Divine" }
@@ -3001,6 +3026,30 @@ for k, want in pairs({ GrabHold = 1.3 }) do
         FM[k] = want
     end
 end
+
+local optSec = main:Section("Options", "Full")
+optSec:Label("Bits and pieces.")
+FM.AntiAfk = true
+FM.AntiAfkEvery = 540
+optSec:Toggle("Anti-AFK", true, function(v) FM.AntiAfk = v end,
+    "Taps an unbound key every 9 minutes so Roblox does not disconnect you for being idle. "
+    .. "Matcha has no VirtualUser, so this uses a real keypress - F13, which nothing in this "
+    .. "game is bound to, so it cannot move you or touch your egg.")
+
+SESPAWN("antiafk", function()
+    while _G.SEHUB_GEN == GEN do
+        task.wait(5)
+        if FM.AntiAfk and keypress and keyrelease then
+            if (tick() - (FM.antiAfkAt or 0)) > (FM.AntiAfkEvery or 540) then
+                FM.antiAfkAt = tick()
+                pcall(function() keypress(0x7C) end)
+                task.wait(0.05)
+                pcall(function() keyrelease(0x7C) end)
+                FM.AntiAfkTaps = (FM.AntiAfkTaps or 0) + 1
+            end
+        end
+    end
+end)
 
 local riftSec = farm:Section("Auto Rift-Farm", "Full")
 riftSec:Label("Farms the pets your selected rifts need.")
@@ -3846,7 +3895,13 @@ do
         -- a 281-object reparent in one frame, which is what crashed the client mid-
         -- teleport and again after a delivery. So: strip once, and only ever hand the
         -- body back when the farm stops or you turn the toggle off.
+        -- Leaving a treadmill while stripped has crashed the client three times now,
+        -- including with the restore already spread over frames, so frame budget was not
+        -- the cause. Stand down for the treadmill entirely: the body goes back while you
+        -- are stood still on your own plot, which is the calmest moment there is, and you
+        -- do not need the speed to train.
         local want = FM.Ghost and not off
+            and not FM.onTreadmill and not FM.treadVisit
         if not want then
             if FM.GhostSaved then
                 ghostRestore()
@@ -4206,12 +4261,14 @@ local function farmStep()
                         elseif FM.nightSince then
                             FM.nightSince, FM.dayAt = nil, now
                         end
-                        if FM.dayAt and (now - FM.dayAt) < (FM.BarrierWait or 3) then
+                        -- Daytime opens with a 5 second countdown and the barrier is still
+                        -- up for all of it; moving during it just jams the farm against it.
+                        if FM.dayAt and (now - FM.dayAt) < (FM.BarrierWait or 5) then
                             pcall(function()
                                 root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0)
                             end)
-                            FM.State = string.format("Night just ended - barrier for %.1fs",
-                                (FM.BarrierWait or 3) - (now - FM.dayAt))
+                            FM.State = string.format("Day countdown - waiting %.1fs",
+                                (FM.BarrierWait or 5) - (now - FM.dayAt))
                             task.wait(0.1)
                             return
                         end
@@ -5071,7 +5128,7 @@ local function farmStep()
                                 end
                             end
                             if (FM.eggBlocked or {})[key] then pri = pri - 4000 end
-                            if not FM.RarePri and not FM.SizePri then
+                            if not FM.RarePri and not FM.SizePri and not FM.DistPri then
                                 cands[#cands + 1] = { key = key, area = t.area }
                                 if key == FM.randomKey then
                                     sawRandom = true
@@ -5082,7 +5139,9 @@ local function farmStep()
                                 pri = pri + (areaBonus[tostring(t.area)] or 0)
                             end
                             if key == FM.lockKey then pri = pri + (FM.LockWeight or 5000) end
-                            local score = d - pri
+                            -- Lower score wins and d is your distance to the egg, so a
+                            -- plain d already means nearest-first. Flip it for Furthest.
+                            local score = (FM.DistPri == "far") and (-d - pri) or (d - pri)
                             if not bestScore or score < bestScore then
                                 best, bestScore = t, score
                                 best.key = key
@@ -5093,7 +5152,8 @@ local function farmStep()
                             end
                         end
                     end
-                    if not FM.RarePri and not FM.SizePri and not sawRandom then
+                    if not FM.RarePri and not FM.SizePri and not FM.DistPri
+                       and not sawRandom then
                         if #cands > 0 then
                             local byArea, areas = {}, {}
                             for _, cd in ipairs(cands) do
