@@ -1159,6 +1159,10 @@ _G.ABOSS = _G.ABOSS or {}
 local AB = _G.ABOSS
 AB.Zone   = CFrame.new(537.9755, 70.5763, -371.0225)
 AB.Count  = 1
+-- how close a boss has to be to the escape spot before we land somewhere else, and how
+-- far along the line we slide when it is
+AB.DodgeNear  = 50
+AB.DodgeShift = 28
 AB.RetryGap = 0
 AB.Teleports = 1
 AB.Hold   = 0.35
@@ -1387,14 +1391,16 @@ do
         if (AB.pinLive or 0) <= tick() or not AB.Zone then return end
         local r = myRoot()
         if not r then return end
+        -- landCF is the zone slid clear of a boss parked on it; falls back to the zone itself
+        local zcf = AB.landCF or AB.Zone
         if countFrame then
             local okq, p = pcall(function() return r.Position end)
-            if okq and p and math.sqrt((p.X - AB.Zone.X) ^ 2 + (p.Z - AB.Zone.Z) ^ 2) < 25 then
+            if okq and p and math.sqrt((p.X - zcf.X) ^ 2 + (p.Z - zcf.Z) ^ 2) < 25 then
                 AB.pinFrames = (AB.pinFrames or 0) + 1
             end
         end
         pcall(function()
-            r.CFrame = AB.Zone
+            r.CFrame = zcf
             r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
         end)
         AB.pinWrites = (AB.pinWrites or 0) + 1
@@ -1422,12 +1428,43 @@ local function gotoZone(quiet)
     if not root then return end
     local okp, me = pcall(function() return root.Position end)
     if not okp or not me then return end
-    local dHome = math.sqrt((AB.Zone.X - me.X)^2 + (AB.Zone.Z - me.Z)^2)
-    AB.hopFrom, AB.hopTo = me, AB.Zone.Position
+    -- A boss that chased you can be stood on the escape spot, and landing on top of it is
+    -- how you get ragdolled at the safe zone. Slide along the line away from it - same X, so
+    -- you end up exactly as far inside as before.
+    do
+        local land = AB.Zone
+        local obj = workspace:FindFirstChild("__OBJECTS")
+        local areas = obj and obj:FindFirstChild("Areas")
+        local ga = areas and areas:FindFirstChild("GuardAreas")
+        local okc, kids = pcall(function() return ga and ga:GetChildren() end)
+        local bz, bd
+        for _, am in ipairs((okc and kids) or {}) do
+            local okr, p = pcall(function()
+                local g = am:FindFirstChild("Guard")
+                local gr = g and g:FindFirstChild("HumanoidRootPart")
+                return gr and gr.Position
+            end)
+            if okr and typeof(p) == "Vector3" then
+                local d = math.sqrt((p.X - AB.Zone.X) ^ 2 + (p.Z - AB.Zone.Z) ^ 2)
+                if d < (AB.DodgeNear or 50) and (not bd or d < bd) then bz, bd = p.Z, d end
+            end
+        end
+        if bz then
+            local away = (AB.Zone.Z >= bz) and 1 or -1
+            land = CFrame.new(AB.Zone.X, AB.Zone.Y,
+                AB.Zone.Z + away * (AB.DodgeShift or 28))
+            AB.Dodged = (AB.Dodged or 0) + 1
+            AB.DodgedFrom = bd
+        end
+        AB.landCF = land
+    end
+    local zcf = AB.landCF or AB.Zone
+    local dHome = math.sqrt((zcf.X - me.X)^2 + (zcf.Z - me.Z)^2)
+    AB.hopFrom, AB.hopTo = me, zcf.Position
 
     pcall(function()
         root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-        root.CFrame = AB.Zone
+        root.CFrame = zcf
     end)
     AB.Hops = (AB.Hops or 0) + 1
     AB.pinning, AB.pinAt = true, tick()
@@ -1448,7 +1485,7 @@ local function gotoZone(quiet)
                     local r = myRoot()
                     if r then
                         pcall(function()
-                            r.CFrame = AB.Zone
+                            r.CFrame = AB.landCF or AB.Zone
                             r.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
                         end)
                     end
@@ -3889,7 +3926,10 @@ do
     FM.RagdollTpGiveUp = 15
     FM.RagdollTpHold = 0
     FM.RagdollTpSettle = 0
+    -- 0 = go straight back and try again instead of falling back to running
     FM.RagdollTpCool = 0
+    -- the one real reason to pause: a woken guard has to settle before it can hit us
+    FM.RagdollTpAwakeCool = 1
     FM.RagdollTpGap = 0.01
     FM.RagdollTpBurst = 3
     FM.RagdollTpHeight = 0
@@ -4061,8 +4101,21 @@ do
         end
         local dMeTarget = math.sqrt((tpos.X - me.X) ^ 2 + (tpos.Z - me.Z) ^ 2)
         local dMeLaunch = math.sqrt((launchPos.X - me.X) ^ 2 + (launchPos.Z - me.Z) ^ 2)
-        if dMeLaunch + 150 > dMeTarget then
+        -- The launch egg only has to be no further away than the target, not 150 studs
+        -- nearer than it. A short detour is nothing next to the thousands of studs the
+        -- teleport saves, and the old margin was quietly cancelling runs that would have
+        -- worked. Set FM.RagdollTpOnWay back to 150 for the old behaviour.
+        if dMeLaunch + (FM.RagdollTpOnWay or 0) > dMeTarget then
             FM.RagdollTpWhy = "launch egg is not on the way"
+            return false
+        end
+        -- Ghost has to be ON before we commit. Un-stripped, the guard hit flings you instead
+        -- of leaving the pin to hold, which is the "teleport ragdolled" failure. Ghost
+        -- re-engages a moment after any stand-down, so just come back next step - failures
+        -- retry immediately now, so waiting costs nothing.
+        if FM.Ghost and not FM.DeathDrop and not FM.GhostSaved then
+            FM.RagdollTpWhy = "waiting for ghost mode to take hold"
+            FM.RagdollTpWaits = (FM.RagdollTpWaits or 0) + 1
             return false
         end
         FM.RagdollTpWhy = nil
@@ -4090,7 +4143,7 @@ do
             return true
         end
         if guardModelAwake(gArea) then
-            FM.rtCoolUntil = now + 3
+            FM.rtCoolUntil = now + (FM.RagdollTpAwakeCool or 1)
             return false
         end
 
@@ -4142,12 +4195,18 @@ do
             task.wait(0.05)
         end
         local function grabLanded()
+            -- The ragdoll is the surest sign of all: the guard only wakes because the grab
+            -- landed, and UpperTorso's constraints are one of the few runtime additions
+            -- Matcha reports live. GuardWakeHighlight never turns up in its stale index, so
+            -- that check below can never fire, and the prompt-vanishing test lags behind the
+            -- actual grab - between them that is the noGrab failure.
+            if ragdollJoints() then return true end
             if guardModelAwake(gArea) then return true end
             return #promptsNear(launchPos, 6) == 0
         end
         local woke = false
         if (FM.RagdollTpHold or 1.2) < 0.05 then
-            local tapEnd = tick() + 2.5
+            local tapEnd = tick() + (FM.RagdollTpTapFor or 3.5)
             while tick() < tapEnd and FM.On and rootAlive(root) and not woke do
                 pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0) end)
                 if keypress then pcall(function() keypress(0x45) end) end
@@ -4182,7 +4241,9 @@ do
         end
         if not woke then
             FM.RagdollTpNoGrab = (FM.RagdollTpNoGrab or 0) + 1
-            finish(8, "Ragdoll teleport - " .. gName .. " grab didn't land")
+            FM.RagdollTpStreak = (FM.RagdollTpStreak or 0) + 1
+            finish(FM.RagdollTpCool or 0, string.format(
+                "Ragdoll teleport - %s grab missed, retrying (%d)", gName, FM.RagdollTpStreak))
             return true
         end
 
@@ -4220,7 +4281,10 @@ do
                 FM.grabArea = gName
             end
             FM.RagdollTpNoHit = (FM.RagdollTpNoHit or 0) + 1
-            finish(8, "Ragdoll teleport - no hit, taking the egg home")
+            FM.RagdollTpStreak = (FM.RagdollTpStreak or 0) + 1
+            -- we are holding the launch egg now, so the retry comes round naturally on the
+            -- next run once this one is delivered - no reason to sit on a cooldown
+            finish(FM.RagdollTpCool or 0, "Ragdoll teleport - no hit, taking the egg home")
             return true
         end
 
@@ -4271,10 +4335,13 @@ do
                 pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0) end)
                 task.wait(0.05)
             end
+            FM.RagdollTpStreak = 0
             finish(nil, "Ragdoll teleport - landed")
         else
             FM.RagdollTpFails = (FM.RagdollTpFails or 0) + 1
-            finish(FM.RagdollTpCool or 6, "Ragdoll teleport failed - running instead")
+            FM.RagdollTpStreak = (FM.RagdollTpStreak or 0) + 1
+            finish(FM.RagdollTpCool or 0, string.format(
+                "Ragdoll teleport - pin lost, retrying (%d)", FM.RagdollTpStreak))
         end
         return true
     end
@@ -4381,7 +4448,15 @@ local function farmStep()
                         end
                     end
                     local RW = _G.SEHUB_WATCH or {}
-                    local hitAt = math.max(RW.lastRagAt or 0, RW.flingHardAt or 0)
+                    -- A plain ragdoll no longer means the egg is gone. It did before Ghost,
+                    -- when a hit flung you across the map; now you stay put and the boss-hit
+                    -- stop taps E to pick it straight back up. Counting every ragdoll as a
+                    -- loss is what sent you off for a second egg while still holding the
+                    -- first. Only a hard fling counts. Set FM.LoseEggOnRagdoll = true to go
+                    -- back to the old behaviour.
+                    local hitAt = FM.LoseEggOnRagdoll
+                        and math.max(RW.lastRagAt or 0, RW.flingHardAt or 0)
+                        or (RW.flingHardAt or 0)
                     if FM.hasEgg and FM.carryKey and FM.grabbedAt and hitAt > FM.grabbedAt + 0.1
                        and not FM.recovering then
                         local lostKey = FM.carryKey
@@ -4722,13 +4797,37 @@ local function farmStep()
                         -- during a Ragdoll Teleport the ragdoll is ours on purpose, so leave it
                         -- alone. Keep working the spot for a few seconds after the ragdoll ends
                         -- too, or there is no time left to reach an egg that fell a bit away.
-                        local active = hit
-                            or (FM.bhPhase and (now - (FM.bhAt or now)) < (FM.BossHitHold or 5))
-                        if active and (FM.rtBusyUntil or 0) < now then
+                        -- Not at the safe zone. A boss can ragdoll you there during the quick
+                        -- Anti-Boss teleport, and there is no dropped egg to sweep for - pinning
+                        -- you on the spot would only stop you delivering.
+                        local safeP = AB.Zone or homeP
+                        local nearSafe = safeP
+                            and math.sqrt((me.X - safeP.X) ^ 2 + (me.Z - safeP.Z) ^ 2)
+                                < (FM.BossHitSkipNear or 60)
+                        -- Only stop if the egg actually went missing. A ragdoll on its own no
+                        -- longer takes it, so standing there sweeping for an egg that is still
+                        -- in your hands just parks you next to the boss until it hits you
+                        -- again. Still holding it means keep running.
+                        local active = (hit
+                            or (FM.bhPhase and (now - (FM.bhAt or now)) < (FM.BossHitHold or 2.5)))
+                            and not FM.hasEgg
+                        if active and not nearSafe and (FM.rtBusyUntil or 0) < now
+                           and not (AB.pinning and tick() < (AB.pinUntil or 0)) then
                             if not FM.bhPhase then
                                 FM.bhPhase, FM.bhAt = "stopped", now
                                 FM.bhX, FM.bhY, FM.bhZ = me.X, me.Y, me.Z
                                 FM.BossHits = (FM.BossHits or 0) + 1
+                            end
+                            -- the instant it is back in your hands, drop everything and run
+                            local backTool = heldEggTool()
+                            if backTool then
+                                FM.hasEgg, FM.eggIsTool = true, true
+                                FM.grabbedAt, FM.lastPressAt = tick(), tick()
+                                FM.bhPhase, FM.bhTapAt = nil, nil
+                                FM.BossHitRecovered = (FM.BossHitRecovered or 0) + 1
+                                FM.State = "Got the egg back - going"
+                                task.wait(0.02)
+                                return
                             end
                             -- Hold dead still for the first second so the ragdoll cannot slide you
                             -- off the spot, then hop around it in widening rings. We have no way to
@@ -5325,8 +5424,15 @@ local function farmStep()
                     FM.lockKey = best and best.key or nil
                     if not best and anyAllowed == 0 then
                         FM.idleSince = FM.idleSince or now
+                        -- An Anti-Boss escape drops you at the safe zone and the egg list
+                        -- reads empty for a moment while things resettle. At the 0.3s gate I
+                        -- had set, that blip was enough to decide every egg was gone and send
+                        -- you off to train. Wait longer, and never decide it right after an
+                        -- escape.
+                        local sinceEsc = now - (AB.lastEscape or 0)
                         local tread = FM.TreadmillFarm
-                            and (now - FM.idleSince) >= (FM.TreadmillIdle or 0.3)
+                            and (now - FM.idleSince) >= (FM.TreadmillIdle or 2)
+                            and sinceEsc > (FM.TreadmillAfterEscape or 5)
                             and myTreadmill() or nil
                         if tread then
                             FM.idleSpot = nil
