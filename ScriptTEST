@@ -193,12 +193,22 @@ local function myCharacter()
         local ok, ch = pcall(function() return lp.Character end)
         if ok and ch then return ch end
     end
+    -- Matcha's Players binding goes stale and returns nil, and while the body is stripped
+    -- CameraSubject is the Humanoid sitting IN the Camera - so the fallback below used to
+    -- hand back the Camera itself as "your character". Stripping that orphans your root and
+    -- leaves you unable to move. Prefer the character we stripped, and never accept the
+    -- Camera or anything that is not a Model.
+    local FMg = _G.FARM
+    if FMg and FMg.GhostSaved and FMg.GhostChar then return FMg.GhostChar end
     local okc, cam = pcall(function() return workspace.CurrentCamera end)
     if okc and cam then
         local oks, subj = pcall(function() return cam.CameraSubject end)
         if oks and subj then
             local okp, par = pcall(function() return subj.Parent end)
-            if okp and par then return par end
+            if okp and par and par ~= cam then
+                local okcl, cl = pcall(function() return par.ClassName end)
+                if okcl and cl == "Model" then return par end
+            end
         end
     end
     return nil
@@ -3803,6 +3813,15 @@ do
 
     FM.ghostStep = function(root, off)
         local ch = myCharacter()
+        -- Belt and braces for the same trap: if the character read comes back as the Camera,
+        -- as nil, or as anything that is not a Model, do nothing at all this step. A bad read
+        -- must not strip, must not restore, and must not move the GhostChar goalposts.
+        local okcl, cl = pcall(function() return ch and ch.ClassName end)
+        local okcam, camNow = pcall(function() return workspace.CurrentCamera end)
+        if not ch or (okcam and ch == camNow) or not okcl or cl ~= "Model" then
+            FM.GhostBadChar = (FM.GhostBadChar or 0) + 1
+            return
+        end
         if ch ~= FM.GhostChar then
             -- Hand the old body back before letting go of it, or 281 parts are left in
             -- the Camera after every death and pile up there for the rest of the session.
