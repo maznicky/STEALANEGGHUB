@@ -5523,9 +5523,18 @@ local function farmStep()
                     end
                     do
                         local ds = FM.DeathSpot or Vector3.new(551.523, 70.574, -441.038)
-                        local farEnough = FM.hasEgg and homeP and FM.carryPos
-                            and math.sqrt((FM.carryPos.X - homeP.X) ^ 2 + (FM.carryPos.Z - homeP.Z) ^ 2)
-                                > (FM.DeathDropMin or 1200)
+                        -- No distance requirement any more. Demanding the egg be 1200+ studs
+                        -- from home meant Friend Drop silently did nothing for whole areas -
+                        -- Cosmic and Prehistoric included - which just leaves you doing normal
+                        -- farming with the toggle on and no sign of why. Carrying an egg is the
+                        -- only condition; the egg-in-hand check on the dive does the rest.
+                        -- Set FM.DeathDropMin above 0 to bring a minimum back.
+                        local farEnough = FM.hasEgg and true or false
+                        if (FM.DeathDropMin or 0) > 0 and homeP and FM.carryPos then
+                            farEnough = farEnough and math.sqrt(
+                                (FM.carryPos.X - homeP.X) ^ 2
+                                + (FM.carryPos.Z - homeP.Z) ^ 2) > FM.DeathDropMin
+                        end
                         local curChar = myCharacter()
                         if FM.DeathDrop and FM.hasEgg and not FM.ddPhase then
                             for _, ch3 in ipairs(workspace:GetChildren()) do
