@@ -16,6 +16,30 @@ if GEN > 1 then
     task.wait(0.2)
 end
 
+-- Refuse to load into a broken DataModel. Matcha can end up in a state where every
+-- game:GetService() returns nil while the game itself runs fine (game:GetChildren() == 0,
+-- game reads as "DataModel (Ugc)"). Loading into that gives you a build that cannot find
+-- you and cannot hook frames, so teleports and pins silently stop holding with no error to
+-- point at - and at least one outright hang. The binding also just flaps for a second or
+-- two at times, so retry for 3s before giving up.
+do
+    local P, RS
+    for _ = 1, 60 do
+        local okP, p = pcall(function() return game:GetService("Players") end)
+        local okR, r = pcall(function() return game:GetService("RunService") end)
+        if okP and p and okR and r then P, RS = p, r break end
+        task.wait(0.05)
+    end
+    if not P or not RS then
+        warn("[Steal An Egg] Roblox services are not reachable right now "
+            .. "(game:GetService returns nil), so nothing was loaded. Restart Matcha; if it "
+            .. "still fails, close Roblox completely and relaunch it.")
+        -- give the generation back so the next attempt is a clean first load, not a reload
+        _G.SEHUB_GEN = GEN - 1
+        return
+    end
+end
+
 _G.SEHUB_SKIP = _G.SEHUB_SKIP or {}
 _G.SEHUB_LOOPS = {}
 _G.SEHUB_SLOW = _G.SEHUB_SLOW or {}
@@ -319,21 +343,37 @@ _G.SEHUB_TRAPS = trapPositions
 -- as workspace children, so they do not show up here.
 -- (This replaces an older guess that egg models had 32-character GUID names. They never
 -- have, so every scan built on that matched nothing at all.)
-local function eggModelsNear(pos, range)
+-- Both finders live in one do-block on purpose: Luau allows only 200 locals at the top
+-- level of a chunk and this file is already at the ceiling. Declaring eggPos and
+-- DROP_HOLDERS out here costs two of them and the script will not compile.
+local eggModelsNear, droppedEggsNear
+do
+
+local function eggPos(c)
+    local okq, q = pcall(function()
+        local hb = c:FindFirstChild("Hitbox")
+        return hb and hb.Position
+    end)
+    if okq and q then return q end
+    local okp, p2 = pcall(function() return c:GetPivot().Position end)
+    return okp and p2 or nil
+end
+
+-- A CARRIED egg is a direct workspace child named like
+-- "FirstAreaEgg_84080151_5965395_Forest:Slot_005" and it follows you a stud or two away.
+-- This is the "am I still holding one" test.
+function eggModelsNear(pos, range)
     local out = {}
+    if not pos then return out end
     local okk, kids = pcall(function() return workspace:GetChildren() end)
-    if not okk or not kids then return out end
-    for _, c in ipairs(kids) do
+    for _, c in ipairs((okk and kids) or {}) do
         local okc, cl = pcall(function() return c.ClassName end)
         if okc and cl == "Model" then
             local okn, nm = pcall(function() return c.Name end)
             if okn and type(nm) == "string"
                and string.find(string.lower(nm), "egg", 1, true) then
-                local okq, q = pcall(function()
-                    local hb = c:FindFirstChild("Hitbox")
-                    return hb and hb.Position
-                end)
-                if okq and q and pos then
+                local q = eggPos(c)
+                if q then
                     local d = math.sqrt((q.X - pos.X) ^ 2 + (q.Z - pos.Z) ^ 2)
                     if d <= (range or math.huge) then
                         out[#out + 1] = { m = c, pos = q, d = d, name = nm }
@@ -345,6 +385,43 @@ local function eggModelsNear(pos, range)
     table.sort(out, function(a, b) return a.d < b.d end)
     return out
 end
+
+-- A DROPPED egg is a different thing entirely. It lives inside one of these containers
+-- under a name like "84080151_3927d6ed2e40400ab1a9be0fdf260b23" - <eggTypeId>_<32 hex> -
+-- with no "egg" in it anywhere, which is why searching workspace by name never found one
+-- (BossHitFound stayed nil every single session while the egg sat right next to us).
+-- These holders only ever contain eggs, so take any Model in them.
+local DROP_HOLDERS = { "PlacedEggRenders", "ClientRenderedAssets", "Eggs", "__DEBRIS" }
+
+function droppedEggsNear(pos, range)
+    local out = {}
+    if not pos then return out end
+    for _, holder in ipairs(DROP_HOLDERS) do
+        local okh, h = pcall(function() return workspace:FindFirstChild(holder) end)
+        if okh and h then
+            local okk, kids = pcall(function() return h:GetChildren() end)
+            for _, c in ipairs((okk and kids) or {}) do
+                local okc, cl = pcall(function() return c.ClassName end)
+                if okc and cl == "Model" then
+                    local q = eggPos(c)
+                    if q then
+                        local d = math.sqrt((q.X - pos.X) ^ 2 + (q.Z - pos.Z) ^ 2)
+                        if d <= (range or math.huge) then
+                            out[#out + 1] = { m = c, pos = q, d = d, name = tostring(c.Name) }
+                        end
+                    end
+                end
+            end
+        end
+    end
+    -- and anything sitting straight in workspace with "egg" in the name
+    for _, e in ipairs(eggModelsNear(pos, range)) do out[#out + 1] = e end
+    table.sort(out, function(a, b) return a.d < b.d end)
+    return out
+end
+
+end
+_G.SEHUB_DROPPEDEGGS = droppedEggsNear
 _G.SEHUB_EGGMODELS = eggModelsNear
 
 local steerAround, drive
@@ -2978,6 +3055,16 @@ farmToggle = farmSec:Toggle("Auto Farm", false, function(v)
     FM.On = v
     if v then
         skipRally()
+        -- Drop stale carry state. hasEgg is deliberately sticky now (a scan miss alone will
+        -- not clear it), so leftovers from an earlier run survive indefinitely - and Friend
+        -- Drop reads them as "carrying something far from home" and dives at the wall the
+        -- moment you press start. Anything older than 30s is not a real carry.
+        if FM.hasEgg and (not FM.grabbedAt or (tick() - FM.grabbedAt) > 30) then
+            FM.hasEgg, FM.eggIsTool, FM.depositAt = false, false, nil
+            FM.carryKey, FM.carryPos, FM.carrySlotGone = nil, nil, false
+            FM.carryMiss, FM.grabbedAt = 0, nil
+            FM.StaleCarryCleared = (FM.StaleCarryCleared or 0) + 1
+        end
         -- Turning the farm on while you are stood on your treadmill used to strip you where
         -- you stand, and stepping off a treadmill stripped crashes the client. Spot it and
         -- hand it straight to the normal treadmill-exit path, which jumps you off properly.
@@ -3020,13 +3107,32 @@ FM.TreadmillFarm = true
 farmSec:Toggle("Auto Treadmill Farm", true, function(v) FM.TreadmillFarm = v end,
     "Trains on your treadmill whenever there are no eggs to farm.")
 FM.RagdollTp = true
-farmSec:Toggle("Ragdoll Teleport", true, function(v) FM.RagdollTp = v end,
-    "Lets the Forest guard ragdoll you, then teleports to far eggs. Runs normally if it fails.")
+FM.rtTog = farmSec:Toggle("Ragdoll Teleport", true, function(v) FM.RagdollTp = v end,
+    "Lets the Forest guard ragdoll you, then teleports to far eggs. Runs normally if it fails. "
+    .. "Waits 1.5s before pinning while Friend Drop is on.")
 FM.FriendDrop = false
 FM.DeathDrop = false
 fdTog = farmSec:Toggle("Friend Drop", false, function(v)
     FM.DeathDrop = v
-    if v and bossTog then pcall(function() bossTog:Set(false) end) end
+    -- Note when it was switched on, so a key you happen to be holding at that moment cannot
+    -- immediately count as a deliberate press.
+    if v then FM.fdEnabledAt = tick() end
+    if v then
+        -- Anti-Boss is the one that genuinely fights the dive: it drags you back to the safe
+        -- zone. Ragdoll Teleport works fine alongside Friend Drop - it just needs its 1.5s
+        -- wait before pinning, which rtWait handles.
+        if bossTog then pcall(function() bossTog:Set(false) end) end
+        -- Never assume an egg is already in your hand when this is switched on. Whatever the
+        -- farm currently believes it is carrying, throw that belief away and let the cycle
+        -- start from scratch: leftover state reads as "carrying something far from home" and
+        -- dives you at the wall the instant you enable it, even stood at the safe zone.
+        FM.hasEgg, FM.eggIsTool, FM.depositAt = false, false, nil
+        FM.carryKey, FM.carryPos, FM.carrySlotGone = nil, nil, false
+        FM.carryMiss, FM.grabbedAt = 0, nil
+        FM.ddPhase, FM.ddAt, FM.ddDived, FM.ddPushed = nil, nil, nil, nil
+        FM.fdArmedAt, FM.fdBusy = nil, false
+        FM.FriendDropReset = (FM.FriendDropReset or 0) + 1
+    end
 end, "Dies at the wall so the egg drops by your plot for a friend. Works on its own too - "
     .. "with Auto Farm off, grab an egg with E and it dives. Turns off Auto Anti-Boss.")
 FM.fdTog = fdTog
@@ -3157,10 +3263,24 @@ FM.FriendDropDelay = 0
 FM.FriendDropSink = 20
 FM.FriendDropMaxSink = 30
 FM.FriendDropGrabWait = 1.5
+-- Breathing room after a dive before another can start. Without it the cycle comes
+-- straight back round on respawn and you get yanked off your spawn point again.
+FM.FriendDropCool = 2
 -- last-resort kill, late enough that the wall gets a real chance first
 FM.FriendDropKillAfter = 4
 _G.SEHUB_FRIENDDROP = function()
     if FM.fdBusy then return false end
+    -- Never dive empty-handed, whoever asks. Dying at the wall with nothing in your hands
+    -- costs you a life and gains nothing at all.
+    do
+        local r = myRoot()
+        local okp, p = pcall(function() return r and r.Position end)
+        if not okp or not p or #eggModelsNear(p, FM.CarryNear or 15) == 0 then
+            FM.FriendDropNoEgg = (FM.FriendDropNoEgg or 0) + 1
+            FM.State = "Friend drop - no egg in hand, not diving"
+            return false
+        end
+    end
     FM.fdBusy = true
     local ds = FM.DeathSpot or Vector3.new(551.523, 70.574, -441.038)
     local t0, died = tick(), false
@@ -3190,15 +3310,17 @@ _G.SEHUB_FRIENDDROP = function()
         task.wait(0.05)
     end
     if died then FM.FriendDropsMade = (FM.FriendDropsMade or 0) + 1 end
+    FM.fdDoneAt = tick()
     FM.fdBusy = false
     return died
 end
 
 SESPAWN("frienddrop", function()
-    local UIS, wasDown = nil, false
+    local UIS, wasDown, wasOn = nil, false, false
     while _G.SEHUB_GEN == GEN do
         task.wait(0.08)
-        if FM.DeathDrop and not FM.On and not FM.fdBusy then
+        local onNow = (FM.DeathDrop and not FM.On and not FM.fdBusy) and true or false
+        if onNow then
             if not UIS then
                 local oks, s = pcall(function() return game:GetService("UserInputService") end)
                 UIS = oks and s or nil
@@ -3209,20 +3331,45 @@ SESPAWN("frienddrop", function()
                 local okd, d = pcall(function() return UIS:IsKeyDown(101) end)
                 down = okd and d == true
             end
-            if down and not wasDown then FM.fdArmedAt = tick() end
+            -- The instant Friend Drop is switched on, adopt whatever the key is doing right
+            -- now instead of assuming it was up. Otherwise a key you were already holding
+            -- reads as a fresh press and dives on you the moment you enable it.
+            if not wasOn then wasDown = down end
+            -- and ignore presses for a beat after enabling, for the same reason
+            local settled = (tick() - (FM.fdEnabledAt or 0)) > (FM.FriendDropArmDelay or 1)
+                and (tick() - (FM.fdDoneAt or 0)) > (FM.FriendDropCool or 2)
+            if down and not wasDown and settled then FM.fdArmedAt = tick() end
             wasDown = down
             if FM.fdArmedAt
-               and (tick() - FM.fdArmedAt) > (FM.FriendDropGrabWait or 0.6) then
+               and (tick() - FM.fdArmedAt) > (FM.FriendDropGrabWait or 1.5) then
                 FM.fdArmedAt = nil
-                FM.FriendDropSolo = (FM.FriendDropSolo or 0) + 1
-                pcall(_G.SEHUB_FRIENDDROP)
+                -- Only dive if an egg is ACTUALLY in your hands. This used to fire on any E
+                -- press at all, so pressing E for anything else - or at nothing - teleported
+                -- you into the wall and killed you out of nowhere. There was no way to tell
+                -- back then; there is now.
+                local holding = false
+                local r = myRoot()
+                local okp, p = pcall(function() return r and r.Position end)
+                if okp and p then
+                    holding = #eggModelsNear(p, FM.CarryNear or 15) > 0
+                end
+                if holding then
+                    FM.FriendDropSolo = (FM.FriendDropSolo or 0) + 1
+                    pcall(_G.SEHUB_FRIENDDROP)
+                else
+                    FM.FriendDropNoEgg = (FM.FriendDropNoEgg or 0) + 1
+                end
             end
         else
             wasDown, FM.fdArmedAt = false, nil
         end
+        wasOn = onNow
     end
 end)
 
+-- The whole settings block sits in a do-block: it declares nine locals and this chunk
+-- is at Luau's 200-local ceiling. Anything that has to outlive it is hung off FM or _G.
+do
 local cfgSec = main:Section("Settings", "Full")
 cfgSec:Label("Keybinds and saved setups.")
 
@@ -3325,9 +3472,14 @@ local function cfgRead()
     if not okr or type(body) ~= "string" or body == "" then
         return nil, "no saved config yet"
     end
-    local f = loadstring("return " .. body)
+    -- Matcha's loadstring throws a chunk's return value away: loadstring("return 42")()
+    -- hands back nil. Assigning to a global does work, so pass the table out that way.
+    local f = loadstring("_G.SEHUB_CFGTMP = " .. body)
     if not f then return nil, "the config file is corrupt" end
-    local okc, c = pcall(f)
+    _G.SEHUB_CFGTMP = nil
+    local okc = pcall(f)
+    local c = _G.SEHUB_CFGTMP
+    _G.SEHUB_CFGTMP = nil
     if not okc or type(c) ~= "table" then return nil, "the config file is corrupt" end
     return c
 end
@@ -3374,6 +3526,8 @@ do
             FM.autoLoadedCfg = true
         end
     end
+end
+
 end
 
 local riftSec = farm:Section("Auto Rift-Farm", "Full")
@@ -4682,19 +4836,31 @@ local function farmStep()
                         local nSlots = (okn and kids) and #kids or 0
                         if nSlots == 0 then
                             FM.nightSince = FM.nightSince or now
+                            -- remember when night STARTED, not just that it is night
+                            FM.nightStart = FM.nightStart or now
                         elseif FM.nightSince then
                             FM.nightSince, FM.dayAt = nil, now
                         end
-                        -- Daytime opens with a 5 second countdown and the barrier is still
-                        -- up for all of it; moving during it just jams the farm against it.
-                        if FM.dayAt and (now - FM.dayAt) < (FM.BarrierWait or 5) then
-                            pcall(function()
-                                root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0)
-                            end)
-                            FM.State = string.format("Day countdown - waiting %.1fs",
-                                (FM.BarrierWait or 5) - (now - FM.dayAt))
-                            task.wait(0.1)
-                            return
+                        -- Night plus the opening slice of day - everything before the barrier
+                        -- lifts - runs about 15 seconds end to end. The old wait counted 5s
+                        -- from the moment eggs appeared, which is the wrong anchor and let the
+                        -- farm out early: the first teleport to the launch egg and the boss
+                        -- then failed against a barrier that was still up, costing a whole
+                        -- retry. Time it from the start of night instead.
+                        if FM.nightStart then
+                            local left = (FM.nightStart + (FM.NightHold or 15)) - now
+                            if left > 0 then
+                                pcall(function()
+                                    root.AssemblyLinearVelocity =
+                                        Vector3.new(0, -(FM.LandStick or 40), 0)
+                                end)
+                                FM.State = string.format(
+                                    "Waiting for the barrier (%.1fs)", left)
+                                task.wait(0.1)
+                                return
+                            end
+                            FM.nightStart = nil
+                            FM.BarrierWaits = (FM.BarrierWaits or 0) + 1
                         end
                     end
                     local RW = _G.SEHUB_WATCH or {}
@@ -4708,16 +4874,41 @@ local function farmStep()
                     if FM.hasEgg and FM.grabbedAt and (now - FM.grabbedAt) > 1.2
                        and (FM.carryChkAt or 0) < now then
                         FM.carryChkAt = now + (FM.CarryCheckEvery or 0.3)
-                        if #eggModelsNear(me, FM.CarryNear or 15) > 0 then
+                        -- Look with the WIDE finder (workspace plus the render containers) and
+                        -- at a generous radius. The narrow one kept missing the egg that was in
+                        -- our hands the whole time: Taken 1, EggsLost 2 - more losses than eggs
+                        -- ever picked up. Each false miss started a recovery, which froze us,
+                        -- tapped E, picked the same egg back up, and went round again.
+                        if #droppedEggsNear(me, FM.CarryNear or 25) > 0 then
                             FM.carryMiss = 0
                         else
                             FM.carryMiss = (FM.carryMiss or 0) + 1
-                            if FM.carryMiss >= (FM.CarryMissNeed or 3) then
+                            -- Patience is only needed when nothing corroborates the miss. If a
+                            -- boss just hit us, believe it straight away - waiting out the full
+                            -- 2.4s is why the recovery started so late you had already run half
+                            -- way home.
+                            local need = FM.CarryMissNeed or 8
+                            if FM.lastHitAt
+                               and (now - FM.lastHitAt) < (FM.BossHitMemory or 6) then
+                                need = FM.CarryMissHit or 2
+                            end
+                            if FM.carryMiss >= need then
                                 eggGone, FM.carryMiss = true, 0
                             end
                         end
                     end
                     if not FM.hasEgg then FM.carryMiss = 0 end
+                    -- A miss on its own proves nothing. The scan genuinely cannot see an egg
+                    -- that IS in our hands - CarryFalseLost climbed while hasEgg was true and
+                    -- the wide finder reported nothing within 60 studs. So unless a boss hit us
+                    -- just now, we are still carrying: believing otherwise is what sent the farm
+                    -- off for a second egg with the first still in hand, over and over.
+                    local hitRecent = FM.lastHitAt
+                        and (now - FM.lastHitAt) < (FM.BossHitMemory or 6)
+                    if eggGone and not hitRecent then
+                        FM.CarryFalseLost = (FM.CarryFalseLost or 0) + 1
+                        eggGone = false
+                    end
                     if eggGone and FM.carryKey and not FM.recovering then
                         local lostKey = FM.carryKey
                         FM.retryTries = FM.retryTries or {}
@@ -4740,10 +4931,15 @@ local function farmStep()
                         FM.EggsLost = (FM.EggsLost or 0) + 1
                         -- We know where we were standing when it went missing, so start the
                         -- recovery there rather than waiting for a boss hit to trigger it.
+                        -- We only get here with a real hit behind us, so go and fetch it.
                         if not FM.bhPhase then
+                            -- go back to where the hit landed: the egg fell there, and we have
+                            -- run on since while the carry check made its mind up
+                            local hp0 = FM.lastHitPos or me
                             FM.bhPhase, FM.bhAt = "stopped", now
-                            FM.bhX, FM.bhY, FM.bhZ = me.X, me.Y, me.Z
+                            FM.bhX, FM.bhY, FM.bhZ = hp0.X, hp0.Y, hp0.Z
                             FM.bhSeen, FM.bhPinX, FM.bhPinZ = nil, nil, nil
+                            FM.bhTried, FM.bhEggX, FM.bhEggZ = nil, nil, nil
                             FM.EggGoneRecoveries = (FM.EggGoneRecoveries or 0) + 1
                             FM.State = "Egg gone - going back for it"
                         end
@@ -5094,21 +5290,44 @@ local function farmStep()
                         -- loose do we then hop around the spot to reach it, and we are back to
                         -- farming the instant the ragdoll ends with the egg still in hand.
                         local freezeFor = FM.BossHitFreeze or 0.8
-                        -- Only a hit taken while you are actually carrying starts this. Turning
-                        -- up at an egg empty-handed and freezing on every hit just leaves you
-                        -- stood there being chain-hit with nothing to protect.
-                        local active = (hit and (FM.hasEgg or FM.bhPhase))
-                            or (FM.bhPhase and not FM.hasEgg
-                                -- long enough to sit out the ragdoll AND still have time
-                                -- to grab afterwards
-                                and (now - (FM.bhAt or now)) < (FM.BossHitHold or 7))
+                        -- NEVER stop while the egg is still in your hands. Freezing on any hit
+                        -- meant getting pinned in place on the way home and battered, and worse:
+                        -- straight after a successful pickup you are holding an egg AND still
+                        -- ragdolled, so it re-froze you and you lost it again. If you still have
+                        -- it, run. Only the recovery - started by the carry check once the egg
+                        -- is genuinely gone - gets to stop you.
+                        if hit and FM.hasEgg then
+                            -- remember where the hit landed, because the egg drops HERE even
+                            -- though we will not notice it is missing for another second
+                            FM.lastHitPos = Vector3.new(me.X, me.Y, me.Z)
+                            FM.lastHitAt = now
+                            FM.BossHits = (FM.BossHits or 0) + 1
+                        end
+                        local active = FM.bhPhase and not FM.hasEgg
+                            -- long enough to sit out the ragdoll AND still have time to grab
+                            and (now - (FM.bhAt or now)) < (FM.BossHitHold or 7)
                         if active and not nearSafe and (FM.rtBusyUntil or 0) < now
                            and not (AB.pinning and tick() < (AB.pinUntil or 0)) then
-                            if not FM.bhPhase then
-                                FM.bhPhase, FM.bhAt = "stopped", now
-                                FM.bhX, FM.bhY, FM.bhZ = me.X, me.Y, me.Z
-                                FM.bhTried = nil
-                                FM.BossHits = (FM.BossHits or 0) + 1
+                            -- A hard fling throws you hundreds of studs, and the position
+                            -- check reverts any teleport over about 150 - so we cannot simply
+                            -- pin back to the spot, we have to RUN there. Hold the grab clock
+                            -- at zero until we arrive, or the whole window expires in transit
+                            -- and the farm wanders off to a nearer egg instead.
+                            local backD = math.sqrt(
+                                (me.X - (FM.bhX or me.X)) ^ 2 + (me.Z - (FM.bhZ or me.Z)) ^ 2)
+                            if backD > (FM.BossHitRunBack or 120) then
+                                FM.bhAt = now
+                                local spB = FM.Speed
+                                if backD < (FM.Brake or 60) then
+                                    spB = math.max(40, spB * (backD / (FM.Brake or 60)))
+                                end
+                                local uxB, uzB = steerAround(me, FM.bhX, FM.bhZ, spB)
+                                drive(root, uxB * spB, uzB * spB, -(FM.Stick or 18))
+                                FM.State = string.format(
+                                    "Egg knocked away - running back (%.0f studs)", backD)
+                                FM.BossHitRunBacks = (FM.BossHitRunBacks or 0) + 1
+                                task.wait(0.03)
+                                return
                             end
                             -- No "have I got it back yet" test here any more. Standing ON a
                             -- dropped egg looks exactly like holding one, so that check was
@@ -5146,7 +5365,7 @@ local function farmStep()
                                 -- were only ever meant as the fallback.
                                 local tx, tz, bestD
                                 FM.bhSeen = FM.bhSeen or {}
-                                for _, e in ipairs(eggModelsNear(
+                                for _, e in ipairs(droppedEggsNear(
                                         Vector3.new(FM.bhX, FM.bhY, FM.bhZ),
                                         FM.BossHitFind or 60)) do
                                     -- anything drifting is in someone else's hands, or still
@@ -5193,9 +5412,17 @@ local function farmStep()
                                 end
                                 FM.bhPinX, FM.bhPinZ = hx, hz
                             else
-                                -- already on it: just hold still and let the tapping work
+                                -- On the spot. Hold X and Z but let yourself DROP. Zeroing the
+                                -- velocity every step left you hovering at whatever height you
+                                -- were hit at, and a prompt does not render while you are in
+                                -- the air - so every single tap missed. Ghost sets Stick to 0,
+                                -- so the push has to come from LandStick.
+                                local okY, curY = pcall(function() return root.Position.Y end)
+                                local useY = (okY and curY) or FM.bhY
                                 pcall(function()
-                                    root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                                    root.CFrame = CFrame.new(hx, useY, hz)
+                                    root.AssemblyLinearVelocity =
+                                        Vector3.new(0, -(FM.LandStick or 40), 0)
                                 end)
                             end
                             if ST.On then pcall(function() patchNear(hSpot, 25) end) end
@@ -5229,10 +5456,20 @@ local function farmStep()
                                         end
                                     end
                                 end
+                                -- Instant Steal puts the hold at 0, so holding the key down
+                                -- achieves nothing - the problem is timing. A single press
+                                -- often lands BEFORE the prompt exists and is simply thrown
+                                -- away, which is why the launch-egg grab taps about six times
+                                -- a second rather than pressing once. Do the same here.
                                 if keypress then
-                                    pcall(function() keypress(0x45) end)
-                                    task.wait(FM.BossHitPress or 0.3)
-                                    if keyrelease then pcall(function() keyrelease(0x45) end) end
+                                    local tapEnd = tick() + (FM.BossHitTapFor or 2)
+                                    while tick() < tapEnd do
+                                        pcall(function() keypress(0x45) end)
+                                        task.wait(0.06)
+                                        if keyrelease then pcall(function() keyrelease(0x45) end) end
+                                        task.wait(0.1)
+                                        FM.BossHitTaps = (FM.BossHitTaps or 0) + 1
+                                    end
                                 end
                                 task.wait(0.15)
                                 -- Assume it worked and head home. If it did not, the carry check
@@ -5292,7 +5529,12 @@ local function farmStep()
                             FM.DeathDropAny = (FM.DeathDropAny or 0) + 1
                         end
                         FM.ddLastChar = curChar
-                        if FM.DeathDrop and not FM.ddPhase and farEnough then
+                        if FM.DeathDrop and not FM.ddPhase and farEnough
+                           and (now - (FM.fdDoneAt or 0)) > (FM.FriendDropCool or 2)
+                           -- and only on an egg we actually picked up recently, never on
+                           -- leftover state from a previous run
+                           and FM.grabbedAt
+                           and (now - FM.grabbedAt) < (FM.FriendDropFresh or 60) then
                             FM.ddPhase, FM.ddAt = "dying", now
                             FM.ddDived, FM.ddPushed = nil, nil
                             FM.ddChar = myCharacter()
@@ -5376,6 +5618,7 @@ local function farmStep()
                                     -- the egg stays where it fell for a friend to take, so
                                     -- there is nothing to wait for and nothing to recover
                                     FM.ddPhase, FM.ddSpawnAt = nil, nil
+                                    FM.fdDoneAt = now
                                     FM.FriendDropsMade = (FM.FriendDropsMade or 0) + 1
                                     FM.State = "Friend drop - left for a friend, back to farming"
                                 else
@@ -6040,11 +6283,26 @@ local function farmStep()
                             if best.name then what = " for " .. best.name end
                             FM.State = string.format("Going to %s%s", best.area, what)
                         else
-                            pcall(function()
-                                root.AssemblyLinearVelocity =
-                                    Vector3.new(0, -(FM.Stick or 18), 0)
-                            end)
-                            task.wait(0.03)
+                            -- Get both feet down before pressing anything. Ghost sets Stick to
+                            -- 0, so this used to apply no downward force whatsoever and you
+                            -- could still be in the air from the snap - where the prompt does
+                            -- not show and the grab quietly fails. Breaks out as soon as your
+                            -- height stops changing, so it costs nothing when already landed.
+                            do
+                                local tG, lastY = tick(), nil
+                                while (tick() - tG) < (FM.GroundWait or 0.5) do
+                                    pcall(function()
+                                        root.AssemblyLinearVelocity =
+                                            Vector3.new(0, -(FM.LandStick or 40), 0)
+                                    end)
+                                    task.wait(0.05)
+                                    local okY, py = pcall(function() return root.Position.Y end)
+                                    if okY and py then
+                                        if lastY and math.abs(py - lastY) < 0.05 then break end
+                                        lastY = py
+                                    end
+                                end
+                            end
                             local nearPrompts = promptsNear(best.pos, 30)
                             if ST.On then _G.SEHUB_PATCHNEAR(best.pos, 30, nearPrompts) end
                             local hd = _G.SEHUB_HOLDTIME(best.pos, 20, nearPrompts)
