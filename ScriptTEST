@@ -313,6 +313,40 @@ local function trapPositions()
 end
 _G.SEHUB_TRAPS = trapPositions
 
+-- A carried or dropped egg is a workspace Model whose name contains "Egg" and which has a
+-- Hitbox, e.g. "FirstAreaEgg_84080151_5965395_Forest:Slot_005". Carried, it tracks you a
+-- stud or two away; dropped, it sits still. Nest eggs live inside AreaEggSlotsClient, not
+-- as workspace children, so they do not show up here.
+-- (This replaces an older guess that egg models had 32-character GUID names. They never
+-- have, so every scan built on that matched nothing at all.)
+local function eggModelsNear(pos, range)
+    local out = {}
+    local okk, kids = pcall(function() return workspace:GetChildren() end)
+    if not okk or not kids then return out end
+    for _, c in ipairs(kids) do
+        local okc, cl = pcall(function() return c.ClassName end)
+        if okc and cl == "Model" then
+            local okn, nm = pcall(function() return c.Name end)
+            if okn and type(nm) == "string"
+               and string.find(string.lower(nm), "egg", 1, true) then
+                local okq, q = pcall(function()
+                    local hb = c:FindFirstChild("Hitbox")
+                    return hb and hb.Position
+                end)
+                if okq and q and pos then
+                    local d = math.sqrt((q.X - pos.X) ^ 2 + (q.Z - pos.Z) ^ 2)
+                    if d <= (range or math.huge) then
+                        out[#out + 1] = { m = c, pos = q, d = d, name = nm }
+                    end
+                end
+            end
+        end
+    end
+    table.sort(out, function(a, b) return a.d < b.d end)
+    return out
+end
+_G.SEHUB_EGGMODELS = eggModelsNear
+
 local steerAround, drive
 do
     local CLEAR = 8
@@ -2944,6 +2978,21 @@ farmToggle = farmSec:Toggle("Auto Farm", false, function(v)
     FM.On = v
     if v then
         skipRally()
+        -- Turning the farm on while you are stood on your treadmill used to strip you where
+        -- you stand, and stepping off a treadmill stripped crashes the client. Spot it and
+        -- hand it straight to the normal treadmill-exit path, which jumps you off properly.
+        do
+            local tf = _G.SEHUB_TREADMILL
+            local tp = tf and tf()
+            local r = myRoot()
+            local okp, p = pcall(function() return r and r.Position end)
+            if tp and okp and p
+               and math.sqrt((p.X - tp.X) ^ 2 + (p.Z - tp.Z) ^ 2) < (FM.TreadmillNear or 14) then
+                FM.onTreadmill, FM.treadVisit = true, true
+                FM.StartedOnTreadmill = (FM.StartedOnTreadmill or 0) + 1
+                FM.State = "Started on the treadmill - stepping off first"
+            end
+        end
         if not AB.Zone then
             notify("Auto Farm", "No safe zone set", 4, "warn")
         end
@@ -2967,8 +3016,8 @@ farmSec:Toggle("Avoid Players", false, function(v) FM.AvoidPlayers = v end,
     "Steers around other players, like traps and the boss rift.")
 farmSec:Toggle("Avoid Bosses", true, function(v) FM.AvoidBosses = v end,
     "Makes a small turn around any boss that is moving, so you do not run into the one you just woke while it walks back. Ignores a boss sitting on your target egg, and stands down during a Ragdoll Teleport.")
-FM.TreadmillFarm = false
-farmSec:Toggle("Auto Treadmill Farm", false, function(v) FM.TreadmillFarm = v end,
+FM.TreadmillFarm = true
+farmSec:Toggle("Auto Treadmill Farm", true, function(v) FM.TreadmillFarm = v end,
     "Trains on your treadmill whenever there are no eggs to farm.")
 FM.RagdollTp = true
 farmSec:Toggle("Ragdoll Teleport", true, function(v) FM.RagdollTp = v end,
@@ -3057,9 +3106,9 @@ pcall(function() areaDrop:Set({}) end)
 FM.Areas, FM.AllAreas = {}, false
 FM.areaDrop = areaDrop
 farmSec:Divider()
-farmSec:Slider("Run Speed", 500, 10, 40, 600, " studs/s", function(v)
+farmSec:Slider("Run Speed", 500, 10, 40, 900, " studs/s", function(v)
     FM.SpeedSet = v
-    FM.Speed = math.min(v, 600)
+    FM.Speed = math.min(v, 900)
 end, "How fast you run. Your character is moved into the Camera while farming, so the speed check has nothing left to read.")
 farmSec:Slider("Grab Escape Delay", 0.45, 0.05, 0, 1.5, " s", function(v) FM.GrabEscapeDelay = v end,
     "Escape this long after grabbing an egg. 0 = as soon as the grab registers.")
@@ -3099,12 +3148,17 @@ end)
 
 -- Friend Drop on its own, the way Auto Anti-Boss works without the farm: you press E,
 -- the egg goes in your hands, and the dive happens.
--- The 1.5s settle Friend Drop used to get from the old Teleport Delay: give the egg time
--- to be properly in your hands before the dive, or the game just returns it to its nest.
-FM.FriendDropDelay = 1.5
+-- The 1.5s wait now lives where it belongs: on the ragdoll teleport that carries you to the
+-- egg (FriendDropTpDelay above). Once the egg is actually in your hands the dive has to be
+-- FAST - anything slow gets you ragdolled by the boss before the wall finishes the job, which
+-- is what "the teleport spam is too slow to die" was. So: no standoff hold, and sink hard.
+FM.FriendDropTpDelay = 1.5
+FM.FriendDropDelay = 0
+FM.FriendDropSink = 20
+FM.FriendDropMaxSink = 30
 FM.FriendDropGrabWait = 1.5
 -- last-resort kill, late enough that the wall gets a real chance first
-FM.FriendDropKillAfter = 5
+FM.FriendDropKillAfter = 4
 _G.SEHUB_FRIENDDROP = function()
     if FM.fdBusy then return false end
     FM.fdBusy = true
@@ -3168,6 +3222,159 @@ SESPAWN("frienddrop", function()
         end
     end
 end)
+
+local cfgSec = main:Section("Settings", "Full")
+cfgSec:Label("Keybinds and saved setups.")
+
+FM.FarmKey = FM.FarmKey or "F2"
+cfgSec:Keybind("Farm Key", "F2", function(k) FM.FarmKey = k end,
+    "Starts and stops Auto Farm.")
+SESPAWN("farm key", function()
+    local wasDown = false
+    while _G.SEHUB_GEN == GEN do
+        local down = keyDown(tostring(FM.FarmKey or "F2"))
+        if down and not wasDown then
+            pcall(function() farmToggle:Set(not FM.On) end)
+        end
+        wasDown = down
+        task.wait(0.05)
+    end
+end)
+
+local CFG_FILE = "stealhub_config.txt"
+local CFG_KEYS = {
+    "SpeedSet", "Priority", "RagdollTp", "DeathDrop", "AutoBoss", "AvoidPlayers",
+    "AvoidBosses", "TreadmillFarm", "AntiAfk", "GrabEscapeDelay", "Rift",
+    "CarryCap", "FarmKey",
+}
+
+local function cfgSerialize(v)
+    local t = type(v)
+    if t == "number" or t == "boolean" then return tostring(v) end
+    if t == "string" then return string.format("%q", v) end
+    if t == "table" then
+        local out = { "{" }
+        for k, vv in pairs(v) do
+            local kt, vt = type(k), type(vv)
+            if vt == "number" or vt == "boolean" or vt == "string" or vt == "table" then
+                if kt == "string" then
+                    out[#out + 1] = string.format("[%q]=", k) .. cfgSerialize(vv) .. ","
+                elseif kt == "number" then
+                    out[#out + 1] = cfgSerialize(vv) .. ","
+                end
+            end
+        end
+        out[#out + 1] = "}"
+        return table.concat(out)
+    end
+    return "nil"
+end
+
+local function cfgGather()
+    local c = {}
+    for _, k in ipairs(CFG_KEYS) do c[k] = FM[k] end
+    c.Areas, c.AllAreas, c.Always = FM.Areas, FM.AllAreas, FM.Always
+    c.StealOn, c.StealDist = ST.On, ST.Dist
+    c.EscapeKey = AB.Key
+    c.AutoLoad = FM.AutoLoadCfg and true or false
+    return c
+end
+
+local function cfgApply(c)
+    for _, k in ipairs(CFG_KEYS) do
+        if c[k] ~= nil then FM[k] = c[k] end
+    end
+    if type(c.Areas) == "table" then FM.Areas = c.Areas end
+    if c.AllAreas ~= nil then FM.AllAreas = c.AllAreas end
+    if type(c.Always) == "table" then
+        FM.Always = c.Always
+        local n = 0
+        for _ in pairs(c.Always) do n = n + 1 end
+        FM.AlwaysN = n
+    end
+    if c.StealOn ~= nil then ST.On = c.StealOn end
+    if c.StealDist ~= nil then ST.Dist = c.StealDist end
+    if c.EscapeKey then AB.Key = c.EscapeKey end
+    if c.AutoLoad ~= nil then
+        FM.AutoLoadCfg = c.AutoLoad
+        -- the toggle is built after this function, so only Set it once it exists
+        pcall(function() if FM.autoTog then FM.autoTog:Set(c.AutoLoad and true or false) end end)
+    end
+    FM.Speed = math.min(FM.SpeedSet or 500, 900)
+    -- Push what we can back into the menu. Anything without a stored handle still takes
+    -- effect, because the farm reads these values directly - the control just will not
+    -- redraw until the next load.
+    pcall(function()
+        if FM.priDrop and type(c.Priority) == "string" then FM.priDrop:Set({ c.Priority }) end
+    end)
+    pcall(function()
+        if FM.areaDrop and type(c.Areas) == "table" then
+            local sel = {}
+            for a, on in pairs(c.Areas) do if on then sel[#sel + 1] = a end end
+            if c.AllAreas then sel = { "All" } end
+            FM.areaDrop:Set(sel)
+        end
+    end)
+    pcall(function() if FM.fdTog then FM.fdTog:Set(FM.DeathDrop and true or false) end end)
+    pcall(function() if FM.bossTog then FM.bossTog:Set(FM.AutoBoss and true or false) end end)
+end
+
+local function cfgRead()
+    if not readfile then return nil, "this executor cannot read files" end
+    local okr, body = pcall(function() return readfile(CFG_FILE) end)
+    if not okr or type(body) ~= "string" or body == "" then
+        return nil, "no saved config yet"
+    end
+    local f = loadstring("return " .. body)
+    if not f then return nil, "the config file is corrupt" end
+    local okc, c = pcall(f)
+    if not okc or type(c) ~= "table" then return nil, "the config file is corrupt" end
+    return c
+end
+
+local function cfgSave()
+    if not writefile then return false, "this executor cannot write files" end
+    local body = cfgSerialize(cfgGather())
+    local ok = pcall(function() writefile(CFG_FILE, body) end)
+    return ok, ok and (tostring(#body) .. " bytes") or "write failed"
+end
+
+local function cfgLoad()
+    local c, err = cfgRead()
+    if not c then return false, err end
+    cfgApply(c)
+    return true, "loaded"
+end
+_G.SEHUB_CFGSAVE, _G.SEHUB_CFGLOAD = cfgSave, cfgLoad
+
+cfgSec:Button("Save Config", function()
+    local ok, msg = cfgSave()
+    notify("Settings", ok and ("Config saved (" .. tostring(msg) .. ")")
+        or ("Could not save: " .. tostring(msg)), 3, ok and "good" or "warn")
+end, "Writes your current settings to " .. CFG_FILE .. ".")
+
+cfgSec:Button("Load Config", function()
+    local ok, msg = cfgLoad()
+    notify("Settings", ok and "Config loaded" or ("Could not load: " .. tostring(msg)),
+        3, ok and "good" or "warn")
+end, "Applies the settings you last saved.")
+
+FM.AutoLoadCfg = false
+FM.autoTog = cfgSec:Toggle("Auto-Load Config", false, function(v) FM.AutoLoadCfg = v end,
+    "Applies your saved config automatically the next time the script loads. Save again "
+    .. "after turning this on, or it will not be remembered.")
+
+cfgSec:Label("Config file: " .. CFG_FILE)
+
+-- Apply a saved config at startup, but only when it was saved with Auto-Load switched on.
+do
+    local c = cfgRead()
+    if c and c.AutoLoad then
+        if pcall(function() cfgApply(c) end) then
+            FM.autoLoadedCfg = true
+        end
+    end
+end
 
 local riftSec = farm:Section("Auto Rift-Farm", "Full")
 riftSec:Label("Farms the pets your selected rifts need.")
@@ -4021,8 +4228,21 @@ do
         -- the cause. Stand down for the treadmill entirely: the body goes back while you
         -- are stood still on your own plot, which is the calmest moment there is, and you
         -- do not need the speed to train.
+        -- Belt and braces for the treadmill: go by where you actually are, not just the
+        -- flags. However you got onto it - the farm walking you there, or you turning the
+        -- farm on mid-workout - stepping off stripped crashes the client.
+        local onTreadNow = FM.onTreadmill or FM.treadVisit
+        if not onTreadNow then
+            local tp = myTreadmill()
+            local rr = myRoot()
+            local okrp, rp = pcall(function() return rr and rr.Position end)
+            if tp and okrp and rp then
+                onTreadNow = math.sqrt((rp.X - tp.X) ^ 2 + (rp.Z - tp.Z) ^ 2)
+                    < (FM.TreadmillNear or 14)
+            end
+        end
         local want = FM.Ghost and not off
-            and not FM.onTreadmill and not FM.treadVisit
+            and not onTreadNow
             -- Friend Drop needs the WALL to kill you. That specific death is what drops
             -- the egg by your plot; an ordinary health-zero death just returns it to its
             -- nest, which is what "egg gets returned" was. A stripped character takes no
@@ -4039,7 +4259,7 @@ do
             return
         end
         FM.Stick = 0
-        FM.Speed = math.min(FM.SpeedSet or 300, 600)
+        FM.Speed = math.min(FM.SpeedSet or 300, 900)
         local now = tick()
         -- Never hold a dead or half-loaded character stripped: dying in ghost leaves you
         -- permanently dead. Hand the body back the instant health hits 0, and stay out of
@@ -4116,8 +4336,20 @@ do
         if FM.Ghost and not FM.DeathDrop and not FM.GhostSaved then
             FM.RagdollTpWhy = "waiting for ghost mode to take hold"
             FM.RagdollTpWaits = (FM.RagdollTpWaits or 0) + 1
+            FM.rtGhostWaitAt = FM.rtGhostWaitAt or now
+            if (now - FM.rtGhostWaitAt) < (FM.RagdollTpGhostWait or 2) then
+                -- Stand still instead of handing the step back to the farm. Letting it set
+                -- off for the target is why you ran the wrong way for a second or two and
+                -- then got yanked back to the launch egg the moment ghost engaged.
+                pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, 0, 0) end)
+                FM.State = "Waiting for ghost mode before the teleport"
+                task.wait(0.03)
+                return true
+            end
+            -- waited long enough - ghost is not coming, so just run it normally
             return false
         end
+        FM.rtGhostWaitAt = nil
         FM.RagdollTpWhy = nil
 
         local dl = math.sqrt((launchPos.X - me.X) ^ 2 + (launchPos.Z - me.Z) ^ 2)
@@ -4290,8 +4522,13 @@ do
 
         FM.State = "Ragdoll teleport - teleporting"
         local writes, holds, cut, misses = 0, 0, false, 0
+        -- Friend Drop needs the old 1.5s wait right here. At 0 the pin lands while the ragdoll
+        -- is still bouncing and the whole dive goes wrong from there. The ordinary farm is fine
+        -- at 0 because it is not about to throw itself at a wall straight afterwards.
+        local rtWait = FM.RagdollTpDelay or 0
+        if FM.DeathDrop then rtWait = FM.FriendDropTpDelay or 1.5 end
         local t2 = tick()
-        while (tick() - t2) < (FM.RagdollTpDelay or 0) and ragdollJoints() and rootAlive(root) do
+        while (tick() - t2) < rtWait and ragdollJoints() and rootAlive(root) do
             task.wait(0.03)
         end
         local pinY = ty + (FM.RagdollTpHeight or 0)
@@ -4299,7 +4536,9 @@ do
             AB.rtCF = CFrame.new(lx, pinY, lz)
             AB.rtLive = tick() + 6
         end
-        while FM.On and (tick() - t2) < 5 and ragdollJoints() and rootAlive(root) do
+        -- the pin window is measured from before the wait, so give it that time back
+        while FM.On and (tick() - t2) < (5 + rtWait)
+              and ragdollJoints() and rootAlive(root) do
             for _ = 1, math.max(1, math.floor(FM.RagdollTpBurst or 1)) do
                 pcall(function()
                     root.CFrame = CFrame.new(lx, pinY, lz)
@@ -4330,10 +4569,21 @@ do
         if landed then
             FM.RagdollTps = (FM.RagdollTps or 0) + 1
             if ST.On then pcall(function() patchNear(tpos, 30) end) end
-            local settle2 = tick()
-            while (tick() - settle2) < 0.3 and rootAlive(root) do
-                pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0) end)
+            -- Ghost sets Stick to 0, because downward force at speed is what the ground
+            -- check kills you for. That made this settle push nothing at all, which is why
+            -- you were left hanging in the air drifting slowly down. Use a landing push of
+            -- its own, and hold it until you actually stop falling.
+            local settle2, lastY = tick(), nil
+            while (tick() - settle2) < (FM.LandSettle or 1.5) and rootAlive(root) do
+                pcall(function()
+                    root.AssemblyLinearVelocity = Vector3.new(0, -(FM.LandStick or 40), 0)
+                end)
                 task.wait(0.05)
+                local oky, py = pcall(function() return root.Position.Y end)
+                if oky and py then
+                    if lastY and math.abs(py - lastY) < 0.05 then break end
+                    lastY = py
+                end
             end
             FM.RagdollTpStreak = 0
             finish(nil, "Ragdoll teleport - landed")
@@ -4448,17 +4698,27 @@ local function farmStep()
                         end
                     end
                     local RW = _G.SEHUB_WATCH or {}
-                    -- A plain ragdoll no longer means the egg is gone. It did before Ghost,
-                    -- when a hit flung you across the map; now you stay put and the boss-hit
-                    -- stop taps E to pick it straight back up. Counting every ragdoll as a
-                    -- loss is what sent you off for a second egg while still holding the
-                    -- first. Only a hard fling counts. Set FM.LoseEggOnRagdoll = true to go
-                    -- back to the old behaviour.
-                    local hitAt = FM.LoseEggOnRagdoll
-                        and math.max(RW.lastRagAt or 0, RW.flingHardAt or 0)
-                        or (RW.flingHardAt or 0)
-                    if FM.hasEgg and FM.carryKey and FM.grabbedAt and hitAt > FM.grabbedAt + 0.1
-                       and not FM.recovering then
+                    -- Stop guessing. A carried egg is a workspace model that follows you a
+                    -- stud or two away, so just look: if we believe we are carrying and there
+                    -- is no egg anywhere near us for about a second, it is genuinely gone.
+                    -- This replaces the ragdoll/fling heuristics, which were wrong in both
+                    -- directions - first inventing losses from our own teleports, then missing
+                    -- real ones once that was tightened up.
+                    local eggGone = false
+                    if FM.hasEgg and FM.grabbedAt and (now - FM.grabbedAt) > 1.2
+                       and (FM.carryChkAt or 0) < now then
+                        FM.carryChkAt = now + (FM.CarryCheckEvery or 0.3)
+                        if #eggModelsNear(me, FM.CarryNear or 15) > 0 then
+                            FM.carryMiss = 0
+                        else
+                            FM.carryMiss = (FM.carryMiss or 0) + 1
+                            if FM.carryMiss >= (FM.CarryMissNeed or 3) then
+                                eggGone, FM.carryMiss = true, 0
+                            end
+                        end
+                    end
+                    if not FM.hasEgg then FM.carryMiss = 0 end
+                    if eggGone and FM.carryKey and not FM.recovering then
                         local lostKey = FM.carryKey
                         FM.retryTries = FM.retryTries or {}
                         local rt = FM.retryTries[lostKey]
@@ -4478,6 +4738,15 @@ local function farmStep()
                         FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
                         FM.carryKey = nil
                         FM.EggsLost = (FM.EggsLost or 0) + 1
+                        -- We know where we were standing when it went missing, so start the
+                        -- recovery there rather than waiting for a boss hit to trigger it.
+                        if not FM.bhPhase then
+                            FM.bhPhase, FM.bhAt = "stopped", now
+                            FM.bhX, FM.bhY, FM.bhZ = me.X, me.Y, me.Z
+                            FM.bhSeen, FM.bhPinX, FM.bhPinZ = nil, nil, nil
+                            FM.EggGoneRecoveries = (FM.EggGoneRecoveries or 0) + 1
+                            FM.State = "Egg gone - going back for it"
+                        end
                     end
                     if FM.recovering then
                         local sinceRag = now - math.max(RW.lastRagAt or 0, RW.flingAt or 0, FM.recoverStart or 0)
@@ -4698,6 +4967,21 @@ local function farmStep()
                             local key = FM.pendingKey
                             local pressAt = FM.pendingAt or 0
                             FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
+                            -- The slot we aimed at is still sitting there - but that does not
+                            -- mean we came away empty. A big egg between us and it takes the
+                            -- prompt, so we walk off holding that one instead. Going home with
+                            -- something beats retrying for the one we wanted, so if an egg is
+                            -- actually with us, keep it and deliver it.
+                            if #eggModelsNear(me, FM.CarryNear or 15) > 0 then
+                                FM.hasEgg, FM.eggIsTool = true, false
+                                FM.grabbedAt = FM.grabbedAt or tick()
+                                FM.carrySlotGone = true
+                                FM.WrongEggKept = (FM.WrongEggKept or 0) + 1
+                                if key then FM.visited[key] = now end
+                                FM.State = "Got a different egg - taking it anyway"
+                                task.wait(0.05)
+                                return
+                            end
                             local RWm = _G.SEHUB_WATCH or {}
                             local reactedAt = math.max(FM.wakeAt or 0, RWm.flingHardAt or 0, RWm.lastRagAt or 0)
                             if key and reactedAt > pressAt then
@@ -4804,55 +5088,116 @@ local function farmStep()
                         local nearSafe = safeP
                             and math.sqrt((me.X - safeP.X) ^ 2 + (me.Z - safeP.Z) ^ 2)
                                 < (FM.BossHitSkipNear or 60)
-                        -- Only stop if the egg actually went missing. A ragdoll on its own no
-                        -- longer takes it, so standing there sweeping for an egg that is still
-                        -- in your hands just parks you next to the boss until it hits you
-                        -- again. Still holding it means keep running.
-                        local active = (hit
-                            or (FM.bhPhase and (now - (FM.bhAt or now)) < (FM.BossHitHold or 2.5)))
-                            and not FM.hasEgg
+                        -- The moment a boss hits you: stop dead. Speed to zero right where it
+                        -- happened, egg or no egg - being dragged onward while it comes loose
+                        -- is what leaves you too far away to get it back. Only if it did come
+                        -- loose do we then hop around the spot to reach it, and we are back to
+                        -- farming the instant the ragdoll ends with the egg still in hand.
+                        local freezeFor = FM.BossHitFreeze or 0.8
+                        -- Only a hit taken while you are actually carrying starts this. Turning
+                        -- up at an egg empty-handed and freezing on every hit just leaves you
+                        -- stood there being chain-hit with nothing to protect.
+                        local active = (hit and (FM.hasEgg or FM.bhPhase))
+                            or (FM.bhPhase and not FM.hasEgg
+                                -- long enough to sit out the ragdoll AND still have time
+                                -- to grab afterwards
+                                and (now - (FM.bhAt or now)) < (FM.BossHitHold or 7))
                         if active and not nearSafe and (FM.rtBusyUntil or 0) < now
                            and not (AB.pinning and tick() < (AB.pinUntil or 0)) then
                             if not FM.bhPhase then
                                 FM.bhPhase, FM.bhAt = "stopped", now
                                 FM.bhX, FM.bhY, FM.bhZ = me.X, me.Y, me.Z
+                                FM.bhTried = nil
                                 FM.BossHits = (FM.BossHits or 0) + 1
                             end
-                            -- the instant it is back in your hands, drop everything and run
-                            local backTool = heldEggTool()
-                            if backTool then
-                                FM.hasEgg, FM.eggIsTool = true, true
-                                FM.grabbedAt, FM.lastPressAt = tick(), tick()
-                                FM.bhPhase, FM.bhTapAt = nil, nil
-                                FM.BossHitRecovered = (FM.BossHitRecovered or 0) + 1
-                                FM.State = "Got the egg back - going"
-                                task.wait(0.02)
-                                return
-                            end
-                            -- Hold dead still for the first second so the ragdoll cannot slide you
-                            -- off the spot, then hop around it in widening rings. We have no way to
-                            -- see where the egg landed, so sweep the area rather than guess.
+                            -- No "have I got it back yet" test here any more. Standing ON a
+                            -- dropped egg looks exactly like holding one, so that check was
+                            -- calling success before we had even pressed E. One attempt at a
+                            -- fixed time is simpler and does not need to tell them apart.
+                            -- Freeze first so the ragdoll cannot slide you off the spot, then
+                            -- hop around it in widening rings - but only when the egg actually
+                            -- came loose. We cannot see where it landed, so sweep rather than
+                            -- guess.
                             local held = now - (FM.bhAt or now)
                             local hx, hz = FM.bhX, FM.bhZ
-                            if held > 1 then
-                                local stepN = math.floor((held - 1) / (FM.BossHitHopGap or 0.3))
-                                -- step out every 4 points, not every 8: the old pacing only
-                                -- reached 8 studs before the hold ran out. This walks
-                                -- 4 -> 8 -> 12 -> 16 and still covers every angle, because
-                                -- consecutive rings use opposite halves of the circle.
-                                local ring = 4 + math.floor(stepN / 4) * 4
-                                local maxR = FM.BossHitReach or 16
-                                if ring > maxR then ring = maxR end
-                                local ang = (stepN % 8) * (math.pi / 4)
-                                hx = FM.bhX + math.cos(ang) * ring
-                                hz = FM.bhZ + math.sin(ang) * ring
-                                FM.BossHitHops = (FM.BossHitHops or 0) + 1
+                            -- Residual fling speed from the ragdoll drags the pin straight back
+                            -- - the very thing that made the original teleport need a 1.5s wait.
+                            -- Do not try to move anywhere until it has died down: judge that by
+                            -- both the leftover velocity and whether the last pin actually held.
+                            local okv, vel = pcall(function() return root.AssemblyLinearVelocity end)
+                            local vmag = 0
+                            if okv and vel then
+                                vmag = math.sqrt(vel.X ^ 2 + vel.Y ^ 2 + vel.Z ^ 2)
+                            end
+                            local drift = 0
+                            local okp2, pnow = pcall(function() return root.Position end)
+                            if okp2 and pnow and FM.bhPinX then
+                                drift = math.sqrt((pnow.X - FM.bhPinX) ^ 2
+                                    + (pnow.Z - FM.bhPinZ) ^ 2)
+                            end
+                            local settled = vmag < (FM.BossHitSettleSpeed or 25) and drift < 6
+                            if not settled then
+                                FM.BossHitSettling = (FM.BossHitSettling or 0) + 1
+                            end
+                            if not FM.hasEgg and held > freezeFor and settled then
+                                -- Look for the egg itself and go straight to it. The old Death
+                                -- Drop recovery found dropped eggs with exactly this scan and
+                                -- banked 10 of them, so the listing does see them - blind rings
+                                -- were only ever meant as the fallback.
+                                local tx, tz, bestD
+                                FM.bhSeen = FM.bhSeen or {}
+                                for _, e in ipairs(eggModelsNear(
+                                        Vector3.new(FM.bhX, FM.bhY, FM.bhZ),
+                                        FM.BossHitFind or 60)) do
+                                    -- anything drifting is in someone else's hands, or still
+                                    -- in ours; only something lying still is a dropped egg
+                                    local prev = FM.bhSeen[e.name]
+                                    local still = prev and math.sqrt(
+                                        (e.pos.X - prev.X) ^ 2 + (e.pos.Z - prev.Z) ^ 2) < 2
+                                    FM.bhSeen[e.name] = e.pos
+                                    if still and (not bestD or e.d < bestD) then
+                                        tx, tz, bestD = e.pos.X, e.pos.Z, e.d
+                                    end
+                                end
+                                if tx then
+                                    FM.bhEggX, FM.bhEggZ = tx, tz
+                                    FM.BossHitFound = (FM.BossHitFound or 0) + 1
+                                end
+                                if FM.bhEggX then
+                                    -- Locked on: go to the egg and stay there. No ring-hopping
+                                    -- fallback any more - a recording showed it circling for
+                                    -- the full 7s, which is both the teleporting-in-circles and
+                                    -- the standing-still-being-battered. If we cannot see the
+                                    -- egg we simply hold the spot where it was lost, which is
+                                    -- where it is.
+                                    hx, hz = FM.bhEggX, FM.bhEggZ
+                                    FM.BossHitHops = (FM.BossHitHops or 0) + 1
+                                end
                             end
                             local hSpot = Vector3.new(hx, FM.bhY, hz)
-                            pcall(function()
-                                root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-                                root.CFrame = CFrame.new(hx, FM.bhY, hz)
-                            end)
+                            -- Only teleport if we are not already there. Rewriting the position
+                            -- every step while stood on the egg is the constant teleporting.
+                            local okpp, pp = pcall(function() return root.Position end)
+                            local offSpot = (not okpp) or (not pp)
+                                or math.sqrt((pp.X - hx) ^ 2 + (pp.Z - hz) ^ 2)
+                                    > (FM.BossHitOnSpot or 2)
+                            if offSpot then
+                                -- One write per step loses to the ragdoll. Burst several, the
+                                -- way the ragdoll teleport pin does, so it outlasts the bounce.
+                                for _ = 1, (FM.BossHitBurst or 4) do
+                                    pcall(function()
+                                        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                                        root.CFrame = CFrame.new(hx, FM.bhY, hz)
+                                    end)
+                                    task.wait(FM.BossHitGap or 0.01)
+                                end
+                                FM.bhPinX, FM.bhPinZ = hx, hz
+                            else
+                                -- already on it: just hold still and let the tapping work
+                                pcall(function()
+                                    root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                                end)
+                            end
                             if ST.On then pcall(function() patchNear(hSpot, 25) end) end
                             -- stretch the prompts too, so we do not have to land right on top of it
                             if memory_read and memory_write then
@@ -4867,20 +5212,56 @@ local function farmStep()
                                     end
                                 end
                             end
-                            -- a single press lands before the prompt appears, so tap about 6 times a second
-                            if keypress and (FM.bhTapAt or 0) < now then
-                                FM.bhTapAt = now + 0.16
-                                pcall(function() keypress(0x45) end)
-                                task.wait(0.04)
-                                if keyrelease then pcall(function() keyrelease(0x45) end) end
+                            -- Wait out the ragdoll, then ONE grab, then leave either way.
+                            if not FM.bhTried and held > (FM.BossHitGrabAfter or 3) then
+                                FM.bhTried = true
+                                FM.State = "Boss hit - picking the egg back up"
+                                if ST.On then pcall(function() patchNear(hSpot, 25) end) end
+                                if memory_read and memory_write then
+                                    for _, pe in ipairs(promptsNear(hSpot, 25)) do
+                                        local pa = addrOf(pe.p)
+                                        if pa and promptWritable(pa) then
+                                            pcall(function()
+                                                memory_write("float", pa + ST.OFF_HOLD, 0)
+                                                memory_write("float", pa + ST.OFF_DIST, 30)
+                                                memory_write("byte", pa + ST.OFF_LOS, 0)
+                                            end)
+                                        end
+                                    end
+                                end
+                                if keypress then
+                                    pcall(function() keypress(0x45) end)
+                                    task.wait(FM.BossHitPress or 0.3)
+                                    if keyrelease then pcall(function() keyrelease(0x45) end) end
+                                end
+                                task.wait(0.15)
+                                -- Assume it worked and head home. If it did not, the carry check
+                                -- notices within a second and the farm moves on by itself, which
+                                -- beats standing here guessing.
+                                FM.hasEgg, FM.eggIsTool = true, false
+                                FM.grabbedAt, FM.lastPressAt = tick(), tick()
+                                FM.carryPos = Vector3.new(FM.bhX, FM.bhY, FM.bhZ)
+                                FM.carryKey = FM.carryKey
+                                    or string.format("%d_%d", FM.bhX, FM.bhZ)
+                                FM.carrySlotGone = true
+                                FM.carryW = FM.carryW or 1
+                                FM.BossHitRecovered = (FM.BossHitRecovered or 0) + 1
+                                FM.bhPhase, FM.bhTapAt, FM.bhBack = nil, nil, nil
+                                FM.bhTried, FM.bhSeen = nil, nil
+                                FM.bhEggX, FM.bhEggZ = nil, nil
+                                FM.bhPinX, FM.bhPinZ = nil, nil
+                                FM.State = "Got the egg - heading home"
+                                task.wait(0.02)
+                                return
                             end
-                            FM.State = string.format("Boss hit - %s (%.1fs)",
-                                (held > 1) and "sweeping for the egg" or "stopped, grabbing", held)
+                            FM.State = string.format("Boss hit - holding for the egg (%.1fs)", held)
                             task.wait(0.02)
                             return
                         end
                         if FM.bhPhase then
-                            FM.bhPhase, FM.bhTapAt = nil, nil
+                            FM.bhPhase, FM.bhTapAt, FM.bhSeen = nil, nil, nil
+                            FM.bhPinX, FM.bhPinZ, FM.bhBack = nil, nil, nil
+                            FM.bhEggX, FM.bhEggZ = nil, nil
                             FM.BossHitsEnded = (FM.BossHitsEnded or 0) + 1
                         end
                     end
@@ -4913,6 +5294,7 @@ local function farmStep()
                         FM.ddLastChar = curChar
                         if FM.DeathDrop and not FM.ddPhase and farEnough then
                             FM.ddPhase, FM.ddAt = "dying", now
+                            FM.ddDived, FM.ddPushed = nil, nil
                             FM.ddChar = myCharacter()
                         end
                         if FM.ddPhase then
@@ -4922,19 +5304,45 @@ local function farmStep()
                             local hp = -1
                             pcall(function() hp = hum and hum.Health or -1 end)
                             if FM.ddPhase == "dying" then
-                                FM.State = "Friend drop - dropping the egg at the wall"
-                                -- hold before diving: the egg needs to settle in your hands
-                                if (now - (FM.ddAt or now)) < (FM.FriendDropDelay or 1.5) then
-                                    FM.State = string.format("Friend drop - settling (%.1fs)",
-                                        (FM.FriendDropDelay or 1.5) - (now - (FM.ddAt or now)))
-                                    task.wait(0.05)
-                                    return
+                                -- Pin from the very first step. The old version stood still
+                                -- doing nothing for the whole 1.5s settle, which is exactly
+                                -- when the boss flung you - the teleport only started after.
+                                -- So: hold a few studs short of the wall while the egg settles
+                                -- in your hands, then go in, then push deeper if the wall has
+                                -- not done its job.
+                                local since = now - (FM.ddAt or now)
+                                local settleT = FM.FriendDropDelay or 1.5
+                                if since < settleT then
+                                    -- Held clear of the wall while the egg settles, pinned hard
+                                    -- so a boss cannot fling you out of position.
+                                    FM.State = string.format(
+                                        "Friend drop - holding at the wall (%.1fs)", settleT - since)
+                                    for _ = 1, (FM.FriendDropBurst or 3) do
+                                        pcall(function()
+                                            root.CFrame = CFrame.new(ds.X, ds.Y,
+                                                ds.Z + (FM.FriendDropStandOff or 5))
+                                            root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                                        end)
+                                        task.wait(FM.FriendDropGap or 0.01)
+                                    end
+                                else
+                                    -- The wall does kill, it is just slow, and sitting at one
+                                    -- depth waiting for it is what let the boss reach you first.
+                                    -- So sink further in the longer it takes, while staying
+                                    -- pinned - the pin is what stops the fling.
+                                    local deep = math.min(
+                                        (since - settleT) * (FM.FriendDropSink or 8),
+                                        FM.FriendDropMaxSink or 24)
+                                    FM.State = string.format(
+                                        "Friend drop - into the wall (%.0f studs deep)", deep)
+                                    for _ = 1, (FM.FriendDropBurst or 3) do
+                                        pcall(function()
+                                            root.CFrame = CFrame.new(ds.X, ds.Y, ds.Z - deep)
+                                            root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                                        end)
+                                        task.wait(FM.FriendDropGap or 0.01)
+                                    end
                                 end
-                                local zPush = ((now - (FM.ddAt or now)) > 2.5) and 4 or 0
-                                pcall(function()
-                                    root.CFrame = CFrame.new(ds.X, ds.Y, ds.Z - zPush)
-                                    root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-                                end)
                                 -- Let the wall do the killing: that death is what makes the
                                 -- egg drop by your plot, where a health-zero death just
                                 -- returns it to its nest. Only fall back to the health float
@@ -5527,27 +5935,36 @@ local function farmStep()
                             FM.State = "Leaving the treadmill"
                             local freed = false
                             local okS, pS = pcall(function() return root.Position end)
-                            local startD = (okS and pS)
-                                and math.sqrt((pS.X - tread.X) ^ 2 + (pS.Z - tread.Z) ^ 2) or 0
-                            for _ = 1, (FM.TreadmillJumps or 10) do
+                            local lastP = (okS and pS) or nil
+                            local startD = lastP and math.sqrt(
+                                (lastP.X - tread.X) ^ 2 + (lastP.Z - tread.Z) ^ 2) or 0
+                            for _ = 1, (FM.TreadmillJumps or 6) do
                                 if keypress then pcall(function() keypress(0x20) end) end
-                                task.wait(0.15)
+                                task.wait(0.08)
                                 if keyrelease then pcall(function() keyrelease(0x20) end) end
-                                task.wait(0.1)
-                                drive(root, dx * 60, dz * 60, -(FM.Stick or 18))
-                                task.wait(0.2)
-                                local okp1, p1 = pcall(function() return root.Position end)
-                                -- Ask "did I actually get off it", not "did I move at all".
-                                -- Clipped into the floor you slide around while going nowhere,
-                                -- which passed the old 2-stud test and let the farm run off
-                                -- towards an egg while you were still stuck.
-                                if okp1 and p1 then
-                                    local dNow = math.sqrt((p1.X - tread.X) ^ 2 + (p1.Z - tread.Z) ^ 2)
-                                    if dNow > startD + 6 then
-                                        freed = true
-                                        break
+                                -- Hopping off gives you a small teleport away from the treadmill.
+                                -- Watch for THAT, instead of shoving yourself sideways and
+                                -- waiting to drift clear. Catching it means one jump rather than
+                                -- ten, and none of the repositioning in between - which is the
+                                -- jumping about you were seeing.
+                                local tW = tick()
+                                while (tick() - tW) < (FM.TreadmillWatch or 0.8) do
+                                    task.wait(0.05)
+                                    local okp1, p1 = pcall(function() return root.Position end)
+                                    if okp1 and p1 then
+                                        local step = lastP and math.sqrt(
+                                            (p1.X - lastP.X) ^ 2 + (p1.Z - lastP.Z) ^ 2) or 0
+                                        local away = math.sqrt(
+                                            (p1.X - tread.X) ^ 2 + (p1.Z - tread.Z) ^ 2)
+                                        lastP = p1
+                                        if step > (FM.TreadmillHopJump or 3)
+                                           or away > startD + 6 then
+                                            freed = true
+                                            break
+                                        end
                                     end
                                 end
+                                if freed then break end
                                 FM.TreadmillJumpTries = (FM.TreadmillJumpTries or 0) + 1
                             end
                             -- Coming off a treadmill half sunk into the ground is common. Lift
