@@ -1718,6 +1718,10 @@ FM.SpeedSet      = 500
 FM.StickSet      = 18
 FM.CarryCap      = 400
 FM.PostDeliver   = 0
+-- Auto egg-recovery, off by default. Chasing an egg a boss knocked off you cost more time
+-- than it saved, so the farm now writes it off and picks a new target instead. The machinery
+-- is all still here - set this true to turn it back on.
+FM.EggRecovery   = false
 FM.RandomPick    = nil
 FM.carryW        = 1
 FM.AfterSteal = 0.4
@@ -3935,6 +3939,9 @@ SESPAWN("death watch", function()
         if okc and ch then
             if lastChar ~= nil and ch ~= lastChar then
                 FM.needRally = true
+                -- note when we came back, so nothing fires while the character is still
+                -- loading in - teleporting during that window just kills you again
+                FM.respawnAt = tick()
                 FM.Deaths = (FM.Deaths or 0) + 1
                 if FM.hasEgg and FM.carryKey and FM.carryPos then
                     local W = _G.SEHUB_WATCH or {}
@@ -4449,6 +4456,12 @@ do
 
     ragdollTeleport = function(root, me, best)
         local now = tick()
+        -- Straight after a respawn the character is still loading. Firing teleports at an egg
+        -- from your base during that window is what kills you on the way back in.
+        if FM.respawnAt and (now - FM.respawnAt) < (FM.RespawnSettle or 3) then
+            FM.RagdollTpWhy = "still loading back in"
+            return false
+        end
         if (FM.rtCoolUntil or 0) > now or not best or not best.pos then return false end
         local gArea, gpos = nearestGuard(me, tostring(best.area))
         if not gpos then
@@ -4713,7 +4726,12 @@ do
                 break
             end
         end
-        if cut then AB.rtLive = 0 end
+        -- Let go the instant the pin loop is done. rtLive was armed for a flat 6 seconds
+        -- regardless of how quickly the landing happened, and while it is live the frame hook
+        -- rewrites your CFrame every frame at the pin height with the velocity zeroed - so you
+        -- hang in the air afterwards, unable to grab, until the 6s runs out. That is the
+        -- floating. Clearing it here lets the landing settle below actually pull you down.
+        AB.rtLive = 0
         while (tick() - t2) < 6 and ragdollJoints() and rootAlive(root) do task.wait(0.05) end
         task.wait(0.1)
         local okq, q = pcall(function() return root.Position end)
@@ -4931,8 +4949,9 @@ local function farmStep()
                         FM.EggsLost = (FM.EggsLost or 0) + 1
                         -- We know where we were standing when it went missing, so start the
                         -- recovery there rather than waiting for a boss hit to trigger it.
-                        -- We only get here with a real hit behind us, so go and fetch it.
-                        if not FM.bhPhase then
+                        -- We only get here with a real hit behind us. Recovery is off by
+                        -- default now, so normally we just let the egg go and move on.
+                        if FM.EggRecovery and not FM.bhPhase then
                             -- go back to where the hit landed: the egg fell there, and we have
                             -- run on since while the carry check made its mind up
                             local hp0 = FM.lastHitPos or me
@@ -5534,7 +5553,13 @@ local function farmStep()
                            -- and only on an egg we actually picked up recently, never on
                            -- leftover state from a previous run
                            and FM.grabbedAt
-                           and (now - FM.grabbedAt) < (FM.FriendDropFresh or 60) then
+                           and (now - FM.grabbedAt) < (FM.FriendDropFresh or 60)
+                           -- not while still loading back in from the last death
+                           and (not FM.respawnAt
+                                or (now - FM.respawnAt) > (FM.RespawnSettle or 3))
+                           -- and only with an egg genuinely in hand. hasEgg alone has been
+                           -- wrong before, and diving empty just costs a life.
+                           and #eggModelsNear(me, FM.CarryNear or 25) > 0 then
                             FM.ddPhase, FM.ddAt = "dying", now
                             FM.ddDived, FM.ddPushed = nil, nil
                             FM.ddChar = myCharacter()
