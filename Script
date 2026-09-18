@@ -3463,6 +3463,22 @@ do
     FM.Always, FM.AlwaysN = set, n
 end
 FM.alwaysDrop = alwaysDrop
+-- The dropdown is the source of truth for Always Target. The menu library fires its
+-- callbacks unreliably at load, and one stray empty callback wiped the list while the
+-- dropdown still showed Secret, Eternal and Divine ticked - so a Secret got no priority
+-- at all, and the empty list then got saved into the config. Read what it really shows.
+FM.syncAlways = function()
+    local ok, sel = pcall(function() return alwaysDrop:Get() end)
+    if not ok or type(sel) ~= "table" then return end
+    local set, n = {}, 0
+    for _, nm in ipairs(sel) do
+        if type(nm) == "string" then
+            set[string.lower(nm)] = true
+            n = n + 1
+        end
+    end
+    FM.Always, FM.AlwaysN = set, n
+end
 
 local ALL_AREAS = "All"
 local areaNames = { ALL_AREAS }
@@ -3688,6 +3704,7 @@ local function cfgSerialize(v)
 end
 
 local function cfgGather()
+    if FM.syncAlways then FM.syncAlways() end
     local c = {}
     for _, k in ipairs(CFG_KEYS) do c[k] = FM[k] end
     c.Areas, c.AllAreas, c.Always = FM.Areas, FM.AllAreas, FM.Always
@@ -3703,11 +3720,23 @@ local function cfgApply(c)
     end
     if type(c.Areas) == "table" then FM.Areas = c.Areas end
     if c.AllAreas ~= nil then FM.AllAreas = c.AllAreas end
-    if type(c.Always) == "table" then
+    -- An empty Always list in a saved config is the menu glitch above, not a choice, so
+    -- only apply a list with something in it - and show it in the dropdown too, since the
+    -- farm now reads the dropdown.
+    if type(c.Always) == "table" and next(c.Always) ~= nil then
         FM.Always = c.Always
         local n = 0
         for _ in pairs(c.Always) do n = n + 1 end
         FM.AlwaysN = n
+        pcall(function()
+            if FM.alwaysDrop then
+                local sel = {}
+                for _, nm in ipairs({ "Secret", "Eternal", "Divine" }) do
+                    if c.Always[string.lower(nm)] then sel[#sel + 1] = nm end
+                end
+                FM.alwaysDrop:Set(sel)
+            end
+        end)
     end
     if c.StealOn ~= nil then ST.On = c.StealOn end
     if c.StealDist ~= nil then ST.Dist = c.StealDist end
@@ -4961,6 +4990,11 @@ do
                 FM.carryKey = string.format("%d_%d", launchPos.X, launchPos.Z)
                 FM.carrySlotGone, FM.grabReloads, FM.carryW = true, FM.Reloads, 1
                 FM.grabArea = gName
+                -- Mark this carry as the LAUNCH egg. With Friend Drop on, any carried egg
+                -- set off the dive, so a teleport that got no hit threw you at the wall with
+                -- a Forest egg instead of teleporting to the target. A launch egg just goes
+                -- home - the safe zone is right beside it - and the next run tries again.
+                FM.launchCarryAt = FM.grabbedAt
             end
             FM.RagdollTpNoHit = (FM.RagdollTpNoHit or 0) + 1
             FM.RagdollTpStreak = (FM.RagdollTpStreak or 0) + 1
@@ -5874,7 +5908,9 @@ local function farmStep()
                            -- hasEgg on its own is not enough either: after a second missed grab
                            -- the farm bans the egg but leaves hasEgg true, which is how you
                            -- ended up diving at the wall with nothing.
-                           and FM.carrySlotGone and FM.pendingSlot == nil then
+                           and FM.carrySlotGone and FM.pendingSlot == nil
+                           -- never for the launch egg of a teleport that got no hit
+                           and FM.launchCarryAt ~= FM.grabbedAt then
                             FM.ddPhase, FM.ddAt = "dying", now
                             FM.ddDived, FM.ddPushed = nil, nil
                             FM.ddChar = myCharacter()
@@ -6256,6 +6292,10 @@ local function farmStep()
                     local anyAllowed = 0
                     local cands, sawRandom = {}, false
                     local tlist = farmTargets()
+                    if FM.syncAlways and (now - (FM.alwaysSyncAt or 0)) > 1 then
+                        FM.alwaysSyncAt = now
+                        FM.syncAlways()
+                    end
                     local areaBonus = {}
                     if FM.RarePri then
                         local home = homePos()
@@ -6310,7 +6350,9 @@ local function farmStep()
                             local en = (FM.rareName or {})[key] or FM.eggName[key]
                             local pri = 0
                             local wanted = false
-                            if always then pri = pri + 20000000 end
+                            -- Above everything, a retry included: a Secret, Eternal or Divine
+                            -- always comes first.
+                            if always then pri = pri + 50000000 end
                             if FM.retryKey == key and FM.retryUntil and now < FM.retryUntil then
                                 pri = pri + 25000000
                             end
