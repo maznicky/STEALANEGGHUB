@@ -1176,6 +1176,36 @@ local function suppressOthers(pos, radius, keepPrompt, shared)
             end
         end
     end
+    -- Make sure the prompt we are KEEPING is live. This function only ever touched the
+    -- others, so if the target had itself been suppressed a moment earlier (as a neighbour of
+    -- a previous target) it stayed at 0.5 studs - and patchNear and the sweep both skip
+    -- anything suppressed in the last second, so nothing put it back and E did nothing.
+    -- Give it a generous range while we grab. Every neighbour within the radius is at 0.5
+    -- by now, so the extra reach cannot land on the wrong egg - and it covers standing on top
+    -- of a small egg after a teleport, which puts you further than 5 studs from its prompt.
+    if keep then
+        local ka = addrOf(keep)
+        if ka and promptWritable(ka) then
+            if not ST.orig[ka] then
+                local okh, h = pcall(function() return memory_read("float", ka + ST.OFF_HOLD) end)
+                local okd, dd = pcall(function() return memory_read("float", ka + ST.OFF_DIST) end)
+                if okh and okd then ST.orig[ka] = { hold = h, dist = dd } end
+            end
+            pcall(function()
+                memory_write("float", ka + ST.OFF_HOLD, ST.Hold)
+                memory_write("float", ka + ST.OFF_DIST, ST.KeepDist or 12)
+            end)
+            if ST.NoLOS then
+                if ST.origLOS[ka] == nil then
+                    local okl, l = pcall(function() return memory_read("byte", ka + ST.OFF_LOS) end)
+                    if okl and type(l) == "number" then ST.origLOS[ka] = l end
+                end
+                pcall(function() memory_write("byte", ka + ST.OFF_LOS, 0) end)
+            end
+            ST.suppressed[ka] = nil
+            ST.KeptLive = (ST.KeptLive or 0) + 1
+        end
+    end
     ST.Suppressed = (ST.Suppressed or 0) + n
     return n
 end
@@ -5566,9 +5596,16 @@ local function farmStep()
                            -- not while still loading back in from the last death
                            and (not FM.respawnAt
                                 or (now - FM.respawnAt) > (FM.RespawnSettle or 3))
-                           -- and only with an egg genuinely in hand. hasEgg alone has been
-                           -- wrong before, and diving empty just costs a life.
-                           and #eggModelsNear(me, FM.CarryNear or 25) > 0 then
+                           -- and only once the grab is CONFIRMED: the slot we took the egg
+                           -- from has actually vanished (carrySlotGone) and nothing is still
+                           -- pending. That is the same proof the farm has always used to count
+                           -- a grab, read from AreaEggSlotsClient, which refreshes live.
+                           -- The model scan that was here could not reliably see an egg in
+                           -- your hands, so the dive never fired and you just ran home. And
+                           -- hasEgg on its own is not enough either: after a second missed grab
+                           -- the farm bans the egg but leaves hasEgg true, which is how you
+                           -- ended up diving at the wall with nothing.
+                           and FM.carrySlotGone and FM.pendingSlot == nil then
                             FM.ddPhase, FM.ddAt = "dying", now
                             FM.ddDived, FM.ddPushed = nil, nil
                             FM.ddChar = myCharacter()
