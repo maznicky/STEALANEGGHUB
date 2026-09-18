@@ -311,6 +311,23 @@ local function trapPositions()
             end
         end
     end
+    -- Matcha reads trap names as EMPTY (measured 2026-09-15), so the name match above never
+    -- sees one and we ran straight over them. A trap pins you for a few seconds - plenty for
+    -- a chasing boss to catch up. Recognise one by what it holds instead: a Hitbox plus the
+    -- owner's UnplacePrompt.
+    if deb then
+        local okt, top = pcall(function() return deb:GetChildren() end)
+        for _, m in ipairs((okt and top) or {}) do
+            local okh, hp = pcall(function()
+                if m:FindFirstChild("UnplacePrompt") then
+                    local h = m:FindFirstChild("Hitbox")
+                    return h and h.Position
+                end
+                return nil
+            end)
+            if okh and typeof(hp) == "Vector3" then out[#out + 1] = hp end
+        end
+    end
     local rift = workspace:FindFirstChild("BossArenaTeleport")
     local hb = rift and rift:FindFirstChild("Hitbox")
     if hb then
@@ -1894,10 +1911,10 @@ end)
 _G.FARM = _G.FARM or {}
 local FM = _G.FARM
 FM.On        = false
-FM.AvoidPlayers = false
+FM.AvoidPlayers = true
 FM.AvoidBosses = true
 FM.deliveredTool, FM.pendingSlot, FM.stowPending, FM.ePress = nil, nil, nil, nil
-FM.Speed     = 500
+FM.Speed     = 600
 FM.Stick     = 18
 FM.Reach     = 1.5
 FM.GrabHold  = 1.3
@@ -1909,14 +1926,12 @@ FM.Snaps     = 0
 FM.Headstart, FM.Headstarts, FM.outboundHop = nil, nil, nil
 FM.Suppress      = true
 FM.BigWidth      = 6
--- Big eggs used to be throttled to 260 by their own slider. That slider is gone, so
--- match the carry cap and let them travel like any other egg.
-FM.BigCarrySpeed = 400
 FM.Ghost         = true
 FM.GhostSaved    = nil
-FM.SpeedSet      = 500
+FM.SpeedSet      = 600
 FM.StickSet      = 18
-FM.CarryCap      = 400
+-- No carry cap any more: carrying an egg runs at the Run Speed slider like everything
+-- else. (It used to be held at 400 because deliveries failed above that.)
 FM.PostDeliver   = 0
 -- Auto egg-recovery, off by default. Chasing an egg a boss knocked off you cost more time
 -- than it saved, so the farm now writes it off and picks a new target instead. The machinery
@@ -3242,25 +3257,39 @@ end
 -- Kept out of farmStep, which is already close to Luau's register limit.
 FM.confirmGrab = function(root, slot, pos)
     if not slot then return 1 end
-    local gs = _G.SEHUB_GUARDSPOTS
+    -- The nearest guard, read directly. It only moves because the grab landed, and it is
+    -- on you within a fraction of a second, so the first stud it moves is the signal to go.
+    local gRoot, gFrom
+    pcall(function()
+        local ga = workspace.__OBJECTS.Areas.GuardAreas
+        local bestD
+        for _, am in ipairs(ga:GetChildren()) do
+            local g = am:FindFirstChild("Guard")
+            local r = g and g:FindFirstChild("HumanoidRootPart")
+            local p = r and r.Position
+            if p and pos then
+                local d = (p.X - pos.X) ^ 2 + (p.Z - pos.Z) ^ 2
+                if not bestD or d < bestD then gRoot, gFrom, bestD = r, p, d end
+            end
+        end
+    end)
     local function landed()
         if slotGone(slot) or heldEggTool() then return true end
-        if gs and pos then
-            local okg, act = pcall(gs)
-            for _, g in ipairs((okg and act) or {}) do
-                if g.moving and ((g.pos.X - pos.X) ^ 2 + (g.pos.Z - pos.Z) ^ 2) < 3600 then
-                    return true
-                end
+        if gRoot and gFrom then
+            local okp, p = pcall(function() return gRoot.Position end)
+            if okp and p and ((p.X - gFrom.X) ^ 2 + (p.Z - gFrom.Z) ^ 2) > 1 then
+                FM.GrabByGuard = (FM.GrabByGuard or 0) + 1
+                return true
             end
         end
         return false
     end
     local t0, taps = tick(), 1
-    while FM.On and not landed() and (tick() - t0) < (FM.GrabConfirm or 0.4) do
+    while FM.On and not landed() and (tick() - t0) < (FM.GrabConfirm or 0.3) do
         pcall(function()
             root.AssemblyLinearVelocity = Vector3.new(0, -(FM.LandStick or 40), 0)
         end)
-        task.wait(0.07)
+        task.wait(0.05)
         if landed() then break end
         if taps < (FM.GrabTaps or 6) then
             pressE(0.04)
@@ -3340,7 +3369,7 @@ bossTog = farmSec:Toggle("Auto Anti-Boss", false, function(v)
     if v and fdTog then pcall(function() fdTog:Set(false) end) end
 end, "Escapes a boss that chases you while you carry an egg. Turns off Friend Drop.")
 FM.bossTog = bossTog
-farmSec:Toggle("Avoid Players", false, function(v) FM.AvoidPlayers = v end,
+farmSec:Toggle("Avoid Players", true, function(v) FM.AvoidPlayers = v end,
     "Steers around other players, like traps and the boss rift.")
 farmSec:Toggle("Avoid Bosses", true, function(v) FM.AvoidBosses = v end,
     "Makes a small turn around any boss that is moving, so you do not run into the one you just woke while it walks back. Ignores a boss sitting on your target egg, and stands down during a Ragdoll Teleport.")
@@ -3453,7 +3482,7 @@ pcall(function() areaDrop:Set({}) end)
 FM.Areas, FM.AllAreas = {}, false
 FM.areaDrop = areaDrop
 farmSec:Divider()
-farmSec:Slider("Run Speed", 500, 10, 40, 900, " studs/s", function(v)
+farmSec:Slider("Run Speed", 600, 10, 40, 900, " studs/s", function(v)
     FM.SpeedSet = v
     FM.Speed = math.min(v, 900)
 end, "How fast you run. Your character is moved into the Camera while farming, so the speed check has nothing left to read.")
@@ -3633,7 +3662,7 @@ local CFG_FILE = "stealhub_config.txt"
 local CFG_KEYS = {
     "SpeedSet", "Priority", "RagdollTp", "DeathDrop", "AutoBoss", "AvoidPlayers",
     "AvoidBosses", "TreadmillFarm", "AntiAfk", "GrabEscapeDelay", "Rift",
-    "CarryCap", "FarmKey",
+    "FarmKey",
 }
 
 local function cfgSerialize(v)
@@ -3688,7 +3717,7 @@ local function cfgApply(c)
         -- the toggle is built after this function, so only Set it once it exists
         pcall(function() if FM.autoTog then FM.autoTog:Set(c.AutoLoad and true or false) end end)
     end
-    FM.Speed = math.min(FM.SpeedSet or 500, 900)
+    FM.Speed = math.min(FM.SpeedSet or 600, 900)
     -- Push what we can back into the menu. Anything without a stored handle still takes
     -- effect, because the farm reads these values directly - the control just will not
     -- redraw until the next load.
@@ -4733,13 +4762,11 @@ do
             FM.RagdollTpWhy = "launch egg is not on the way"
             return false
         end
-        -- Only teleport when it actually beats running there. A teleport takes about 7s
-        -- from the launch grab to landing whatever your speed, and it was firing for any egg
-        -- 40+ studs from a launch egg - 53 of your last 57 eggs came that way. So the Run
-        -- Speed slider hardly mattered, which is why 600 and 900 felt the same. At 300 a far
-        -- egg is still a 15s run and the teleport wins; at 900 almost everything is quicker
-        -- on foot. The teleport's real cost is measured from your own landings as you go.
-        do
+        -- Optional: only teleport when it beats running there at the current speed. OFF by
+        -- default - with it on, at 900 studs/s nearly every egg came out "quicker to run" and
+        -- Ragdoll Teleport looked like it had stopped working. Set FM.RagdollTpOnlyIfFaster
+        -- to true to bring it back; the teleport's cost is still measured from your landings.
+        if FM.RagdollTpOnlyIfFaster then
             local spd = math.max(50, FM.Speed or 300)
             local runFor = dMeTarget / spd
             local tpFor = dMeLaunch / spd + (FM.RagdollTpAvg or FM.RagdollTpCost or 7)
@@ -5115,10 +5142,17 @@ local function farmStep()
                         local sf = workspace:FindFirstChild("AreaEggSlotsClient")
                         local okn, kids = pcall(function() return sf and sf:GetChildren() end)
                         local nSlots = (okn and kids) and #kids or 0
+                        -- Only believe it is night once the egg list has stayed empty for a
+                        -- second. Matcha now and then hands back an empty list for one read, and
+                        -- that single blip used to start the full 15-second barrier hold - you
+                        -- stood dead still wherever you were, egg in hand, while the boss
+                        -- chasing you walked up and took it. A random pause.
                         if nSlots == 0 then
                             FM.nightSince = FM.nightSince or now
-                            -- remember when night STARTED, not just that it is night
-                            FM.nightStart = FM.nightStart or now
+                            if (now - FM.nightSince) >= (FM.NightConfirm or 1) then
+                                -- remember when night STARTED, not just that it is night
+                                FM.nightStart = FM.nightStart or FM.nightSince
+                            end
                         elseif FM.nightSince then
                             FM.nightSince, FM.dayAt = nil, now
                         end
@@ -5128,7 +5162,9 @@ local function farmStep()
                         -- farm out early: the first teleport to the launch egg and the boss
                         -- then failed against a barrier that was still up, costing a whole
                         -- retry. Time it from the start of night instead.
-                        if FM.nightStart then
+                        -- and never hold while carrying: the barrier only matters for heading
+                        -- OUT, and stopping with an egg is how a chasing boss catches you
+                        if FM.nightStart and not FM.hasEgg then
                             local left = (FM.nightStart + (FM.NightHold or 15)) - now
                             if left > 0 then
                                 pcall(function()
@@ -6069,10 +6105,7 @@ local function farmStep()
                         local dp = FM.FriendDropPos or Vector3.new(572, 70.6, -364)
                         local dd = (Vector3.new(dp.X, me.Y, dp.Z) - me).Magnitude
                         if dd > (FM.SpotReach or 4) then
-                            local sp = math.min(FM.Speed, FM.CarryCap or 400)
-                            if (FM.carryW or 1) > (FM.BigWidth or 6) then
-                                sp = math.min(sp, FM.BigCarrySpeed or 260)
-                            end
+                            local sp = FM.Speed
                             if dd < (FM.Brake or 60) then
                                 sp = math.max(40, sp * (dd / (FM.Brake or 60)))
                             end
@@ -6108,38 +6141,28 @@ local function farmStep()
                         FM.homeSpot = FM.homeSpot or pickHomeSpot() or homeP
                         local zp = FM.homeSpot
                         local d = (Vector3.new(zp.X, me.Y, zp.Z) - me).Magnitude
-                        -- Start the hand-over clock a few studs out instead of after coming to a
-                        -- dead stop on the spot, so the settle overlaps the last of the braking
-                        -- rather than being added on top of it. We keep creeping onto the spot
-                        -- while it runs (below).
-                        if d > (FM.DepositReach or 8) and not (FM.depositAt and d <= (FM.ZoneReach or 12)) then
+                        if d > (FM.SpotReach or 4) and not (FM.depositAt and d <= (FM.ZoneReach or 12)) then
                             FM.depositAt = nil
                             FM.depositToolSeen = nil
                             local flat = Vector3.new(zp.X - me.X, 0, zp.Z - me.Z)
                             local m = flat.Magnitude
                             if m > 0.01 then
-                                local sp = math.min(FM.Speed, FM.CarryCap or 400)
-                                if (FM.carryW or 1) > (FM.BigWidth or 6) then
-                                    sp = math.min(sp, FM.BigCarrySpeed or 260)
-                                    FM.BigCarries = FM.BigCarries or 0
-                                end
-                                if d < (FM.Brake or 60) then
-                                    sp = math.max(40, sp * (d / (FM.Brake or 60)))
-                                end
+                                -- Full speed, except never cover more than about half of what is
+                                -- left in one step. The old braking was a fraction of Run Speed,
+                                -- so at 900 you still arrived fast enough to sail past the spot
+                                -- and bounce back and forth before settling.
+                                local sp = math.min(FM.Speed, math.max(40, d / (FM.ArriveStep or 0.1)))
                                 local ux, uz = steerAround(me, zp.X, zp.Z, sp)
                                 drive(root, ux * sp, uz * sp, -(FM.Stick or 18))
                             end
                             FM.State = string.format("Taking egg home (%.0f studs)", d)
                             PROFTICK("farm: carry move", __s3)
                         else
+                            -- In the safe zone: speed to zero, instantly, like dragging Run Speed
+                            -- to 0 mid-run. No creeping onto the spot - that creep scaled with Run
+                            -- Speed and was what kept you drifting about before the next loop.
                             pcall(function()
-                                local vx, vz = 0, 0
-                                if d > (FM.SpotReach or 4) then
-                                    local cap = FM.CarryCap or 400
-                                    local v = math.max(40, math.min(cap, cap * d / (FM.Brake or 30)))
-                                    vx, vz = (zp.X - me.X) / d * v, (zp.Z - me.Z) / d * v
-                                end
-                                root.AssemblyLinearVelocity = Vector3.new(vx, -(FM.Stick or 18), vz)
+                                root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0)
                             end)
                             FM.depositAt = FM.depositAt or tick()
                             local held = tick() - FM.depositAt
