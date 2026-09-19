@@ -3357,9 +3357,18 @@ farmToggle = farmSec:Toggle("Auto Farm", false, function(v)
         for _ in pairs(FM.Areas or {}) do any = true break end
         if not any and not FM.Rift then
             notify("Auto Farm", "Pick an area first", 4, "warn")
+        elseif any and FM.areaSummary then
+            notify("Auto Farm", "Farming areas: " .. FM.areaSummary(), 4)
         end
+        FM.farmStartedAt, FM.sessionDelivered = tick(), (FM.DeliveredCount or 0)
     else
         FM.State = "Off"
+        -- only for a farm that was actually running, not the menu setting itself at load
+        if FM.farmStartedAt then
+            local n = (FM.DeliveredCount or 0) - (FM.sessionDelivered or 0)
+            notify("Auto Farm", string.format("Stopped - %d egg%s delivered", n, (n == 1) and "" or "s"), 4)
+        end
+        FM.farmStartedAt = nil
     end
 end, "Farms eggs until you turn it off.")
 local bossTog, fdTog
@@ -3369,8 +3378,9 @@ bossTog = farmSec:Toggle("Auto Anti-Boss", false, function(v)
     if v and fdTog then pcall(function() fdTog:Set(false) end) end
 end, "Escapes a boss that chases you while you carry an egg. Turns off Friend Drop.")
 FM.bossTog = bossTog
-farmSec:Toggle("Avoid Players", true, function(v) FM.AvoidPlayers = v end,
-    "Steers around other players, like traps and the boss rift.")
+-- Avoid Players is always on now, with no toggle: steering round other players (and their
+-- traps and the boss rift) never costs anything worth keeping it switchable for.
+FM.AvoidPlayers = true
 farmSec:Toggle("Avoid Bosses", true, function(v) FM.AvoidBosses = v end,
     "Makes a small turn around any boss that is moving, so you do not run into the one you just woke while it walks back. Ignores a boss sitting on your target egg, and stands down during a Ragdoll Teleport.")
 FM.TreadmillFarm = true
@@ -3443,6 +3453,96 @@ priBusy = false
 applyPriority(PRI_NONE)
 FM.priDrop = priDrop
 
+-- Always Target ranking, mutation ranking, and the notices that go with them. Kept as FM
+-- fields in a do-block: the top level of this file is at Luau's 200-local limit, and
+-- farmStep is close to its register limit too, so none of this can live inside either.
+do
+    local ALWAYS_RANK = { secret = 1, eternal = 2, divine = 3, rare = 1 }
+    local ALWAYS_LABEL = { secret = "Secret", eternal = "Eternal", divine = "Divine", rare = "Rare egg" }
+
+    -- On top of the flat Always Target bonus: rarest first (Divine, Eternal, Secret), and
+    -- between two of the same rarity the one furthest out from the safe zone. A rarity
+    -- step is worth far more than any distance, so a Divine beats an Eternal wherever
+    -- either one is.
+    FM.alwaysBonus = function(tier, pos)
+        local r = ALWAYS_RANK[tier or "rare"] or 1
+        local h = homePos()
+        local far = 0
+        if h and pos then far = math.sqrt((pos.X - h.X) ^ 2 + (pos.Z - h.Z) ^ 2) end
+        return r * 1000000 + far * 3
+    end
+
+    -- "Secret has spawned, prioritising" / "2 Secrets and an Eternal have spawned", once
+    -- per egg. One whose rarity is not known yet gets up to 6s for its name to come in,
+    -- then is announced as a rare egg rather than guessed at.
+    FM.alwaysAnnounce = function(nowSet)
+        FM.alwaysKnown = FM.alwaysKnown or {}
+        FM.alwaysFirst = FM.alwaysFirst or {}
+        local nowT = tick()
+        local counts, total = {}, 0
+        for key, tier in pairs(nowSet or {}) do
+            if not FM.alwaysKnown[key] then
+                FM.alwaysFirst[key] = FM.alwaysFirst[key] or nowT
+                if tier ~= "rare" or (nowT - FM.alwaysFirst[key]) > 6 then
+                    FM.alwaysKnown[key] = true
+                    counts[tier] = (counts[tier] or 0) + 1
+                    total = total + 1
+                end
+            end
+        end
+        for key in pairs(FM.alwaysKnown) do
+            if not (nowSet or {})[key] then FM.alwaysKnown[key], FM.alwaysFirst[key] = nil, nil end
+        end
+        if total == 0 then return end
+        local parts = {}
+        for _, tier in ipairs({ "divine", "eternal", "secret", "rare" }) do
+            local n = counts[tier]
+            if n then
+                local label = ALWAYS_LABEL[tier]
+                parts[#parts + 1] = (n == 1) and label or (n .. " " .. label .. "s")
+            end
+        end
+        local text = parts[1]
+        if #parts == 2 then
+            text = parts[1] .. " and " .. parts[2]
+        elseif #parts > 2 then
+            text = table.concat(parts, ", ", 1, #parts - 1) .. " and " .. parts[#parts]
+        end
+        notify("Always Target", text .. ((total == 1) and " has" or " have")
+            .. " spawned, prioritising", 5, "good")
+    end
+
+    -- Called by every delivery path: counts it, and calls out an Always Target egg.
+    FM.onDelivered = function()
+        FM.DeliveredCount = (FM.DeliveredCount or 0) + 1
+        local tier = FM.carryTier
+        FM.carryTier = nil
+        if tier then
+            notify("Always Target", ALWAYS_LABEL[tier] .. " delivered", 4, "good")
+        end
+    end
+
+    -- Areas in the same order as the menu, for the start-up notice
+    FM.areaSummary = function()
+        if FM.AllAreas then return "All" end
+        local out = {}
+        for i = #AREA_BOUNDS, 1, -1 do
+            local nm = AREA_BOUNDS[i].name
+            if (FM.Areas or {})[nm] then out[#out + 1] = nm end
+        end
+        return (#out > 0) and table.concat(out, ", ") or "none"
+    end
+
+    -- How many eggs are up in the areas being farmed right now
+    FM.eggsWanted = function()
+        local n = 0
+        for _, e in ipairs(eggSlots(0)) do
+            if (FM.Areas or {})[areaOf(e.pos)] then n = n + 1 end
+        end
+        return n
+    end
+end
+
 local prevAlways = FM.Always
 local RARITY_CHOICES = { "Secret", "Eternal", "Divine" }
 local alwaysDrop = farmSec:Dropdown("Always Target", { "Secret", "Eternal", "Divine" }, RARITY_CHOICES, true, function(sel)
@@ -3482,7 +3582,8 @@ end
 
 local ALL_AREAS = "All"
 local areaNames = { ALL_AREAS }
-for _, b in ipairs(AREA_BOUNDS) do areaNames[#areaNames + 1] = b.name end
+-- All first, then the areas from the last one back to the first
+for i = #AREA_BOUNDS, 1, -1 do areaNames[#areaNames + 1] = AREA_BOUNDS[i].name end
 local areaDrop = farmSec:Dropdown("Areas", {}, areaNames, true, function(sel)
     local set, all = {}, false
     for _, nm in ipairs(sel or {}) do
@@ -3676,7 +3777,7 @@ end)
 
 local CFG_FILE = "stealhub_config.txt"
 local CFG_KEYS = {
-    "SpeedSet", "Priority", "RagdollTp", "DeathDrop", "AutoBoss", "AvoidPlayers",
+    "SpeedSet", "Priority", "RagdollTp", "DeathDrop", "AutoBoss",
     "AvoidBosses", "TreadmillFarm", "AntiAfk", "GrabEscapeDelay", "Rift",
     "FarmKey",
 }
@@ -4327,16 +4428,8 @@ SESPAWN("night watch", function()
                     sweepEggNames()
                     local fpN = _G.SEHUB_FPCOUNT()
                     local fpTotal = (_G.SEHUB_EGGFP or {}).total or 0
-                    if (fpN == 0 or (fpTotal > 0 and fpN < fpTotal * 0.5))
-                       and (tick() - (FM.identWarnAt or 0)) > 60 then
-                        FM.identWarnAt = tick()
-                        if fpTotal == 0 then
-                            notify("Eggs", "Can't identify eggs - reinject Matcha", 6, "warn")
-                        else
-                            notify("Eggs", string.format("Egg models still loading (%d of %d) - names come in as they load",
-                                fpN, fpTotal), 6, "warn")
-                        end
-                    end
+                    -- (the "can't identify eggs" / "still loading" warnings are gone on purpose)
+                    FM.IdentState = string.format("%d of %d egg models", fpN, fpTotal)
                     local noTier = {}
                     local nNoTier = 0
                     for _, e in ipairs(eggSlots()) do
@@ -4348,15 +4441,7 @@ SESPAWN("night watch", function()
                         end
                     end
                     FM.NoTier, FM.NoTierN = noTier, nNoTier
-                    if (FM.AlwaysN or 0) > 0 and nNoTier > 0
-                       and (tick() - (FM.tierWarnAt or 0)) > 60 then
-                        FM.tierWarnAt = tick()
-                        local list = {}
-                        for nm in pairs(noTier) do list[#list + 1] = nm end
-                        table.sort(list)
-                        notify("Always Target",
-                            "Unknown rarity: " .. table.concat(list, ", "):sub(1, 60), 8, "warn")
-                    end
+                    -- (the "unknown rarity" warning is gone on purpose; FM.NoTier still lists them)
                 end
 
                 if not (FM.On and FM.hasEgg) and (tick() - (FM.indexAt or 0)) > 30
@@ -4424,7 +4509,18 @@ SESPAWN("night watch", function()
                     FM.eggName, FM.eggTried = {}, {}
                     FM.Reloads = (FM.Reloads or 0) + 1
                     FM.State = "Eggs respawned"
-                    notify("Auto Farm", "Eggs respawned", 3)
+                    -- give the new eggs a moment to all load before counting them
+                    task.spawn(function()
+                        task.wait(2)
+                        if _G.SEHUB_GEN ~= GEN then return end
+                        if FM.On and FM.eggsWanted then
+                            local nW = FM.eggsWanted()
+                            notify("Auto Farm", string.format("Eggs have respawned, targeting %d egg%s",
+                                nW, (nW == 1) and "" or "s"), 4)
+                        else
+                            notify("Auto Farm", "Eggs have respawned", 3)
+                        end
+                    end)
                     if FM.Rift then
                         task.spawn(function()
                             task.wait(5)
@@ -4855,6 +4951,24 @@ do
             FM.rtCoolUntil = now + (FM.RagdollTpAwakeCool or 1)
             return false
         end
+        -- Never start while still ragdolled from the last attempt. A failed pin gets you
+        -- snapped back to the launch egg while the ragdoll is still on, and retrying straight
+        -- away read that leftover ragdoll as a brand-new hit: no egg was grabbed, the pin went
+        -- in with no real ragdoll behind it, the game snapped you back again, and round it
+        -- went - the teleport loop. Stand still until it has worn off.
+        if ragdollJoints() then
+            FM.rtRagWaitAt = FM.rtRagWaitAt or now
+            if (now - FM.rtRagWaitAt) < (FM.RagdollTpClearWait or 5) then
+                pcall(function()
+                    root.AssemblyLinearVelocity = Vector3.new(0, -(FM.LandStick or 40), 0)
+                end)
+                FM.State = "Ragdoll teleport - waiting for the last ragdoll to wear off"
+                task.wait(0.05)
+                return true
+            end
+            FM.RagdollTpStuckRag = (FM.RagdollTpStuckRag or 0) + 1
+        end
+        FM.rtRagWaitAt = nil
 
         FM.rtBusyUntil = now + 12
         FM.rtQuietUntil = now + 12
@@ -4905,13 +5019,15 @@ do
             pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0) end)
             task.wait(0.05)
         end
+        -- only a ragdoll that starts AFTER we begin counts as this grab's hit
+        local ragBefore = ragdollJoints()
         local function grabLanded()
             -- The ragdoll is the surest sign of all: the guard only wakes because the grab
             -- landed, and UpperTorso's constraints are one of the few runtime additions
             -- Matcha reports live. GuardWakeHighlight never turns up in its stale index, so
             -- that check below can never fire, and the prompt-vanishing test lags behind the
             -- actual grab - between them that is the noGrab failure.
-            if ragdollJoints() then return true end
+            if ragdollJoints() and not ragBefore then return true end
             if guardModelAwake(gArea) then return true end
             return #promptsNear(launchPos, 6) == 0
         end
@@ -4995,6 +5111,7 @@ do
                 -- a Forest egg instead of teleporting to the target. A launch egg just goes
                 -- home - the safe zone is right beside it - and the next run tries again.
                 FM.launchCarryAt = FM.grabbedAt
+                FM.carryTier = nil
             end
             FM.RagdollTpNoHit = (FM.RagdollTpNoHit or 0) + 1
             FM.RagdollTpStreak = (FM.RagdollTpStreak or 0) + 1
@@ -5562,6 +5679,7 @@ local function farmStep()
                                 FM.hasEgg = false
                                 if key then FM.visited[key] = nil end
                                 FM.State = "Grab missed - retrying"
+                                notify("Auto Farm", "Failed to pick up egg due to lag or someone else has picked it up", 4, "warn")
                                 task.wait(0.05)
                                 return
                             end
@@ -5572,6 +5690,7 @@ local function farmStep()
                                     FM.banned[key] = tick() + 120
                                     FM.Banned = (FM.Banned or 0) + 1
                                     FM.State = "Egg blocked - skipping"
+                                    notify("Auto Farm", "Failed to pick up egg due to lag or someone else has picked it up", 4, "warn")
                                 end
                             end
                         end
@@ -6177,6 +6296,30 @@ local function farmStep()
                         FM.homeSpot = FM.homeSpot or pickHomeSpot() or homeP
                         local zp = FM.homeSpot
                         local d = (Vector3.new(zp.X, me.Y, zp.Z) - me).Magnitude
+                        -- The delivery registers as you cross into the safe zone, and the egg
+                        -- turns up in your hand as a tool right then - measured 0.8s before
+                        -- reaching the drop spot. The farm used to carry on to the spot and then
+                        -- wait for that tool to vanish, about 2s lost on every delivery. Count it
+                        -- the moment the tool appears and stop dead, ready for the next run.
+                        -- (Not within 3s of the last delivery: that egg's tool can still be in
+                        -- hand, and must not count for this one.)
+                        if not FM.eggIsTool and d <= (FM.ToolDeliverNear or 1500)
+                           and (now - (FM.deliveredAt or 0)) > (FM.ToolDeliverGap or 3) then
+                            FM.dlvTool = heldEggTool()
+                            if FM.dlvTool and FM.dlvTool ~= FM.deliveredTool then
+                                FM.deliveredTool, FM.deliveredAt = FM.dlvTool, now
+                                FM.onDelivered()
+                                FM.hasEgg, FM.depositAt, FM.depositToolSeen = false, nil, nil
+                                FM.pendingSlot, FM.pendingKey, FM.pendingAt = nil, nil, nil
+                                FM.DeliveredByTool = (FM.DeliveredByTool or 0) + 1
+                                pcall(function()
+                                    root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0)
+                                end)
+                                FM.State = "Delivered"
+                                task.wait(0.03)
+                                return
+                            end
+                        end
                         if d > (FM.SpotReach or 4) and not (FM.depositAt and d <= (FM.ZoneReach or 12)) then
                             FM.depositAt = nil
                             FM.depositToolSeen = nil
@@ -6221,6 +6364,8 @@ local function farmStep()
                                         task.wait(0.05)
                                     end
                                 end
+                                FM.deliveredAt = tick()
+                                FM.onDelivered()
                                 FM.State = "Delivered"
                                 task.wait(0.05)
                                 return
@@ -6244,6 +6389,8 @@ local function farmStep()
                                         task.wait(0.05)
                                     end
                                 end
+                                FM.deliveredAt = tick()
+                                FM.onDelivered()
                                 FM.State = "Delivered"
                                 task.wait(0.05)
                                 return
@@ -6292,6 +6439,7 @@ local function farmStep()
                     local anyAllowed = 0
                     local cands, sawRandom = {}, false
                     local tlist = farmTargets()
+                    FM.alwaysNow = {}
                     if FM.syncAlways and (now - (FM.alwaysSyncAt or 0)) > 1 then
                         FM.alwaysSyncAt = now
                         FM.syncAlways()
@@ -6336,7 +6484,12 @@ local function farmStep()
                                     always = (FM.AlwaysN or 0) >= 3
                                 end
                             end
-                            if always then allowed = true end
+                            if always then
+                                allowed = true
+                                FM.alwaysNow[key] = ht
+                                    or ((tier == "secret" or tier == "eternal" or tier == "divine") and tier)
+                                    or "rare"
+                            end
                         end
                         local cool = (now - (FM.visited[key] or 0)) > FM.Cooldown
                         if (FM.banned[key] or 0) > now then allowed = false end
@@ -6352,7 +6505,9 @@ local function farmStep()
                             local wanted = false
                             -- Above everything, a retry included: a Secret, Eternal or Divine
                             -- always comes first.
-                            if always then pri = pri + 50000000 end
+                            if always then
+                                pri = pri + 50000000 + FM.alwaysBonus(FM.alwaysNow[key], t.pos)
+                            end
                             if FM.retryKey == key and FM.retryUntil and now < FM.retryUntil then
                                 pri = pri + 25000000
                             end
@@ -6412,6 +6567,7 @@ local function farmStep()
                                 best.rank = FM.RarePri and rarityRank(en, t.area) or 0
                                 best.w    = t.w
                                 best.always = always
+                                best.alwaysTier = always and FM.alwaysNow[key] or nil
                             end
                         end
                     end
@@ -6435,6 +6591,7 @@ local function farmStep()
                         end
                     end
                     FM.lockKey = best and best.key or nil
+                    if FM.alwaysAnnounce then FM.alwaysAnnounce(FM.alwaysNow) end
                     if not best and anyAllowed == 0 then
                         FM.idleSince = FM.idleSince or now
                         -- An Anti-Boss escape drops you at the safe zone and the egg list
@@ -6449,6 +6606,9 @@ local function farmStep()
                             and myTreadmill() or nil
                         if tread then
                             FM.idleSpot = nil
+                            if not FM.treadVisit then
+                                notify("Auto Treadmill Farm", "No eggs, running to Treadmill", 4)
+                            end
                             FM.treadVisit = true
                             local dt = (Vector3.new(tread.X, me.Y, tread.Z) - me).Magnitude
                             local goal = tread
@@ -6737,6 +6897,7 @@ local function farmStep()
                             FM.carryNear = FM.pendingNear
                             FM.carryKey    = best.key
                             FM.carryPos    = best.pos
+                            FM.carryTier   = best.alwaysTier
                             FM.carrySlotGone = false
                             FM.grabReloads = FM.Reloads
                             FM.retryPos    = nil
