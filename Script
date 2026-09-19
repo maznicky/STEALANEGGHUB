@@ -1128,6 +1128,12 @@ ST.SUPPRESS_TTL = 1.0
 ST.REPATCH    = 3.0
 ST.sweepN     = 0
 ST.offsetsOk  = true
+-- Writing to a prompt the game is in the middle of destroying is a write into freed memory,
+-- and that takes the whole client down. A grab destroys the egg's slot and its prompt, so
+-- stop writing for a moment either side of every E press. This is the likeliest cause of the
+-- "crashes when picking an egg up" reports.
+ST.QuietFor   = 0.4
+ST.quietUntil = 0
 ST.patched    = 0
 ST.State      = "Off"
 
@@ -1216,6 +1222,7 @@ local function patchPrompts()
         return
     end
     if not ST.offsetsOk then return end
+    if tick() < (ST.quietUntil or 0) then return end
     local n = 0
     ST.sweepN = (ST.sweepN or 0) + 1
     local verify = (ST.sweepN <= 3) or (ST.sweepN % 20 == 0)
@@ -1295,6 +1302,7 @@ end
 local function patchNear(pos, radius, shared)
     if not memory_write or not pos then return 0 end
     if not ST.On or not ST.offsetsOk then return 0 end
+    if tick() < (ST.quietUntil or 0) then return 0 end
     local n = 0
     for _, e in ipairs(nearFrom(shared, pos, radius or 30)) do
         local a = addrOf(e.p)
@@ -1335,6 +1343,7 @@ _G.SEHUB_PATCHNEAR = patchNear
 local function suppressOthers(pos, radius, keepPrompt, shared)
     if not memory_write or not pos then return 0 end
     if not ST.On or not ST.offsetsOk then return 0 end
+    if tick() < (ST.quietUntil or 0) then return 0 end
     local list = nearFrom(shared, pos, radius or 25)
     local keep, keepD = keepPrompt, nil
     if not keep then
@@ -3242,11 +3251,14 @@ end
 
 local function pressE(dur)
     if not keypress then return end
+    -- hands off the prompts while this grab lands and the slot is torn down
+    ST.quietUntil = tick() + (ST.QuietFor or 0.4)
     pcall(function()
         keypress(0x45)
         task.wait(dur or 0.08)
         keyrelease(0x45)
     end)
+    ST.quietUntil = tick() + (ST.QuietFor or 0.4)
 end
 
 -- Make sure a grab took. Now and then a single tap lands before the prompt is ready and the
@@ -3599,10 +3611,24 @@ pcall(function() areaDrop:Set({}) end)
 FM.Areas, FM.AllAreas = {}, false
 FM.areaDrop = areaDrop
 farmSec:Divider()
-farmSec:Slider("Run Speed", 600, 10, 40, 900, " studs/s", function(v)
+FM.speedSlider = farmSec:Slider("Run Speed", 600, 10, 40, 900, " studs/s", function(v)
     FM.SpeedSet = v
     FM.Speed = math.min(v, 900)
 end, "How fast you run. Your character is moved into the Camera while farming, so the speed check has nothing left to read.")
+-- The menu library fires stray callbacks at load - it once left Run Speed reading 120 while
+-- the slider showed something else, and everything crawled. The slider is the truth: read
+-- what it shows rather than trusting the last callback (same fix as Always Target).
+FM.syncSpeed = function()
+    local ok, v = pcall(function() return FM.speedSlider:Get() end)
+    if type(v) == "table" then v = v[1] end
+    if ok and type(v) == "number" and v >= 40 and v <= 900 then
+        FM.SpeedSet = v
+        if (FM.Ghost and FM.GhostSaved) or not FM.Ghost then
+            FM.Speed = math.min(v, 900)
+        end
+    end
+end
+FM.syncSpeed()
 farmSec:Slider("Grab Escape Delay", 0.45, 0.05, 0, 1.5, " s", function(v) FM.GrabEscapeDelay = v end,
     "Escape this long after grabbing an egg. 0 = as soon as the grab registers.")
 FM.ui = farmSec:Label("Off")
@@ -4458,19 +4484,19 @@ SESPAWN("night watch", function()
                     local have, total, held = riftProgress()
                     FM.RiftHave = held
                     local age = tick() - (FM.RiftPanelAt or FM.RiftReadAt or 0)
-                    if age > 30 then
-                        FM.RiftState = "Can't read the rift panel"
-                        if not FM.riftStaleWarned then
-                            FM.riftStaleWarned = true
-                            notify("Rift Farm", "Can't read the rift panel", 6, "warn")
-                            warn("[Steal An Egg] rift panel unreadable: PlayerGui is out of reach, " ..
-                                 "which happens when the executor loses its DataModel bindings. " ..
-                                 "Rejoin or re-inject to restore it.")
-                        end
-                    else
-                        FM.riftStaleWarned = false
+                    -- The rift panel's contents come and go on the GAME's side: when this was
+                    -- checked, the input frames were simply not there anywhere, so a failed
+                    -- read says nothing about Matcha (the old "PlayerGui is out of reach" note
+                    -- was wrong). Keep farming the targets we last read, and retry every 2s
+                    -- instead of every 10s so it picks the panel up again the moment it is back.
+                    FM.RiftPanelStale = age > 30
+                    if FM.RiftPanelStale and (tick() - (FM.riftRefreshAt or 0)) > 2 then
+                        FM.riftRefreshAt = 0
                     end
-                    if age <= 30 then
+                    if FM.RiftPanelStale and not (FM.RiftTargets and #FM.RiftTargets > 0) then
+                        FM.RiftState = "Waiting for the rift panel"
+                    end
+                    if age <= 30 or (FM.RiftTargets and #FM.RiftTargets > 0) then
                     if have >= total and total >= 3 and FM.RiftComplete then
                         FM.RiftState = string.format("Complete (%d/%d)", have, total)
                         if not FM.riftDoneNotified then
@@ -4495,9 +4521,10 @@ SESPAWN("night watch", function()
                                 missing[#missing + 1] = string.format("%s(%d)", t.name, c)
                             end
                         end
-                        FM.RiftState = string.format("%d/%d - need %s%s",
+                        FM.RiftState = string.format("%d/%d - need %s%s%s",
                             have, total, table.concat(missing, ", "),
-                            (onMap == 0) and " (none spawned)" or "")
+                            (onMap == 0) and " (none spawned)" or "",
+                            FM.RiftPanelStale and " (last read)" or "")
                     end
                     end
                 end
@@ -4730,11 +4757,26 @@ do
         local saved = FM.GhostSaved or {}
         local seen = FM.GhostSeen or {}
         local moved = 0
+        -- Leave any tool - and everything inside it - where it is. The Dr Scramble farm
+        -- fights with the weapon in your hand, and stripping it would pull the tool (and its
+        -- parts out of it) into the Camera, leaving nothing to swing.
+        local function inTool(d)
+            local node = d
+            for _ = 1, 6 do
+                if not node or node == ch then return false end
+                local okc, cl = pcall(function() return node.ClassName end)
+                if okc and cl == "Tool" then return true end
+                local okp, p = pcall(function() return node.Parent end)
+                if not okp then return false end
+                node = p
+            end
+            return false
+        end
         for _, d in ipairs(kids) do
             local okn, nm = pcall(function() return d.Name end)
             -- their filter is IsA("Motor6D"), but Matcha's IsA returns true for every
             -- class, so the name test is the only part that narrows it. Do that directly.
-            if okn and nm ~= "RootJoint" and nm ~= "Root" then
+            if okn and nm ~= "RootJoint" and nm ~= "Root" and not inTool(d) then
                 local okp, par = pcall(function() return d.Parent end)
                 if okp and par and par ~= cam then
                     if not seen[d] then
@@ -4783,14 +4825,24 @@ do
         -- Belt and braces for the treadmill: go by where you actually are, not just the
         -- flags. However you got onto it - the farm walking you there, or you turning the
         -- farm on mid-workout - stepping off stripped crashes the client.
+        -- Your treadmill sits on your plot, a few studs from where eggs are delivered, so a
+        -- plain 14-stud radius made ghost stand down on arrival at the safe zone - a 281
+        -- object restore at the exact moment a delivery lands, which is what the crash
+        -- reports describe. Only treat it as "on the treadmill" when the farm is actually
+        -- going there, or when you are stood on it: close, near enough still, and not in the
+        -- middle of delivering.
         local onTreadNow = FM.onTreadmill or FM.treadVisit
-        if not onTreadNow then
+        if not onTreadNow and not FM.hasEgg
+           and (tick() - (FM.deliveredAt or 0)) > (FM.GhostDeliverGap or 2.5) then
             local tp = myTreadmill()
             local rr = myRoot()
             local okrp, rp = pcall(function() return rr and rr.Position end)
-            if tp and okrp and rp then
+            local okv, vv = pcall(function() return rr and rr.AssemblyLinearVelocity end)
+            local slow = (not okv) or (not vv)
+                or math.sqrt(vv.X * vv.X + vv.Z * vv.Z) < (FM.TreadmillStill or 25)
+            if tp and okrp and rp and slow then
                 onTreadNow = math.sqrt((rp.X - tp.X) ^ 2 + (rp.Z - tp.Z) ^ 2)
-                    < (FM.TreadmillNear or 14)
+                    < (FM.TreadmillOn or 6)
             end
         end
         local want = FM.Ghost and not off
@@ -4803,6 +4855,22 @@ do
             and not FM.DeathDrop and not FM.ddPhase
         if not want then
             if FM.GhostSaved then
+                -- Handing 281 objects back is the one thing that has taken the client down
+                -- outright, and it is worst while the game is busy - which at 900 studs/s it
+                -- always is. Come to a stop first, then restore. A dead character skips this:
+                -- that restore happens further down and has to be immediate.
+                local okv, v = pcall(function() return root and root.AssemblyLinearVelocity end)
+                local fast = okv and v and math.sqrt(v.X * v.X + v.Z * v.Z)
+                    > (FM.GhostRestoreSpeed or 80)
+                if root and fast and (tick() - (FM.ghostBrakeAt or tick())) < 1.5 then
+                    FM.ghostBrakeAt = FM.ghostBrakeAt or tick()
+                    pcall(function()
+                        root.AssemblyLinearVelocity = Vector3.new(0, -(FM.LandStick or 40), 0)
+                    end)
+                    FM.GhostBrakes = (FM.GhostBrakes or 0) + 1
+                    return
+                end
+                FM.ghostBrakeAt = nil
                 ghostRestore()
                 FM.GhostOffs = (FM.GhostOffs or 0) + 1
             end
@@ -5212,6 +5280,13 @@ end
 
 local function farmStep()
     local task = PROF_TASK
+    -- The Dr Scramble farm has the character during the event. Checked before the "farm is
+    -- off" branch below on purpose: that branch hands the ghost body back, and doing that
+    -- while the event farm is running would strip and restore you over and over.
+    if FM.ScrambleBusy then
+        task.wait(0.1)
+        return
+    end
     if not FM.On then
         if FM.ddPhase then FM.ddPhase, FM.ddSpawnAt, FM.ddLastChar = nil, nil, nil end
         if FM.bhPhase then FM.bhPhase, FM.bhSeen, FM.bhMiss = nil, nil, nil end
@@ -6440,6 +6515,10 @@ local function farmStep()
                     local cands, sawRandom = {}, false
                     local tlist = farmTargets()
                     FM.alwaysNow = {}
+                    if FM.syncSpeed and (now - (FM.speedSyncAt or 0)) > 1 then
+                        FM.speedSyncAt = now
+                        FM.syncSpeed()
+                    end
                     if FM.syncAlways and (now - (FM.alwaysSyncAt or 0)) > 1 then
                         FM.alwaysSyncAt = now
                         FM.syncAlways()
@@ -6511,7 +6590,8 @@ local function farmStep()
                             if FM.retryKey == key and FM.retryUntil and now < FM.retryUntil then
                                 pri = pri + 25000000
                             end
-                            local riftFresh = (tick() - (FM.RiftPanelAt or FM.RiftReadAt or 0)) < 30
+                            -- the last targets read stay good while the panel is hidden
+                            local riftFresh = FM.RiftTargets ~= nil and #FM.RiftTargets > 0
                             if FM.Rift and FM.RiftPrio and riftFresh then
                                 for _, want in ipairs(FM.RiftTargets or {}) do
                                     if not (FM.RiftHave or {})[want.name] then
@@ -6920,6 +7000,425 @@ local function farmStep()
         end
     end
 end
+
+-- ======================================================================================
+-- Dr Scramble event farm. While the event is on, experiments spawn all over the map as
+-- client-side models workspace.ScrambleLocalVisuals.DroneVisual_<id>, each with a
+-- RootPart.ScrambleHealth billboard reading "x / y HP". The max HP is the type: 3, 5 or 10
+-- (templates ScrapDrone / ReactorDrone / AugmentedDrone), and the bigger ones drop more.
+--
+-- The game only loads experiments within about 200 studs of you (measured 197). There is
+-- no way round that from here: no replicated copy of their positions exists, getgc comes
+-- back empty in Matcha, and reading the game's remotes is off the table. So when none of
+-- the types you want is loaded, the farm patrols the length of the map along the middle
+-- of the lane - 200 studs either side covers both rows of areas - and goes for the first
+-- wanted one that loads in.
+--
+-- Tested live 2026-09-19 (without ghost): 6 kills in 24s, clicks do the damage.
+-- Wrapped in a function called once, not a do-block: this far down the file the top level
+-- is at Luau's 200-local limit, and a function gets a register budget of its own.
+-- ======================================================================================
+;(function()
+    local scrSec = farm:Section("Dr Scramble", "Full")
+    scrSec:Label("Farms the experiments while the event is on.")
+    FM.Scramble = false
+    scrSec:Toggle("Auto Dr Scramble", false, function(v)
+        FM.Scramble = v
+        if v then
+            notify("Dr Scramble", "Waiting for the event", 3)
+        else
+            FM.ScrambleBusy = false
+        end
+    end, "Waits for the Dr Scramble event, then runs you (in ghost mode) to the experiments you "
+        .. "picked and fights them one at a time with the weapon in your hand, biggest first. "
+        .. "Patrols the map when none are loaded near you. Clicks to swing. Takes over from Auto "
+        .. "Farm during the event, after any egg you are carrying is home.")
+
+    -- which experiments to go for
+    local TYPE_CHOICES = { "3 HP Experiments", "5 HP Experiments", "10 HP Experiments" }
+    local TYPE_HP = { ["3 HP Experiments"] = 3, ["5 HP Experiments"] = 5, ["10 HP Experiments"] = 10 }
+    FM.ScrambleTypes = { [3] = true, [5] = true, [10] = true }
+    local typeDrop = scrSec:Dropdown("Experiments", TYPE_CHOICES, TYPE_CHOICES, true, function(sel)
+        local set = {}
+        for _, nm in ipairs(sel or {}) do
+            if TYPE_HP[nm] then set[TYPE_HP[nm]] = true end
+        end
+        FM.ScrambleTypes = set
+    end, "Which experiments to farm. The farm ignores the rest and patrols until one of these loads in.")
+    pcall(function() typeDrop:Set(TYPE_CHOICES) end)
+    -- The menu library's callbacks misfire at load (see Always Target), so read what the
+    -- box actually shows rather than trusting the last callback.
+    local function syncTypes()
+        local ok, sel = pcall(function() return typeDrop:Get() end)
+        if not ok or type(sel) ~= "table" then return end
+        local set = {}
+        for _, nm in ipairs(sel) do
+            if TYPE_HP[nm] then set[TYPE_HP[nm]] = true end
+        end
+        FM.ScrambleTypes = set
+    end
+    local function wanted(maxHp)
+        if maxHp == 3 or maxHp == 5 or maxHp == 10 then
+            return (FM.ScrambleTypes or {})[maxHp] == true
+        end
+        -- a type we have not seen before: go for it only if everything is ticked
+        local t = FM.ScrambleTypes or {}
+        return t[3] and t[5] and t[10] and true or false
+    end
+
+    local scrLabel = scrSec:Label("Off")
+
+    -- every live experiment: { name, root, pos, hp, max }
+    local function scrambleDrones()
+        local out = {}
+        local okf, f = pcall(function() return workspace:FindFirstChild("ScrambleLocalVisuals") end)
+        local okk, kids = false, nil
+        if okf and f then okk, kids = pcall(function() return f:GetChildren() end) end
+        for _, d in ipairs((okk and kids) or {}) do
+            local okn, n = pcall(function() return d.Name end)
+            if okn and type(n) == "string" and string.find(n, "DroneVisual", 1, true) then
+                local okr, root = pcall(function() return d:FindFirstChild("RootPart") end)
+                local okp, p = pcall(function() return root and root.Position end)
+                local hp, mx
+                if okr and root then
+                    local function walk(node, depth)
+                        if hp or not node or depth > 4 then return end
+                        local okc, ch = pcall(function() return node:GetChildren() end)
+                        for _, c in ipairs((okc and ch) or {}) do
+                            local okt, t = pcall(function() return c.Text end)
+                            if okt and type(t) == "string" then
+                                local a, b = string.match(t, "(%d+)%s*/%s*(%d+)%s*HP")
+                                if a then
+                                    hp, mx = tonumber(a), tonumber(b)
+                                    return
+                                end
+                            end
+                            walk(c, depth + 1)
+                        end
+                    end
+                    local okb, bb = pcall(function() return root:FindFirstChild("ScrambleHealth") end)
+                    if okb and bb then walk(bb, 0) end
+                end
+                if okp and typeof(p) == "Vector3" and hp and hp > 0 then
+                    out[#out + 1] = { name = n, root = root, pos = p, hp = hp, max = mx or hp }
+                end
+            end
+        end
+        return out
+    end
+    _G.SEHUB_SCRAMBLE = scrambleDrones
+
+    -- Is the event running? The HUD timer reads "Event ends in 3m 46s" and counts down every
+    -- second while it is - but once it is over the text just freezes on "Event ends in 0m 1s"
+    -- (checked live), so a timer that has stopped moving means the event has finished.
+    local lastTimerText, timerChangedAt = nil, 0
+    local nightSince = nil
+    local function eventOn()
+        -- The event runs for one day, so nightfall ends it. Night is the egg slots emptying
+        -- out; give it a second so a one-off empty read cannot call it early.
+        local nowT = tick()
+        local okf, f = pcall(function() return workspace:FindFirstChild("AreaEggSlotsClient") end)
+        local nSlots = 0
+        if okf and f then
+            local okk, kids = pcall(function() return f:GetChildren() end)
+            nSlots = (okk and kids) and #kids or 0
+        end
+        if nSlots == 0 then
+            nightSince = nightSince or nowT
+            if (nowT - nightSince) >= (FM.NightConfirm or 1) then
+                FM.ScrambleNight = true
+                return false
+            end
+        else
+            nightSince, FM.ScrambleNight = nil, false
+        end
+        local ok, t = pcall(function()
+            return localPlayer().PlayerGui.HUD.GameHUD.BottomRight.ExperimentTimer.Value.Text
+        end)
+        if not ok or type(t) ~= "string" then return false end
+        if lastTimerText == nil then
+            lastTimerText = t              -- first read: not moving yet as far as we know
+        elseif t ~= lastTimerText then
+            lastTimerText, timerChangedAt = t, nowT
+        end
+        return string.find(string.lower(t), "ends in", 1, true) ~= nil and (nowT - timerChangedAt) < 3
+    end
+
+    -- the weapon in your hand: any tool that is not an egg, checked live by its Parent
+    local function heldWeapon(ch)
+        local okk, kids = pcall(function() return ch:GetChildren() end)
+        for _, t in ipairs((okk and kids) or {}) do
+            local okc, cl = pcall(function() return t.ClassName end)
+            if okc and cl == "Tool" then
+                local okn, n = pcall(function() return string.lower(tostring(t.Name)) end)
+                local okp, par = pcall(function() return t.Parent end)
+                if okn and not string.find(n, "egg", 1, true) and okp and par == ch then
+                    return t
+                end
+            end
+        end
+        return nil
+    end
+
+    -- Where the event is: its own models mark the spot. The underground ones (Brock, the
+    -- vault) give the centre, the lost parts above ground give the spread. Falls back to
+    -- the whole map if the event model is not there.
+    local function eventBounds()
+        local minX, maxX, sumZ, n = nil, nil, 0, 0
+        local oke, ev = pcall(function() return workspace:FindFirstChild("DrScrambleEvent") end)
+        local okk, kids = false, nil
+        if oke and ev then okk, kids = pcall(function() return ev:GetChildren() end) end
+        for _, c in ipairs((okk and kids) or {}) do
+            local p
+            pcall(function()
+                local r = c:FindFirstChild("RootPart") or c:FindFirstChild("HumanoidRootPart")
+                    or c:FindFirstChild("Hitbox")
+                p = r and r.Position
+            end)
+            if typeof(p) == "Vector3" then
+                if not minX or p.X < minX then minX = p.X end
+                if not maxX or p.X > maxX then maxX = p.X end
+                -- only the bits above ground say anything useful about where to run
+                if p.Y > 0 then sumZ, n = sumZ + p.Z, n + 1 end
+            end
+        end
+        if not minX then
+            return FM.ScramblePatrolMin or 600, FM.ScramblePatrolMax or 5620, FM.ScramblePatrolZ or -365
+        end
+        local pad = FM.ScramblePatrolPad or 350
+        local lo = math.max(FM.ScramblePatrolMin or 600, minX - pad)
+        local hi = math.min(FM.ScramblePatrolMax or 5620, maxX + pad)
+        if hi - lo < 200 then
+            lo, hi = lo - 200, hi + 200
+        end
+        local z = (n > 0) and (sumZ / n) or (FM.ScramblePatrolZ or -365)
+        return lo, hi, z
+    end
+    _G.SEHUB_SCRBOUNDS = eventBounds
+
+    local list, listAt = {}, 0
+    local lastSwing, lastEquip, lastLabel = 0, 0, nil
+    local kills, patrolTo = 0, nil
+    local stuckFrom, stuckAt, detourUntil, detourSide = nil, 0, 0, 1
+
+    local function moveTo(root, me, x, z, label)
+        local dx, dz = x - me.X, z - me.Z
+        local d = math.sqrt(dx * dx + dz * dz)
+        if d < 0.5 then return d end
+        local nowT = tick()
+        -- Walls. Respawning drops you back at your plot, and the run out used to grind along
+        -- whatever is in the way until something shook it loose. Watch for going nowhere, and
+        -- when it happens, slide sideways for a moment - alternating sides - and finally hop
+        -- a short way along, which the position check allows under about 120 studs.
+        if not stuckFrom or (nowT - stuckAt) > 0.6 then
+            if stuckFrom and math.sqrt((me.X - stuckFrom.X) ^ 2 + (me.Z - stuckFrom.Z) ^ 2) < 6
+               and nowT > detourUntil then
+                FM.ScrambleStuck = (FM.ScrambleStuck or 0) + 1
+                if (FM.ScrambleStuck % 4) == 0 then
+                    -- still nowhere after a few sidesteps: hop along the way we want to go
+                    pcall(function()
+                        root.CFrame = CFrame.new(me.X + (dx / d) * 40, me.Y + 3, me.Z + (dz / d) * 40)
+                        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                    end)
+                    FM.ScrambleHops = (FM.ScrambleHops or 0) + 1
+                else
+                    detourUntil, detourSide = nowT + 0.8, -detourSide
+                end
+            end
+            stuckFrom, stuckAt = me, nowT
+        end
+        local tx, tz = x, z
+        if nowT < detourUntil then
+            -- aim off to one side of where we were heading
+            tx, tz = me.X - (dz / d) * 60 * detourSide, me.Z + (dx / d) * 60 * detourSide
+            label = label .. " - going round something"
+        end
+        -- full speed, but never more than about half of what is left in one step
+        local sp = math.min(FM.Speed or 300, math.max(40, d / 0.1))
+        local ux, uz = steerAround(me, tx, tz, sp)
+        drive(root, ux * sp, uz * sp, -(FM.Stick or 18))
+        FM.ScrambleState = label
+        return d
+    end
+
+    local function scrambleStep()
+        local nowT = tick()
+        local root, ch = myRoot(), myCharacter()
+        if not root or not ch then
+            FM.ScrambleState = "Waiting for character"
+            return
+        end
+        local okp, me = pcall(function() return root.Position end)
+        if not okp or not me then return end
+
+        -- Just died? Stand still while the new character loads in and ghost settles. Setting
+        -- off the instant you respawn is how you end up grinding along the wall by your plot.
+        if ch ~= FM.scrChar then
+            FM.scrChar, FM.scrRespawnAt = ch, nowT
+            FM.scrTarget, patrolTo = nil, nil
+        end
+        if FM.scrRespawnAt and (nowT - FM.scrRespawnAt) < (FM.ScrambleRespawnWait or 2) then
+            pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0) end)
+            FM.ScrambleState = "Respawned - getting my bearings"
+            return
+        end
+
+        -- weapon first, THEN ghost: the strip leaves tools alone, so a weapon already in
+        -- hand stays usable. Pressing 1 takes it out of the hotbar.
+        local weapon = heldWeapon(ch)
+        if not weapon then
+            FM.scrEquipSince = FM.scrEquipSince or nowT
+            if (nowT - lastEquip) > 0.8 and keypress then
+                lastEquip = nowT
+                pcall(function() keypress(0x31) end)
+                task.wait(0.05)
+                if keyrelease then pcall(function() keyrelease(0x31) end) end
+                FM.ScrambleEquips = (FM.ScrambleEquips or 0) + 1
+            end
+        else
+            FM.scrEquipSince = nil
+        end
+        if FM.ghostStep and (weapon or (nowT - (FM.scrEquipSince or nowT)) > 3) then
+            FM.ghostStep(root)
+        end
+
+        -- keep the current target until it dies
+        local target
+        for _, d in ipairs(list) do
+            if d.name == FM.scrTarget then target = d break end
+        end
+        if FM.scrTarget and not target then
+            kills = kills + 1
+            FM.ScrambleKills = (FM.ScrambleKills or 0) + 1
+            FM.scrTarget = nil
+            -- Straight on to the next one. No stopping to collect the drops - that pause
+            -- after every kill was a second of standing about, and nothing was gained by it.
+            -- Re-read the experiments right now rather than waiting for the next 0.2s scan,
+            -- so the next target is picked this tick.
+            list = scrambleDrones()
+            listAt = nowT
+        end
+
+        -- then the biggest wanted one loaded, nearest first between equals
+        if not target then
+            local bestD
+            for _, d in ipairs(list) do
+                if wanted(d.max) then
+                    local dd = math.sqrt((d.pos.X - me.X) ^ 2 + (d.pos.Z - me.Z) ^ 2)
+                    if not target or d.max > target.max or (d.max == target.max and dd < bestD) then
+                        target, bestD = d, dd
+                    end
+                end
+            end
+            FM.scrTarget = target and target.name or nil
+            if target then patrolTo = nil end
+        end
+
+        -- Nothing wanted loaded near us: sweep the stretch of map the event is on. The
+        -- event has a home - its lost parts sit above ground either side of it (measured
+        -- 1781 and 2782 around Abyss Ocean) - so patrol that stretch plus a margin rather
+        -- than running the whole map and leaving the event behind.
+        if not target then
+            -- The whole map, end to end. Sweeping only the event's own footprint (its models
+            -- sit around Abyss Ocean) stopped the roam at Cosmic, and experiments spawn well
+            -- past that. eventBounds() is still there if a narrower sweep is ever wanted.
+            local lo, hi = FM.ScramblePatrolMin or 600, FM.ScramblePatrolMax or 5620
+            local z = FM.ScramblePatrolZ or -365
+            -- Start at Abyss Ocean, where the event kicks off, then sweep out from there to
+            -- the far end and carry on end to end.
+            if not patrolTo and not FM.scrStarted then
+                local sx = FM.ScrambleStartX or 2165
+                if math.abs(me.X - sx) > 120 then
+                    moveTo(root, me, sx, z, "Heading to Abyss Ocean for the event")
+                    return
+                end
+                FM.scrStarted = true
+            end
+            if not patrolTo then
+                -- head for whichever end is further away, so the first sweep covers the most
+                patrolTo = (math.abs(me.X - lo) > math.abs(me.X - hi)) and lo or hi
+            end
+            local d = moveTo(root, me, patrolTo, z,
+                string.format("Patrolling for experiments (%.0f - %.0f)", lo, hi))
+            if d < 30 then patrolTo = (patrolTo == lo) and hi or lo end
+            return
+        end
+
+        -- follow it live, not from the 0.2s list
+        local okt, tp = pcall(function() return target.root.Position end)
+        local p = (okt and typeof(tp) == "Vector3") and tp or target.pos
+        local dx, dz = p.X - me.X, p.Z - me.Z
+        local d = math.sqrt(dx * dx + dz * dz)
+        if d > (FM.ScrambleReach or 5) then
+            moveTo(root, me, p.X, p.Z, string.format("Running to a %d HP experiment (%.0f studs)", target.max, d))
+        else
+            pcall(function()
+                root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0)
+                root.CFrame = CFrame.new(me.X, me.Y, me.Z, p.X, me.Y, p.Z)
+            end)
+            -- one swing per 0.9s: that is the bat cooldown, and clicking any faster makes
+            -- the weapon skip swings rather than land more of them
+            if weapon and (nowT - lastSwing) >= (FM.ScrambleSwing or 0.9) and mouse1press then
+                lastSwing = nowT
+                pcall(function() mouse1press() end)
+                task.wait(0.03)
+                if mouse1release then pcall(function() mouse1release() end) end
+                FM.ScrambleSwings = (FM.ScrambleSwings or 0) + 1
+            end
+            FM.ScrambleState = string.format("Fighting a %d HP experiment (%d left)", target.max, target.hp)
+        end
+    end
+
+    SESPAWN("dr scramble", function()
+        local syncAt = 0
+        while _G.SEHUB_GEN == GEN do
+            local waitFor = 0.5
+            if FM.Scramble then
+                local nowT = tick()
+                if (nowT - syncAt) > 1 then
+                    syncAt = nowT
+                    syncTypes()
+                    if FM.syncSpeed then FM.syncSpeed() end
+                end
+                if (nowT - listAt) > 0.2 then
+                    listAt = nowT
+                    list = scrambleDrones()
+                end
+                -- let a carried egg get home first
+                local carrying = FM.On and FM.hasEgg
+                -- leftover experiments still count while it is daytime, in case the HUD
+                -- timer cannot be read
+                local live = eventOn() or (#list > 0 and not FM.ScrambleNight)
+                if live and not carrying then
+                    if not FM.ScrambleBusy then
+                        FM.ScrambleBusy, kills, patrolTo = true, 0, nil
+                        FM.scrStarted = nil
+                        notify("Dr Scramble", "Event is on - farming experiments", 4)
+                    end
+                    local ok, err = pcall(scrambleStep)
+                    if not ok then FM.ScrambleErr = tostring(err) end
+                    waitFor = 0.03
+                else
+                    if FM.ScrambleBusy then
+                        FM.ScrambleBusy = false
+                        FM.scrTarget, patrolTo = nil, nil
+                        notify("Dr Scramble", string.format("Event over - %d experiment%s killed",
+                            kills, (kills == 1) and "" or "s"), 5, "good")
+                    end
+                    FM.ScrambleState = live and "Taking the egg home first" or "Waiting for the event"
+                end
+            else
+                FM.ScrambleBusy = false
+                FM.ScrambleState = "Off"
+            end
+            if FM.ScrambleState ~= lastLabel then
+                lastLabel = FM.ScrambleState
+                pcall(function() scrLabel:SetText(tostring(FM.ScrambleState)) end)
+            end
+            task.wait(waitFor)
+        end
+    end)
+end)()
 
 SESPAWN("auto farm", function()
     while _G.SEHUB_GEN == GEN do
