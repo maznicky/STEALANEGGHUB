@@ -4831,7 +4831,12 @@ do
         -- reports describe. Only treat it as "on the treadmill" when the farm is actually
         -- going there, or when you are stood on it: close, near enough still, and not in the
         -- middle of delivering.
-        local onTreadNow = FM.onTreadmill or FM.treadVisit
+        -- treadVisit is set the moment the farm DECIDES to go and train, which it does at the
+        -- safe zone right after a delivery - so standing down on that flag alone restored 281
+        -- objects while you were still setting off from the drop point, with the delivered egg
+        -- in your hand. Go by where you actually are instead: nearly at the treadmill, or on
+        -- it. The run there keeps ghost, and the restore happens once you have stopped.
+        local onTreadNow = FM.onTreadmill
         if not onTreadNow and not FM.hasEgg
            and (tick() - (FM.deliveredAt or 0)) > (FM.GhostDeliverGap or 2.5) then
             local tp = myTreadmill()
@@ -4841,8 +4846,10 @@ do
             local slow = (not okv) or (not vv)
                 or math.sqrt(vv.X * vv.X + vv.Z * vv.Z) < (FM.TreadmillStill or 25)
             if tp and okrp and rp and slow then
-                onTreadNow = math.sqrt((rp.X - tp.X) ^ 2 + (rp.Z - tp.Z) ^ 2)
-                    < (FM.TreadmillOn or 6)
+                local dTread = math.sqrt((rp.X - tp.X) ^ 2 + (rp.Z - tp.Z) ^ 2)
+                -- close enough to be arriving when the farm is heading there, or stood on it
+                onTreadNow = dTread < (FM.treadVisit and (FM.TreadmillStandDown or 25)
+                    or (FM.TreadmillOn or 6))
             end
         end
         local want = FM.Ghost and not off
@@ -4859,6 +4866,12 @@ do
                 -- outright, and it is worst while the game is busy - which at 900 studs/s it
                 -- always is. Come to a stop first, then restore. A dead character skips this:
                 -- that restore happens further down and has to be immediate.
+                -- and never in the seconds right after a delivery, when the client is still
+                -- working through it - that is when people's games died
+                if not off and (tick() - (FM.deliveredAt or 0)) < (FM.GhostDeliverGap or 2.5) then
+                    FM.GhostHeld = (FM.GhostHeld or 0) + 1
+                    return
+                end
                 local okv, v = pcall(function() return root and root.AssemblyLinearVelocity end)
                 local fast = okv and v and math.sqrt(v.X * v.X + v.Z * v.Z)
                     > (FM.GhostRestoreSpeed or 80)
