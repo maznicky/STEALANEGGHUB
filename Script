@@ -3388,7 +3388,10 @@ bossTog = farmSec:Toggle("Auto Anti-Boss", false, function(v)
     FM.AutoBoss = v
     -- One or the other: Anti-Boss keeps the egg, Friend Drop throws it away on purpose.
     if v and fdTog then pcall(function() fdTog:Set(false) end) end
-end, "Escapes a boss that chases you while you carry an egg. Turns off Friend Drop.")
+    -- And Ragdoll Teleport wants the exact opposite of this: it needs a boss to hit you,
+    -- while this escapes the moment one does. With both on they pull against each other.
+    if v and FM.rtTog then pcall(function() FM.rtTog:Set(false) end) end
+end, "Escapes a boss that chases you while you carry an egg. Turns off Friend Drop and Ragdoll Teleport.")
 FM.bossTog = bossTog
 -- Avoid Players is always on now, with no toggle: steering round other players (and their
 -- traps and the boss rift) never costs anything worth keeping it switchable for.
@@ -3399,9 +3402,12 @@ FM.TreadmillFarm = true
 farmSec:Toggle("Auto Treadmill Farm", true, function(v) FM.TreadmillFarm = v end,
     "Trains on your treadmill whenever there are no eggs to farm.")
 FM.RagdollTp = true
-FM.rtTog = farmSec:Toggle("Ragdoll Teleport", true, function(v) FM.RagdollTp = v end,
-    "Lets the Forest guard ragdoll you, then teleports to far eggs. Runs normally if it fails. "
-    .. "Waits 1.5s before pinning while Friend Drop is on.")
+FM.rtTog = farmSec:Toggle("Ragdoll Teleport", true, function(v)
+    FM.RagdollTp = v
+    -- needs a boss hit, which Auto Anti-Boss exists to dodge, so only one of them at a time
+    if v and bossTog then pcall(function() bossTog:Set(false) end) end
+end, "Lets the Forest guard ragdoll you, then teleports to far eggs. Runs normally if it fails. "
+    .. "Waits 1.5s before pinning while Friend Drop is on. Turns off Auto Anti-Boss.")
 FM.FriendDrop = false
 FM.DeathDrop = false
 fdTog = farmSec:Toggle("Friend Drop", false, function(v)
@@ -3654,12 +3660,26 @@ SESPAWN("antiafk", function()
     while _G.SEHUB_GEN == GEN do
         task.wait(5)
         if FM.AntiAfk and keypress and keyrelease then
-            if (tick() - (FM.antiAfkAt or 0)) > (FM.AntiAfkEvery or 540) then
+            if (tick() - (FM.antiAfkAt or 0)) > (FM.AntiAfkEvery or 300) then
                 FM.antiAfkAt = tick()
-                pcall(function() keypress(0x7C) end)
-                task.wait(0.05)
-                pcall(function() keyrelease(0x7C) end)
+                -- This used to tap F13. Measured 2026-09-20: Windows registers F13, but
+                -- ROBLOX never sees it (UserInputService:IsKeyDown stays false), so the idle
+                -- timer never reset and the anti-AFK did nothing at all. Letter keys do get
+                -- through, so tap one the game does not use - not E (grabs) or Q (drops).
+                local vk = FM.AntiAfkKey or 0x4B          -- K
+                local code = FM.AntiAfkKeyCode or 107     -- KeyCode.K
+                pcall(function() keypress(vk) end)
+                task.wait(0.06)
+                -- and check the game actually saw it, so this can never go quiet again
+                local okU, dn = pcall(function()
+                    return game:GetService("UserInputService"):IsKeyDown(code)
+                end)
+                FM.AntiAfkSeen = (okU and dn) and true or false
+                pcall(function() keyrelease(vk) end)
                 FM.AntiAfkTaps = (FM.AntiAfkTaps or 0) + 1
+                if not FM.AntiAfkSeen then
+                    FM.AntiAfkMissed = (FM.AntiAfkMissed or 0) + 1
+                end
             end
         end
     end
@@ -4637,15 +4657,30 @@ _G.SEHUB_TREADMILL = myTreadmill
 
 local ragdollTeleport
 do
+    -- A boss ragdoll adds BallSocketConstraints to the torso, and that is how we know we have
+    -- been hit. Since the game update the rig ALSO carries a permanent one in UpperTorso
+    -- called "NeckAttachment", so "any ball socket = ragdolled" now reads true forever: the
+    -- teleport thought it was permanently ragdolled, waited for it to wear off, gave up,
+    -- pinned with no hit behind it, and went round again. Ignore the rig's own one.
+    local RIG_SOCKETS = { NeckAttachment = true, Neck = true, RootAttachment = true }
     local function ragdollJoints()
         local ch = myCharacter()
-        local okt, t = pcall(function() return ch and ch:FindFirstChild("UpperTorso") end)
-        if not okt or not t then return false end
-        local okk, kids = pcall(function() return t:GetChildren() end)
-        if not okk or not kids then return false end
-        for _, k in ipairs(kids) do
-            local okc, cl = pcall(function() return k.ClassName end)
-            if okc and cl == "BallSocketConstraint" then return true end
+        if not ch then return false end
+        for _, partName in ipairs({ "UpperTorso", "LowerTorso" }) do
+            local okt, t = pcall(function() return ch:FindFirstChild(partName) end)
+            if okt and t then
+                local okk, kids = pcall(function() return t:GetChildren() end)
+                for _, k in ipairs((okk and kids) or {}) do
+                    local okc, cl = pcall(function() return k.ClassName end)
+                    if okc and cl == "BallSocketConstraint" then
+                        local okn, nm = pcall(function() return tostring(k.Name) end)
+                        if okn and not RIG_SOCKETS[nm] then
+                            local okp, par = pcall(function() return k.Parent end)
+                            if okp and par ~= nil then return true end
+                        end
+                    end
+                end
+            end
         end
         return false
     end
@@ -4891,8 +4926,19 @@ do
             FM.Speed = math.min(FM.SpeedSet or 300, 300)
             return
         end
-        FM.Stick = 0
-        FM.Speed = math.min(FM.SpeedSet or 300, 900)
+        -- Ghost is WANTED here, but that is not the same as being stripped. After every
+        -- death the body comes back whole and stays that way for a moment while the new
+        -- character settles - and 900 studs/s on a whole character is an instant kill from
+        -- the speed check. Setting the fast speed on "wanted" meant dying on respawn, over
+        -- and over: die, come back, sprint un-stripped, die again. Only go fast once the
+        -- body is actually in the Camera.
+        if FM.GhostSaved then
+            FM.Stick = 0
+            FM.Speed = math.min(FM.SpeedSet or 300, 900)
+        else
+            FM.Stick = FM.StickSet or 18
+            FM.Speed = math.min(FM.SpeedSet or 300, FM.UnstrippedSpeed or 250)
+        end
         local now = tick()
         -- Never hold a dead or half-loaded character stripped: dying in ghost leaves you
         -- permanently dead. Hand the body back the instant health hits 0, and stay out of
@@ -5039,6 +5085,8 @@ do
         -- went - the teleport loop. Stand still until it has worn off.
         if ragdollJoints() then
             FM.rtRagWaitAt = FM.rtRagWaitAt or now
+            -- hold Auto Anti-Boss off while we wait, so it does not escape out from under us
+            FM.rtBusyUntil = math.max(FM.rtBusyUntil or 0, now + 1)
             if (now - FM.rtRagWaitAt) < (FM.RagdollTpClearWait or 5) then
                 pcall(function()
                     root.AssemblyLinearVelocity = Vector3.new(0, -(FM.LandStick or 40), 0)
@@ -7125,26 +7173,59 @@ end
     -- second while it is - but once it is over the text just freezes on "Event ends in 0m 1s"
     -- (checked live), so a timer that has stopped moving means the event has finished.
     local lastTimerText, timerChangedAt = nil, 0
-    local nightSince = nil
-    local function eventOn()
-        -- The event runs for one day, so nightfall ends it. Night is the egg slots emptying
-        -- out; give it a second so a one-off empty read cannot call it early.
+    local nightSince, nightLeftPrev, nightFellAt = nil, nil, 0
+
+    -- seconds left on the HUD's night countdown ("in 4m 35s"), nil if it cannot be read
+    local function nightCountdown()
+        local ok, t = pcall(function()
+            return localPlayer().PlayerGui.HUD.GameHUD.BottomRight.NightTimer.Value.Text
+        end)
+        if not ok or type(t) ~= "string" then return nil end
+        local m, s = string.match(t, "(%d+)m%s*(%d+)s")
+        if m then return tonumber(m) * 60 + tonumber(s) end
+        local only = string.match(t, "(%d+)s")
+        return only and tonumber(only) or nil
+    end
+
+    -- The event lasts one day and ENDS THE MOMENT NIGHT FALLS - the event's own timer is
+    -- wrong and keeps counting for another 10-15s, so it cannot be trusted for the ending.
+    -- Night shows two ways: the HUD's night countdown running out and resetting for the next
+    -- one, and the eggs going. Some eggs linger a moment (a transition read showed 5 left),
+    -- so a low count counts, not just zero.
+    local function nightNow()
         local nowT = tick()
+        local left = nightCountdown()
+        if left then
+            if nightLeftPrev and nightLeftPrev <= 5 and left >= 20 then
+                nightFellAt = nowT       -- the countdown just reset: night has begun
+            end
+            nightLeftPrev = left
+            if left <= 0 then nightFellAt = nowT end
+        end
+        if (nowT - nightFellAt) < (FM.NightLasts or 25) then return true end
         local okf, f = pcall(function() return workspace:FindFirstChild("AreaEggSlotsClient") end)
         local nSlots = 0
         if okf and f then
             local okk, kids = pcall(function() return f:GetChildren() end)
             nSlots = (okk and kids) and #kids or 0
         end
-        if nSlots == 0 then
+        if nSlots < (FM.NightSlots or 10) then
             nightSince = nightSince or nowT
-            if (nowT - nightSince) >= (FM.NightConfirm or 1) then
-                FM.ScrambleNight = true
-                return false
-            end
+            if (nowT - nightSince) >= (FM.NightConfirm or 1) then return true end
         else
-            nightSince, FM.ScrambleNight = nil, false
+            nightSince = nil
         end
+        return false
+    end
+    _G.SEHUB_NIGHT = nightNow
+
+    local function eventOn()
+        local nowT = tick()
+        if nightNow() then
+            FM.ScrambleNight = true
+            return false
+        end
+        FM.ScrambleNight = false
         local ok, t = pcall(function()
             return localPlayer().PlayerGui.HUD.GameHUD.BottomRight.ExperimentTimer.Value.Text
         end)
@@ -7214,11 +7295,20 @@ end
     local kills, patrolTo = 0, nil
     local stuckFrom, stuckAt, detourUntil, detourSide = nil, 0, 0, 1
 
-    local function moveTo(root, me, x, z, label)
+    -- direct = ignore the trap/player/boss steering and go straight at it. Experiments draw
+    -- a crowd, and keeping 8 studs clear of every player standing round one means circling it
+    -- for ever instead of closing in - which is what the "stuck" counter was really seeing.
+    local function moveTo(root, me, x, z, label, direct)
         local dx, dz = x - me.X, z - me.Z
         local d = math.sqrt(dx * dx + dz * dz)
         if d < 0.5 then return d end
         local nowT = tick()
+        if direct then
+            local sp = math.min(FM.Speed or 300, math.max(40, d / 0.1))
+            drive(root, dx / d * sp, dz / d * sp, -(FM.Stick or 18))
+            FM.ScrambleState = label
+            return d
+        end
         -- Walls. Respawning drops you back at your plot, and the run out used to grind along
         -- whatever is in the way until something shook it loose. Watch for going nowhere, and
         -- when it happens, slide sideways for a moment - alternating sides - and finally hop
@@ -7266,14 +7356,67 @@ end
 
         -- Just died? Stand still while the new character loads in and ghost settles. Setting
         -- off the instant you respawn is how you end up grinding along the wall by your plot.
-        if ch ~= FM.scrChar then
+        -- A death shows up two ways: a new character, or you suddenly being back at your
+        -- plot. Matcha's character reads go stale, so the jump is the one that never lies -
+        -- without it the farm carried straight on after dying and died again.
+        local jumped = FM.scrLastPos and math.sqrt((me.X - FM.scrLastPos.X) ^ 2
+            + (me.Z - FM.scrLastPos.Z) ^ 2) > (FM.ScrambleJump or 250)
+            and (FM.ScrambleHops or 0) == (FM.scrHopsSeen or 0)
+        FM.scrLastPos, FM.scrHopsSeen = me, FM.ScrambleHops or 0
+        if ch ~= FM.scrChar or jumped then
             FM.scrChar, FM.scrRespawnAt = ch, nowT
             FM.scrTarget, patrolTo = nil, nil
+            -- and go back to the safe zone spot before farming again
+            FM.scrRallied, FM.scrAtHomeSince, FM.scrStarted = nil, nil, nil
+            if jumped then FM.ScrambleDeaths = (FM.ScrambleDeaths or 0) + 1 end
         end
         if FM.scrRespawnAt and (nowT - FM.scrRespawnAt) < (FM.ScrambleRespawnWait or 2) then
             pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0) end)
             FM.ScrambleState = "Respawned - getting my bearings"
             return
+        end
+
+        -- On the treadmill when the event starts? Get off it properly first. Velocity alone
+        -- does not move you off one - it takes a jump - and stepping off while stripped
+        -- crashes the client, so hand the body back before jumping and only then carry on.
+        do
+            local tp = myTreadmill()
+            local dTread = tp and math.sqrt((me.X - tp.X) ^ 2 + (me.Z - tp.Z) ^ 2) or 1e9
+            if dTread < (FM.TreadmillNear or 14) then
+                FM.onTreadmill = true                    -- makes ghost stand down for this
+                if FM.ghostStep then FM.ghostStep(root) end
+                if FM.GhostSaved then
+                    FM.ScrambleState = "Getting off the treadmill - putting my body back"
+                    return
+                end
+                -- coming off one half sunk into the floor is common; lift clear first
+                if tp and me.Y < (tp.Y - 1) then
+                    pcall(function()
+                        root.CFrame = CFrame.new(me.X, tp.Y + 4, me.Z)
+                        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+                    end)
+                end
+                if keypress and (nowT - (FM.scrJumpAt or 0)) > 0.45 then
+                    FM.scrJumpAt = nowT
+                    pcall(function() keypress(0x20) end)
+                    task.wait(0.08)
+                    if keyrelease then pcall(function() keyrelease(0x20) end) end
+                    FM.ScrambleTreadJumps = (FM.ScrambleTreadJumps or 0) + 1
+                end
+                -- and drift off it while jumping, gently, since ghost is off right now
+                if tp then
+                    local ax, az = me.X - tp.X, me.Z - tp.Z
+                    local am = math.sqrt(ax * ax + az * az)
+                    if am < 0.01 then ax, az, am = 1, 0, 1 end
+                    drive(root, ax / am * 60, az / am * 60, -(FM.Stick or 18))
+                end
+                FM.ScrambleState = "Getting off the treadmill"
+                return
+            end
+            if FM.onTreadmill or FM.treadVisit then
+                -- clear of it now: let the egg farm know it is no longer training
+                FM.onTreadmill, FM.treadVisit, FM.scrJumpAt = nil, nil, nil
+            end
         end
 
         -- weapon first, THEN ghost: the strip leaves tools alone, so a weapon already in
@@ -7293,6 +7436,35 @@ end
         end
         if FM.ghostStep and (weapon or (nowT - (FM.scrEquipSince or nowT)) > 3) then
             FM.ghostStep(root)
+        end
+
+        -- Start every run from the Auto Farm safe zone spot - on the first tick of the event
+        -- and after every death - and make sure we are genuinely stood there before setting
+        -- off. Counting "close enough" was how you ended up hugging the wall beside it, so
+        -- this wants you inside a few studs AND stopped for a moment.
+        if not FM.scrRallied then
+            local h = homePos()
+            if h then
+                local dh = math.sqrt((me.X - h.X) ^ 2 + (me.Z - h.Z) ^ 2)
+                if dh > (FM.ScrambleRallyReach or 6) then
+                    FM.scrAtHomeSince = nil
+                    moveTo(root, me, h.X, h.Z,
+                        string.format("Going to the safe zone spot (%.0f studs)", dh))
+                    return
+                end
+                local okv, vv = pcall(function() return root.AssemblyLinearVelocity end)
+                local moving = okv and vv and math.sqrt(vv.X * vv.X + vv.Z * vv.Z) > 20
+                if moving then FM.scrAtHomeSince = nil end
+                FM.scrAtHomeSince = FM.scrAtHomeSince or nowT
+                if (nowT - FM.scrAtHomeSince) < (FM.ScrambleRallyHold or 0.6) then
+                    pcall(function()
+                        root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0)
+                    end)
+                    FM.ScrambleState = "At the safe zone spot - setting off"
+                    return
+                end
+            end
+            FM.scrRallied, FM.scrAtHomeSince = true, nil
         end
 
         -- keep the current target until it dies
@@ -7335,7 +7507,9 @@ end
             -- The whole map, end to end. Sweeping only the event's own footprint (its models
             -- sit around Abyss Ocean) stopped the roam at Cosmic, and experiments spawn well
             -- past that. eventBounds() is still there if a narrower sweep is ever wanted.
-            local lo, hi = FM.ScramblePatrolMin or 600, FM.ScramblePatrolMax or 5620
+            -- stop short of the plots and the safe zone at the west end; running into that
+            -- corner is asking to be killed by the base wall
+            local lo, hi = FM.ScramblePatrolMin or 700, FM.ScramblePatrolMax or 5620
             local z = FM.ScramblePatrolZ or -365
             -- Start at Abyss Ocean, where the event kicks off, then sweep out from there to
             -- the far end and carry on end to end.
@@ -7363,7 +7537,10 @@ end
         local dx, dz = p.X - me.X, p.Z - me.Z
         local d = math.sqrt(dx * dx + dz * dz)
         if d > (FM.ScrambleReach or 5) then
-            moveTo(root, me, p.X, p.Z, string.format("Running to a %d HP experiment (%.0f studs)", target.max, d))
+            -- steer round things on the way in, then straight at it for the last stretch
+            moveTo(root, me, p.X, p.Z,
+                string.format("Running to a %d HP experiment (%.0f studs)", target.max, d),
+                d <= (FM.ScrambleDirect or 60))
         else
             pcall(function()
                 root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0)
@@ -7405,7 +7582,8 @@ end
                 if live and not carrying then
                     if not FM.ScrambleBusy then
                         FM.ScrambleBusy, kills, patrolTo = true, 0, nil
-                        FM.scrStarted = nil
+                        -- every event starts from the safe zone spot
+                        FM.scrStarted, FM.scrRallied, FM.scrAtHomeSince = nil, nil, nil
                         notify("Dr Scramble", "Event is on - farming experiments", 4)
                     end
                     local ok, err = pcall(scrambleStep)
@@ -7415,6 +7593,9 @@ end
                     if FM.ScrambleBusy then
                         FM.ScrambleBusy = false
                         FM.scrTarget, patrolTo = nil, nil
+                        -- nightfall ends the event: drop everything rather than setting off
+                        -- back into the areas as though it were still running
+                        FM.scrStarted, FM.scrRallied, FM.scrAtHomeSince = nil, nil, nil
                         notify("Dr Scramble", string.format("Event over - %d experiment%s killed",
                             kills, (kills == 1) and "" or "s"), 5, "good")
                     end
