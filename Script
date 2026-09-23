@@ -5,7 +5,6 @@ if GEN > 1 then
     if _G.FARM then _G.FARM.On = false end
     if _G.ABOSS then _G.ABOSS.pinLive, _G.ABOSS.pinning = 0, false end
     task.wait(0.3)
-    if _G.SEHUB_RESTORE then pcall(_G.SEHUB_RESTORE) end
     if _G.SEHUB_WIN then
         for _, m in ipairs({ "Destroy", "Unload", "Close", "Remove" }) do
             pcall(function() _G.SEHUB_WIN[m](_G.SEHUB_WIN) end)
@@ -1110,33 +1109,6 @@ end)
 local win = Lib:CreateWindow({ title = "Steal An Egg Hub", size = Vector2.new(680, 600) })
 _G.SEHUB_WIN = win
 
-_G.STEAL = _G.STEAL or {}
-local ST = _G.STEAL
-ST.On         = true
-ST.Hold       = 0.0
-ST.Dist       = 15.0
-ST.OFF_HOLD   = 0x120
-ST.OFF_DIST   = 0x128
-ST.OFF_LOS    = 0x135
-ST.NoLOS      = false
-ST.orig       = ST.orig or {}
-ST.origLOS    = ST.origLOS or {}
-ST.doneAt     = ST.doneAt or {}
-ST.suppressed = ST.suppressed or {}
-ST.keepSlow   = {}
-ST.SUPPRESS_TTL = 1.0
-ST.REPATCH    = 3.0
-ST.sweepN     = 0
-ST.offsetsOk  = true
--- Writing to a prompt the game is in the middle of destroying is a write into freed memory,
--- and that takes the whole client down. A grab destroys the egg's slot and its prompt, so
--- stop writing for a moment either side of every E press. This is the likeliest cause of the
--- "crashes when picking an egg up" reports.
-ST.QuietFor   = 0.4
-ST.quietUntil = 0
-ST.patched    = 0
-ST.State      = "Off"
-
 local function promptsNear(pos, radius)
     local out = {}
     local r = radius or math.huge
@@ -1152,7 +1124,7 @@ local function promptsNear(pos, radius)
                     if okg and sub then
                         for _, pr in ipairs(sub) do
                             local okn, nm2 = pcall(function() return pr.Name end)
-                            if okn and (nm2 == "CarryAreaEgg" or ST.AnyPrompt) then
+                            if okn and nm2 == "CarryAreaEgg" then
                                 out[#out + 1] = { p = pr, d = d }
                             end
                         end
@@ -1174,7 +1146,7 @@ local function promptsNear(pos, radius)
                     if okd and desc then
                         for _, pr in ipairs(desc) do
                             local okn, nm2 = pcall(function() return pr.Name end)
-                            if okn and (nm2 == "CarryAreaEgg" or ST.AnyPrompt) then
+                            if okn and nm2 == "CarryAreaEgg" then
                                 out[#out + 1] = { p = pr, d = d }
                             end
                         end
@@ -1186,307 +1158,8 @@ local function promptsNear(pos, radius)
     return out
 end
 
-local function promptList()
-    local out = {}
-    local root = myRoot()
-    local pos
-    if root then
-        local okp, p = pcall(function() return root.Position end)
-        if okp then pos = p end
-    end
-    for _, e in ipairs(promptsNear(pos, pos and 400 or nil)) do out[#out + 1] = e.p end
-    return out
-end
-
-local function addrOf(p)
-    local okpar, par = pcall(function() return p.Parent end)
-    if not okpar or par == nil then return nil end
-    local ok, a = pcall(function() return p.Address end)
-    if ok and type(a) == "number" and a > 0x10000 then return a end
-    return nil
-end
-
-local function promptWritable(a)
-    if not a then return false end
-    local okk, k = pcall(function() return memory_read("int", a + 0x124) end)
-    if not okk or k ~= 101 then return false end
-    local ok, h = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
-    if not ok or type(h) ~= "number" then return false end
-    if h ~= h then return false end
-    return h >= 0 and h <= 5.0
-end
-
-local function patchPrompts()
-    if not memory_write or not memory_read then
-        ST.State = "Not supported"
-        return
-    end
-    if not ST.offsetsOk then return end
-    if tick() < (ST.quietUntil or 0) then return end
-    local n = 0
-    ST.sweepN = (ST.sweepN or 0) + 1
-    local verify = (ST.sweepN <= 3) or (ST.sweepN % 20 == 0)
-    local now = tick()
-    for _, p in ipairs(promptList()) do
-        local a = addrOf(p)
-        if a and (now - (ST.doneAt[a] or 0)) < ST.REPATCH then
-            n = n + 1
-            a = nil
-        end
-        if a and not promptWritable(a) then
-            ST.Rejected = (ST.Rejected or 0) + 1
-            a = nil
-        end
-        if a and ST.suppressed[a] and (now - ST.suppressed[a]) < (ST.SUPPRESS_TTL or 1.0) then
-            a = nil
-        end
-        if a and (ST.keepSlow[a] or 0) > now then
-            a = nil
-        end
-        if a then
-            ST.doneAt[a] = now
-            if not ST.orig[a] then
-                local okh, h = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
-                local okd, d = pcall(function() return memory_read("float", a + ST.OFF_DIST) end)
-                if okh and okd then ST.orig[a] = { hold = h, dist = d } end
-            end
-            pcall(function()
-                memory_write("float", a + ST.OFF_HOLD, ST.Hold)
-                memory_write("float", a + ST.OFF_DIST, ST.Dist)
-            end)
-            if ST.NoLOS then
-                if ST.origLOS[a] == nil then
-                    local okl, l = pcall(function() return memory_read("byte", a + ST.OFF_LOS) end)
-                    if okl and type(l) == "number" then ST.origLOS[a] = l end
-                end
-                pcall(function() memory_write("byte", a + ST.OFF_LOS, 0) end)
-            end
-            local okv, h2, okv2, d2 = false, nil, false, nil
-            if verify then
-                okv, h2 = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
-                okv2, d2 = pcall(function() return memory_read("float", a + ST.OFF_DIST) end)
-            end
-            if okv and okv2 and h2 and d2 then
-                if math.abs(h2 - ST.Hold) > 0.01 or math.abs(d2 - ST.Dist) > 0.01 then
-                    ST.offsetsOk = false
-                    ST.State = "Stopped - game updated"
-                    warn("[Steal An Egg] prompt offsets no longer hold their value.")
-                    warn("[Steal An Egg] Roblox has probably reshuffled ProximityPrompt.")
-                    warn(string.format("[Steal An Egg] wrote hold=%.2f dist=%.2f, read back %.2f / %.2f",
-                        ST.Hold, ST.Dist, h2, d2))
-                    warn("[Steal An Egg] Instant Steal disabled rather than writing blind.")
-                    return
-                end
-            end
-            n = n + 1
-        end
-    end
-    if ST.sweepN % 20 == 0 then
-        for addr, at in pairs(ST.doneAt) do
-            if (now - at) > 30 then ST.doneAt[addr] = nil end
-        end
-    end
-    ST.patched = n
-    ST.State = string.format("On - %d prompts", n)
-end
-
-local function nearFrom(shared, pos, radius)
-    if not shared then return promptsNear(pos, radius) end
-    local out = {}
-    for _, e in ipairs(shared) do
-        if e.d <= radius then out[#out + 1] = e end
-    end
-    return out
-end
-
-local function patchNear(pos, radius, shared)
-    if not memory_write or not pos then return 0 end
-    if not ST.On or not ST.offsetsOk then return 0 end
-    if tick() < (ST.quietUntil or 0) then return 0 end
-    local n = 0
-    for _, e in ipairs(nearFrom(shared, pos, radius or 30)) do
-        local a = addrOf(e.p)
-        if a and not promptWritable(a) then
-            ST.Rejected = (ST.Rejected or 0) + 1
-            a = nil
-        end
-        if a and ST.suppressed[a] and (tick() - ST.suppressed[a]) < (ST.SUPPRESS_TTL or 1.0) then
-            a = nil
-        end
-        if a and (ST.keepSlow[a] or 0) > tick() then
-            a = nil
-        end
-        if a then
-            if not ST.orig[a] then
-                local okh, h = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
-                local okd, dd = pcall(function() return memory_read("float", a + ST.OFF_DIST) end)
-                if okh and okd then ST.orig[a] = { hold = h, dist = dd } end
-            end
-            pcall(function()
-                memory_write("float", a + ST.OFF_HOLD, ST.Hold)
-                memory_write("float", a + ST.OFF_DIST, ST.Dist)
-            end)
-            if ST.NoLOS then
-                if ST.origLOS[a] == nil then
-                    local okl, l = pcall(function() return memory_read("byte", a + ST.OFF_LOS) end)
-                    if okl and type(l) == "number" then ST.origLOS[a] = l end
-                end
-                pcall(function() memory_write("byte", a + ST.OFF_LOS, 0) end)
-            end
-            n = n + 1
-        end
-    end
-    return n
-end
-_G.SEHUB_PATCHNEAR = patchNear
-
-local function suppressOthers(pos, radius, keepPrompt, shared)
-    if not memory_write or not pos then return 0 end
-    if not ST.On or not ST.offsetsOk then return 0 end
-    if tick() < (ST.quietUntil or 0) then return 0 end
-    local list = nearFrom(shared, pos, radius or 25)
-    local keep, keepD = keepPrompt, nil
-    if not keep then
-        for _, e in ipairs(list) do
-            if not keepD or e.d < keepD then keepD, keep = e.d, e.p end
-        end
-    end
-    local n = 0
-    for _, e in ipairs(list) do
-        if e.p ~= keep then
-            local a = addrOf(e.p)
-            if a and not promptWritable(a) then
-                ST.Rejected = (ST.Rejected or 0) + 1
-                a = nil
-            end
-            if a then
-                if not ST.orig[a] then
-                    local okh, h = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
-                    local okd, dd = pcall(function() return memory_read("float", a + ST.OFF_DIST) end)
-                    if okh and okd then ST.orig[a] = { hold = h, dist = dd } end
-                end
-                pcall(function() memory_write("float", a + ST.OFF_DIST, 0.5) end)
-                ST.doneAt[a] = nil
-                ST.suppressed[a] = tick()
-                n = n + 1
-            end
-        end
-    end
-    -- Make sure the prompt we are KEEPING is live. This function only ever touched the
-    -- others, so if the target had itself been suppressed a moment earlier (as a neighbour of
-    -- a previous target) it stayed at 0.5 studs - and patchNear and the sweep both skip
-    -- anything suppressed in the last second, so nothing put it back and E did nothing.
-    -- Give it a generous range while we grab. Every neighbour within the radius is at 0.5
-    -- by now, so the extra reach cannot land on the wrong egg - and it covers standing on top
-    -- of a small egg after a teleport, which puts you further than 5 studs from its prompt.
-    if keep then
-        local ka = addrOf(keep)
-        if ka and promptWritable(ka) then
-            if not ST.orig[ka] then
-                local okh, h = pcall(function() return memory_read("float", ka + ST.OFF_HOLD) end)
-                local okd, dd = pcall(function() return memory_read("float", ka + ST.OFF_DIST) end)
-                if okh and okd then ST.orig[ka] = { hold = h, dist = dd } end
-            end
-            pcall(function()
-                memory_write("float", ka + ST.OFF_HOLD, ST.Hold)
-                memory_write("float", ka + ST.OFF_DIST, ST.KeepDist or 12)
-            end)
-            if ST.NoLOS then
-                if ST.origLOS[ka] == nil then
-                    local okl, l = pcall(function() return memory_read("byte", ka + ST.OFF_LOS) end)
-                    if okl and type(l) == "number" then ST.origLOS[ka] = l end
-                end
-                pcall(function() memory_write("byte", ka + ST.OFF_LOS, 0) end)
-            end
-            ST.suppressed[ka] = nil
-            ST.KeptLive = (ST.KeptLive or 0) + 1
-        end
-    end
-    ST.Suppressed = (ST.Suppressed or 0) + n
-    return n
-end
-_G.SEHUB_SUPPRESS = suppressOthers
-
-local function holdTimeNear(pos, radius, shared)
-    if not memory_read or not pos then return nil end
-    local bestD, bestPrompt
-    for _, e in ipairs(nearFrom(shared, pos, radius or 20)) do
-        if not bestD or e.d < bestD then bestD, bestPrompt = e.d, e.p end
-    end
-    if not bestPrompt then return nil end
-    local okpar, par = pcall(function() return bestPrompt.Parent end)
-    if not okpar or par == nil then return nil end
-    local oka, a = pcall(function() return bestPrompt.Address end)
-    if not oka or type(a) ~= "number" or a <= 0x10000 then return nil end
-    local okh, h = pcall(function() return memory_read("float", a + ST.OFF_HOLD) end)
-    if okh and type(h) == "number" then return h end
-    return nil
-end
-_G.SEHUB_HOLDTIME = holdTimeNear
-
-local function restorePrompts()
-    if not memory_write then return end
-    local n = 0
-    for _, p in ipairs(promptList()) do
-        local a = addrOf(p)
-        if a and not promptWritable(a) then a = nil end
-        local o = a and ST.orig[a]
-        if a and o then
-            pcall(function()
-                memory_write("float", a + ST.OFF_HOLD, o.hold)
-                memory_write("float", a + ST.OFF_DIST, o.dist)
-            end)
-            n = n + 1
-        end
-        if a and ST.origLOS[a] ~= nil then
-            pcall(function() memory_write("byte", a + ST.OFF_LOS, ST.origLOS[a]) end)
-        end
-    end
-    ST.State = "Off"
-    return n
-end
-_G.SEHUB_RESTORE = restorePrompts
-
 local farm = win:Tab("Auto Farm", "target")
 local main = win:Tab("Others", "home")
-local stealSec = main:Section("Instant Steal", "Full")
-stealSec:Label("Grab eggs without holding E.")
-local stealToggle
-stealToggle = stealSec:Toggle("Instant Steal", true, function(v)
-    ST.On = v
-    if v then
-        ST.offsetsOk = true
-        ST.doneAt = {}
-        patchPrompts()
-    else
-        restorePrompts()
-        ST.doneAt = {}
-    end
-end, "Grab eggs instantly. Also stops nearby eggs stealing the grab.")
-ST.ui = stealSec:Label("Off")
-
-local STboot = { Hold = 0, Dist = 5, On = true, NoLOS = true }
-for k, want in pairs(STboot) do
-    if ST[k] ~= want then
-        warn(string.format("[Steal An Egg] menu returned ST.%s=%s - starting at %s",
-            k, tostring(ST[k]), tostring(want)))
-        ST[k] = want
-    end
-end
-if stealToggle then pcall(function() stealToggle:Set(ST.On) end) end
-if ST.On then pcall(patchPrompts) end
-
-SESPAWN("prompt patch", function()
-    while _G.SEHUB_GEN == GEN do
-        local t0 = tick()
-        local F = _G.FARM
-        if ST.On and ST.offsetsOk and not (F and F.On and F.hasEgg)
-           and ((F and F.rtQuietUntil) or 0) < tick() then patchPrompts() end
-        PROFTICK("prompt patch", t0)
-        task.wait(0.75)
-    end
-end)
-
 _G.MOVE = _G.MOVE or {}
 local MV = _G.MOVE
 MV.Fly      = false
@@ -1927,13 +1600,11 @@ FM.Speed     = 600
 FM.Stick     = 18
 FM.Reach     = 1.5
 FM.GrabHold  = 1.3
-FM.Fallbacks = 0
 FM.Brake     = 30
 FM.Snap      = 12
 FM.SnapOn    = true
 FM.Snaps     = 0
 FM.Headstart, FM.Headstarts, FM.outboundHop = nil, nil, nil
-FM.Suppress      = true
 FM.BigWidth      = 6
 FM.Ghost         = true
 FM.GhostSaved    = nil
@@ -3249,69 +2920,6 @@ local function notifyRiftSpawns(title)
     end
 end
 
-local function pressE(dur)
-    if not keypress then return end
-    -- hands off the prompts while this grab lands and the slot is torn down
-    ST.quietUntil = tick() + (ST.QuietFor or 0.4)
-    pcall(function()
-        keypress(0x45)
-        task.wait(dur or 0.08)
-        keyrelease(0x45)
-    end)
-    ST.quietUntil = tick() + (ST.QuietFor or 0.4)
-end
-
--- Make sure a grab took. Now and then a single tap lands before the prompt is ready and the
--- egg stays put - and the farm only found out 1.5s later, halfway home, and had to come all
--- the way back for it. Stay on the egg and keep tapping until it is actually ours: the slot
--- empties, an egg turns up in hand, or the guard wakes (it only wakes because the grab
--- landed, so that is the moment to leave). Costs nothing when the first tap works.
--- Kept out of farmStep, which is already close to Luau's register limit.
-FM.confirmGrab = function(root, slot, pos)
-    if not slot then return 1 end
-    -- The nearest guard, read directly. It only moves because the grab landed, and it is
-    -- on you within a fraction of a second, so the first stud it moves is the signal to go.
-    local gRoot, gFrom
-    pcall(function()
-        local ga = workspace.__OBJECTS.Areas.GuardAreas
-        local bestD
-        for _, am in ipairs(ga:GetChildren()) do
-            local g = am:FindFirstChild("Guard")
-            local r = g and g:FindFirstChild("HumanoidRootPart")
-            local p = r and r.Position
-            if p and pos then
-                local d = (p.X - pos.X) ^ 2 + (p.Z - pos.Z) ^ 2
-                if not bestD or d < bestD then gRoot, gFrom, bestD = r, p, d end
-            end
-        end
-    end)
-    local function landed()
-        if slotGone(slot) or heldEggTool() then return true end
-        if gRoot and gFrom then
-            local okp, p = pcall(function() return gRoot.Position end)
-            if okp and p and ((p.X - gFrom.X) ^ 2 + (p.Z - gFrom.Z) ^ 2) > 1 then
-                FM.GrabByGuard = (FM.GrabByGuard or 0) + 1
-                return true
-            end
-        end
-        return false
-    end
-    local t0, taps = tick(), 1
-    while FM.On and not landed() and (tick() - t0) < (FM.GrabConfirm or 0.3) do
-        pcall(function()
-            root.AssemblyLinearVelocity = Vector3.new(0, -(FM.LandStick or 40), 0)
-        end)
-        task.wait(0.05)
-        if landed() then break end
-        if taps < (FM.GrabTaps or 6) then
-            pressE(0.04)
-            taps = taps + 1
-        end
-    end
-    if taps > 1 then FM.ExtraTaps = (FM.ExtraTaps or 0) + taps - 1 end
-    return taps
-end
-
 local farmSec = farm:Section("Farm", "Full")
 farmSec:Label("Runs to eggs and carries them home.")
 local function skipRally()
@@ -3855,7 +3463,6 @@ local function cfgGather()
     local c = {}
     for _, k in ipairs(CFG_KEYS) do c[k] = FM[k] end
     c.Areas, c.AllAreas, c.Always = FM.Areas, FM.AllAreas, FM.Always
-    c.StealOn, c.StealDist = ST.On, ST.Dist
     c.EscapeKey = AB.Key
     c.AutoLoad = FM.AutoLoadCfg and true or false
     return c
@@ -3885,8 +3492,6 @@ local function cfgApply(c)
             end
         end)
     end
-    if c.StealOn ~= nil then ST.On = c.StealOn end
-    if c.StealDist ~= nil then ST.Dist = c.StealDist end
     if c.EscapeKey then AB.Key = c.EscapeKey end
     if c.AutoLoad ~= nil then
         FM.AutoLoadCfg = c.AutoLoad
@@ -4742,10 +4347,13 @@ do
 
     FM.RagdollTpMin = 40
     FM.RagdollTpOffset = 0
-    -- no wait needed: with the body stripped there is no assembly left to bounce
-    FM.RagdollTpDelay = 0
+    -- Wait this long after the ragdoll starts before pinning. It was 0 on the grounds that a
+    -- stripped body has no assembly left to bounce, and that held until the game update: after
+    -- it, pins "held" every write and then the game snapped you back to the hit spot anyway -
+    -- 17 failures in a row, the farm looping between the Forest and Lake launch eggs. Putting
+    -- the 1.5s back (your own measured figure) fixed it on the spot: 0 failures after.
+    FM.RagdollTpDelay = 1.5
     FM.RagdollTpGiveUp = 15
-    FM.RagdollTpHold = 0
     FM.RagdollTpSettle = 0
     -- 0 = go straight back and try again instead of falling back to running
     FM.RagdollTpCool = 0
@@ -4761,13 +4369,30 @@ do
         local saved = FM.GhostSaved
         FM.GhostSaved, FM.GhostSeen = nil, nil
         if not saved then return 0 end
+        -- This yields between chunks, and the farm keeps stepping while it does. Without a
+        -- flag, a strip can start half way through a restore and the same parts get thrown
+        -- both ways at once - a good way to take the client down for no obvious reason.
+        FM.ghostBusy = true
         local back, since = 0, 0
         for i = #saved, 1, -1 do
             local e = saved[i]
             if e.o and e.p then
                 local oko, cur = pcall(function() return e.o.Parent end)
                 if oko and cur ~= nil then
-                    if pcall(function() e.o.Parent = e.p end) then back = back + 1 end
+                    -- Is the body we took these from still there? After a death Roblox
+                    -- destroys the old character, and pushing 281 parts back into a
+                    -- destroyed model is a crash waiting to happen. Bin them instead -
+                    -- they belong to a corpse either way, and leaving them in the Camera
+                    -- piles them up for the rest of the session.
+                    local okpp, pp = pcall(function() return e.p.Parent end)
+                    local gone = (not okpp) or pp == nil
+                    if gone then
+                        if pcall(function() e.o:Destroy() end) then
+                            FM.GhostBinned = (FM.GhostBinned or 0) + 1
+                        end
+                    elseif pcall(function() e.o.Parent = e.p end) then
+                        back = back + 1
+                    end
                 end
             end
             -- Reparenting all 281 objects inside one frame is what takes the client down:
@@ -4781,6 +4406,7 @@ do
             end
         end
         FM.GhostBack = back
+        FM.ghostBusy = false
         return back
     end
 
@@ -4827,6 +4453,9 @@ do
     end
 
     FM.ghostStep = function(root, off)
+        -- a restore is mid-flight (it yields between chunks): do not touch the body until
+        -- it has finished, or a strip and a restore end up fighting over the same parts
+        if FM.ghostBusy then return end
         local ch = myCharacter()
         -- Belt and braces for the same trap: if the character read comes back as the Camera,
         -- as nil, or as anything that is not a Model, do nothing at all this step. A bad read
@@ -5103,26 +4732,7 @@ do
         FM.rtQuietUntil = now + 12
         -- clock the whole attempt, retries included, for the run-or-teleport choice above
         FM.rtStreakAt = FM.rtStreakAt or now
-        local slowed = {}
-        if memory_read and memory_write then
-            for _, e in ipairs(forestPrompts) do
-                local a = addrOf(e.p)
-                if a and promptWritable(a) then
-                    ST.keepSlow[a] = now + 12
-                    slowed[#slowed + 1] = a
-                    local want = math.max(0, math.min(5, FM.RagdollTpHold or 1.2))
-                    local wantDist = ST.orig[a] and ST.orig[a].dist
-                    if not wantDist or wantDist < 10 then wantDist = 10 end
-                    ST.suppressed[a] = nil
-                    pcall(function()
-                        memory_write("float", a + ST.OFF_HOLD, want)
-                        memory_write("float", a + ST.OFF_DIST, wantDist)
-                    end)
-                end
-            end
-        end
         local function finish(cool, state)
-            for _, a in ipairs(slowed) do ST.keepSlow[a] = nil end
             FM.rtBusyUntil = tick() + 0.3
             FM.rtQuietUntil = tick() + 0.5
             AB.rtLive = 0
@@ -5161,24 +4771,16 @@ do
             return #promptsNear(launchPos, 6) == 0
         end
         local woke = false
-        if (FM.RagdollTpHold or 1.2) < 0.05 then
-            local tapEnd = tick() + (FM.RagdollTpTapFor or 3.5)
-            while tick() < tapEnd and FM.On and rootAlive(root) and not woke do
-                pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0) end)
-                if keypress then pcall(function() keypress(0x45) end) end
-                task.wait(0.06)
-                if keyrelease then pcall(function() keyrelease(0x45) end) end
-                task.wait(0.1)
-                if grabLanded() then woke = true end
-                FM.RagdollTpTaps = (FM.RagdollTpTaps or 0) + 1
-            end
-        else
+        -- Hold E on the launch egg - the prompt has its normal hold time, so a tap does
+        -- nothing. Let go the moment the grab lands; one more try if the first hold misses.
         for _ = 1, 2 do
             if not (FM.On and rootAlive(root)) then break end
             if keypress then pcall(function() keypress(0x45) end) end
             local t0 = tick()
             while (tick() - t0) < 2.2 and FM.On and rootAlive(root) do
-                pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0) end)
+                -- LandStick, not Stick: Stick is 0 under ghost, and floating off the ground
+                -- part way through a 1.2s hold hides the prompt
+                pcall(function() root.AssemblyLinearVelocity = Vector3.new(0, -(FM.LandStick or 40), 0) end)
                 if grabLanded() then
                     woke = true
                     break
@@ -5193,7 +4795,6 @@ do
                 break
             end
             FM.RagdollTpRepress = (FM.RagdollTpRepress or 0) + 1
-        end
         end
         if not woke then
             FM.RagdollTpNoGrab = (FM.RagdollTpNoGrab or 0) + 1
@@ -5303,7 +4904,6 @@ do
         FM.LastRagdollTp = string.format("%d writes, %d held, %s", writes, holds, landed and "landed" or "failed")
         if landed then
             FM.RagdollTps = (FM.RagdollTps or 0) + 1
-            if ST.On then pcall(function() patchNear(tpos, 30) end) end
             -- Ghost sets Stick to 0, because downward force at speed is what the ground
             -- check kills you for. That made this settle push nothing at all, which is why
             -- you were left hanging in the air drifting slowly down. Use a landing push of
@@ -6032,51 +5632,15 @@ local function farmStep()
                                         Vector3.new(0, -(FM.LandStick or 40), 0)
                                 end)
                             end
-                            if ST.On then pcall(function() patchNear(hSpot, 25) end) end
-                            -- stretch the prompts too, so we do not have to land right on top of it
-                            if memory_read and memory_write then
-                                for _, pe in ipairs(promptsNear(hSpot, 25)) do
-                                    local pa = addrOf(pe.p)
-                                    if pa and promptWritable(pa) then
-                                        pcall(function()
-                                            memory_write("float", pa + ST.OFF_HOLD, 0)
-                                            memory_write("float", pa + ST.OFF_DIST, 30)
-                                            memory_write("byte", pa + ST.OFF_LOS, 0)
-                                        end)
-                                    end
-                                end
-                            end
                             -- Wait out the ragdoll, then ONE grab, then leave either way.
                             if not FM.bhTried and held > (FM.BossHitGrabAfter or 3) then
                                 FM.bhTried = true
                                 FM.State = "Boss hit - picking the egg back up"
-                                if ST.On then pcall(function() patchNear(hSpot, 25) end) end
-                                if memory_read and memory_write then
-                                    for _, pe in ipairs(promptsNear(hSpot, 25)) do
-                                        local pa = addrOf(pe.p)
-                                        if pa and promptWritable(pa) then
-                                            pcall(function()
-                                                memory_write("float", pa + ST.OFF_HOLD, 0)
-                                                memory_write("float", pa + ST.OFF_DIST, 30)
-                                                memory_write("byte", pa + ST.OFF_LOS, 0)
-                                            end)
-                                        end
-                                    end
-                                end
-                                -- Instant Steal puts the hold at 0, so holding the key down
-                                -- achieves nothing - the problem is timing. A single press
-                                -- often lands BEFORE the prompt exists and is simply thrown
-                                -- away, which is why the launch-egg grab taps about six times
-                                -- a second rather than pressing once. Do the same here.
+                                -- hold E through the prompt's normal hold time
                                 if keypress then
-                                    local tapEnd = tick() + (FM.BossHitTapFor or 2)
-                                    while tick() < tapEnd do
-                                        pcall(function() keypress(0x45) end)
-                                        task.wait(0.06)
-                                        if keyrelease then pcall(function() keyrelease(0x45) end) end
-                                        task.wait(0.1)
-                                        FM.BossHitTaps = (FM.BossHitTaps or 0) + 1
-                                    end
+                                    pcall(function() keypress(0x45) end)
+                                    task.wait(FM.BossHitHoldFor or 1.6)
+                                    if keyrelease then pcall(function() keyrelease(0x45) end) end
                                 end
                                 task.wait(0.15)
                                 -- Assume it worked and head home. If it did not, the carry check
@@ -6309,7 +5873,10 @@ local function farmStep()
                                 local standX = eggPos.X
                                 local standZ = eggPos.Z + side * (FM.DeathDropStand or 6)
                                 local standD = math.sqrt((standX - me.X) ^ 2 + (standZ - me.Z) ^ 2)
-                                local closeEnough = eggD <= (FM.DeathDropGrabAt or 20)
+                                -- Inside the prompt's own reach (about 8 studs). Instant Steal used
+                                -- to stretch it to 25, which is why this grabbed from 20 away; the
+                                -- stretch is gone, so get properly close first.
+                                local closeEnough = eggD <= (FM.DeathDropGrabAt or 6.5)
                                 if not closeEnough then
                                     local since = now - (FM.ddProgressAt or 0)
                                     if not FM.ddBestD or eggD < (FM.ddBestD - 2) then
@@ -6317,7 +5884,7 @@ local function farmStep()
                                     end
                                     local settling = (now - (FM.ddRecoverAt or now)) < 1
                                     if not settling and FM.ddProgressAt and since > 1.5 then
-                                        if eggD <= (FM.DeathDropReach or 25) then
+                                        if eggD <= (FM.DeathDropReach or 7) then
                                             closeEnough = true
                                             FM.DeathDropStuckGrabs = (FM.DeathDropStuckGrabs or 0) + 1
                                         else
@@ -6353,19 +5920,6 @@ local function farmStep()
                                     root.AssemblyLinearVelocity = Vector3.new(0, -(FM.Stick or 18), 0)
                                 end)
                                 FM.State = "Death drop - grabbing the dropped egg"
-                                if ST.On then pcall(function() patchNear(eggPos, 20) end) end
-                                if memory_read and memory_write then
-                                    for _, pe in ipairs(promptsNear(eggPos, 20)) do
-                                        local pa = addrOf(pe.p)
-                                        if pa and promptWritable(pa) then
-                                            pcall(function()
-                                                memory_write("float", pa + ST.OFF_HOLD, 0)
-                                                memory_write("float", pa + ST.OFF_DIST, FM.DeathDropReach or 25)
-                                                memory_write("byte", pa + ST.OFF_LOS, 0)
-                                            end)
-                                        end
-                                    end
-                                end
                                 if keypress then
                                     pcall(function() keypress(0x45) end)
                                     local tG = tick()
@@ -6969,42 +6523,24 @@ local function farmStep()
                                     end
                                 end
                             end
-                            local nearPrompts = promptsNear(best.pos, 30)
-                            if ST.On then _G.SEHUB_PATCHNEAR(best.pos, 30, nearPrompts) end
-                            local hd = _G.SEHUB_HOLDTIME(best.pos, 20, nearPrompts)
                             local slot = best.model or slotAt(best.pos)
-                            if ST.On and hd ~= nil and hd >= 0 and hd < 0.05 then
-                                if ST.On and FM.Suppress then
-                                    FM.SuppressedNow = _G.SEHUB_SUPPRESS(best.pos, 14, nil, nearPrompts)
-                                end
-                                pressE(0.04)
-                                FM.confirmGrab(root, slot, best.pos)
-                            else
-                                local hold
-                                if hd and hd > 0 then
-                                    hold = hd + 0.3
-                                else
-                                    hold = 2.0
-                                end
-                                local cfg = FM.GrabHold or 1.3
-                                if cfg > hold then hold = cfg end
-                                if ST.On then FM.Fallbacks = (FM.Fallbacks or 0) + 1 end
-                                FM.State = string.format("Grabbing in %s", best.area)
-                                if ST.On and FM.Suppress then
-                                    FM.SuppressedNow = _G.SEHUB_SUPPRESS(best.pos, 14)
-                                end
-                                if keypress then pcall(function() keypress(0x45) end) end
-                                local t0h = tick()
-                                while (tick() - t0h) < hold do
-                                    pcall(function()
-                                        root.AssemblyLinearVelocity =
-                                            Vector3.new(0, -(FM.Stick or 18), 0)
-                                    end)
-                                    if slotGone(slot) then break end
-                                    task.wait(0.03)
-                                end
-                                if keyrelease then pcall(function() keyrelease(0x45) end) end
+                            -- Hold E through the prompt's normal hold time (about 1.2s), and let
+                            -- go the moment the egg's slot empties - that is the grab landing.
+                            -- Keep a downward push on the whole time: under ghost Stick is 0, and
+                            -- drifting up off the ground hides the prompt part way through.
+                            local hold = math.max(FM.GrabHold or 1.3, FM.GrabHoldMax or 2.0)
+                            FM.State = string.format("Grabbing in %s", best.area)
+                            if keypress then pcall(function() keypress(0x45) end) end
+                            local t0h = tick()
+                            while (tick() - t0h) < hold do
+                                pcall(function()
+                                    root.AssemblyLinearVelocity =
+                                        Vector3.new(0, -(FM.LandStick or 40), 0)
+                                end)
+                                if slotGone(slot) then break end
+                                task.wait(0.03)
                             end
+                            if keyrelease then pcall(function() keyrelease(0x45) end) end
                             FM.visited[best.key] = now
                             FM.Taken = FM.Taken + 1
 
@@ -7625,8 +7161,6 @@ SESPAWN("auto farm", function()
 end)
 
 bossSec:Button("Panic", function()
-    ST.On = false
-    restorePrompts()
     if MV then MV.Fly = false end
     FM.On = false
     FM.AutoBoss = false
@@ -7645,7 +7179,6 @@ end
 SESPAWN("ui refresh", function()
     while _G.SEHUB_GEN == GEN do
         local __t0 = tick()
-        setLabel("steal", ST.ui, tostring(ST.State))
         setLabel("farm", FM.ui, tostring(FM.State))
         setLabel("rift", FM.riftUi, tostring(FM.RiftState))
         setLabel("boss", AB.ui, tostring(AB.State))
